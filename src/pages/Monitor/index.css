@@ -1,0 +1,20 @@
+.monitor-container {
+  height: 100%;
+}
+
+.monitor-container .ant-card {
+  margin-bottom: 16px;
+}
+
+.chart-card .ant-card-body {
+  padding: 24px;
+}
+
+.monitor-container .ant-statistic-title {
+  font-size: 14px;
+  margin-bottom: 8px;
+}
+
+.monitor-container .ant-statistic-content {
+  font-size: 24px;
+}

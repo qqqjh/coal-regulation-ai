@@ -1,0 +1,115 @@
+.sidebar {
+  background: #001529;
+  height: 100vh;
+  position: fixed;
+  left: 0;
+  top: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.logo {
+  height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.logo h2 {
+  color: #fff;
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  text-align: center;
+}
+
+.sidebar-menu {
+  border-right: none;
+  padding-top: 16px;
+}
+
+.sidebar-menu .ant-menu-item {
+  height: 48px;
+  line-height: 48px;
+  margin: 4px 8px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+}
+
+.sidebar-menu .ant-menu-item-selected {
+  background-color: rgba(24, 144, 255, 0.3) !important;
+}
+
+.sidebar-menu .ant-menu-item-selected .ant-menu-title-content,
+.sidebar-menu .ant-menu-item-selected .anticon {
+  color: #1890ff !important;
+}
+
+.sidebar-menu .ant-menu-item:hover {
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+.sidebar-menu .ant-menu-item .anticon {
+  font-size: 18px;
+}
+
+/* 主题切换区域 */
+.sidebar-theme {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px 16px;
+  margin-top: auto;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.theme-icon {
+  font-size: 16px;
+  color: rgba(255, 255, 255, 0.45);
+  transition: all 0.3s;
+}
+
+.theme-icon.active {
+  color: #1890ff;
+}
+
+/* 用户信息区域 */
+.sidebar-user {
+  padding: 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.user-info {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.3s;
+}
+
+.user-info:hover {
+  background-color: rgba(255, 255, 255, 0.1);
+}
+
+.user-detail {
+  margin-left: 12px;
+  display: flex;
+  flex-direction: column;
+}
+
+.user-name {
+  color: #fff;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.user-role {
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 12px;
+}

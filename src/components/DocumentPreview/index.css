@@ -1,0 +1,98 @@
+.document-preview-modal .ant-modal-body {
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.preview-content {
+  min-height: 300px;
+}
+
+.preview-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 300px;
+}
+
+.preview-loading p {
+  margin-top: 16px;
+  color: #999;
+}
+
+.chunk-item {
+  background: #fafafa;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+  border: 1px solid #f0f0f0;
+}
+
+.chunk-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.chunk-content {
+  line-height: 1.8;
+  color: #333;
+}
+
+.chunk-content .ant-typography {
+  margin-bottom: 0;
+}
+
+/* 文档信息 */
+.preview-info {
+  padding: 16px 0;
+}
+
+.info-header {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+
+.info-title {
+  flex: 1;
+}
+
+.info-title h4 {
+  margin: 0 0 8px 0;
+}
+
+.info-details {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 24px;
+}
+
+.info-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  background: #fafafa;
+  border-radius: 8px;
+}
+
+.info-item .ant-typography {
+  margin: 0;
+}
+
+.info-summary {
+  margin-top: 16px;
+}
+
+.info-summary h5 {
+  margin-bottom: 12px;
+}
+
+.info-summary .ant-typography {
+  color: #666;
+  line-height: 1.8;
+}

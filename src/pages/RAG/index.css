@@ -1,0 +1,113 @@
+.rag-container {
+  height: 100%;
+}
+
+.config-card,
+.test-card {
+  height: calc(100vh - 96px);
+  overflow-y: auto;
+}
+
+.config-card .ant-card-body {
+  padding: 16px;
+}
+
+.query-section {
+  margin-bottom: 24px;
+}
+
+.retrieval-section,
+.generation-section {
+  margin-bottom: 24px;
+}
+
+.retrieval-section h3,
+.generation-section h3 {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 16px;
+  color: #333;
+}
+
+.retrieval-item {
+  background: #fafafa;
+  padding: 16px;
+  border-radius: 8px;
+  margin-bottom: 12px;
+  border: 1px solid #f0f0f0;
+}
+
+.retrieval-content {
+  width: 100%;
+}
+
+.retrieval-header {
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+}
+
+.doc-name {
+  font-weight: 500;
+  color: #1890ff;
+}
+
+.retrieval-text {
+  line-height: 1.8;
+  color: #666;
+  padding: 12px;
+  background: white;
+  border-radius: 4px;
+  white-space: pre-wrap;
+}
+
+.answer-card {
+  background: #f9f9f9;
+  border: 1px solid #e8e8e8;
+}
+
+.answer-card .ant-card-body {
+  line-height: 1.8;
+}
+
+.answer-card h2 {
+  font-size: 18px;
+  margin-top: 16px;
+  margin-bottom: 12px;
+  color: #333;
+  border-bottom: 2px solid #1890ff;
+  padding-bottom: 8px;
+}
+
+.answer-card h3 {
+  font-size: 16px;
+  margin-top: 12px;
+  margin-bottom: 8px;
+  color: #555;
+}
+
+.answer-card ul,
+.answer-card ol {
+  padding-left: 24px;
+  margin: 8px 0;
+}
+
+.answer-card li {
+  margin: 4px 0;
+}
+
+.answer-card p {
+  margin: 8px 0;
+}
+
+.answer-card strong {
+  color: #1890ff;
+  font-weight: 600;
+}
+
+.answer-card code {
+  background: #f0f0f0;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: 'Courier New', monospace;
+}

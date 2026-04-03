@@ -1,0 +1,13 @@
+.main-layout {
+  height: 100vh;
+  overflow: hidden;
+}
+
+.main-content {
+  height: 100%;
+  overflow-y: auto;
+  background: var(--bg-primary);
+  padding: 24px;
+  margin-left: 220px;
+  transition: background-color 0.3s;
+}

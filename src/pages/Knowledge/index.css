@@ -1,0 +1,16 @@
+.knowledge-container {
+  height: 100%;
+}
+
+.knowledge-container .ant-card {
+  margin-bottom: 16px;
+}
+
+.knowledge-container .ant-statistic-title {
+  font-size: 14px;
+  margin-bottom: 8px;
+}
+
+.knowledge-container .ant-statistic-content {
+  font-size: 24px;
+}
