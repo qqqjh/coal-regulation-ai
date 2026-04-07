@@ -80,7 +80,8 @@
       "Bash(dir \"backend\\data\\chroma_db\")",
       "Bash(python check_collections.py)",
       "Bash(python cleanup_old_collection.py)",
-      "Bash(curl -X DELETE http://localhost:8000/api/knowledge/documents/4)"
+      "Bash(curl -X DELETE http://localhost:8000/api/knowledge/documents/4)",
+      "Bash(cd d:/work/project/coal-regulation-ai && python extract_pdf_images_ocr.py)"
     ],
     "deny": [],
     "ask": []
