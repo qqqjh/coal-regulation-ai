@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(D:/Anaconda/envs/langchain0.3/python.exe -c ' *)",
+      "Bash(\"D:/Anaconda/envs/langchain0.3/python.exe\" -c \"import sys; sys.stdout.reconfigure\\(encoding='utf-8'\\); print\\('test'\\)\")",
+      "Bash(jobs -l)",
+      "Bash(PYTHONIOENCODING=utf-8 \"D:/Anaconda/envs/langchain0.3/python.exe\" hybrid_rag_review_v6.py)",
+      "Bash(echo \"Started PID: $!\")",
+      "Read(//tmp/**)",
+      "Bash(awk '{print $1, $2, \"CPU:\", $3\"%\", \"Time:\", $11}')",
+      "Bash(python -c ' *)",
+      "Bash(python3 -c ' *)",
+      "Bash(chcp 65001)"
+    ],
+    "additionalDirectories": [
+      "\\tmp"
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "python \"D:/work/project/coal-regulation-ai/.claude/statusline-command.py\""
+  }
+}

@@ -158,7 +158,7 @@ def retrieve_regulations(vector_store: Chroma, query: str, k: int = 5) -> str:
 
 def build_llm() -> ChatOpenAI:
     """构建 Qwen3-max 模型实例（DashScope OpenAI 兼容接口）"""
-    api_key = "sk-ed464c0a923b47e8b61c5b82af7acfa8"
+    api_key = "YOUR_DASHSCOPE_API_KEY"
 
     return ChatOpenAI(
         model="qwen-max",
