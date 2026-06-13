@@ -158,12 +158,17 @@ def retrieve_regulations(vector_store: Chroma, query: str, k: int = 5) -> str:
 
 def build_llm() -> ChatOpenAI:
     """构建 Qwen3-max 模型实例（DashScope OpenAI 兼容接口）"""
-    api_key = "YOUR_DASHSCOPE_API_KEY"
+    api_key = os.getenv("DASHSCOPE_API_KEY")
+    base_url = os.getenv("DASHSCOPE_BASE_URL")
+    if not api_key:
+        raise RuntimeError("Missing environment variable: DASHSCOPE_API_KEY")
+    if not base_url:
+        raise RuntimeError("Missing environment variable: DASHSCOPE_BASE_URL")
 
     return ChatOpenAI(
         model="qwen-max",
         api_key=api_key,
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        base_url=base_url,
         temperature=0.1,
     )
 

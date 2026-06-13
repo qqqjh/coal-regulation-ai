@@ -1,508 +1,415 @@
-import React, { useState } from 'react'
+import React, { useState, useRef, useEffect, useCallback } from 'react'
 import {
-  Card,
-  Upload,
-  Button,
-  message,
-  Row,
-  Col,
-  Divider,
-  Tag,
-  Space,
-  Statistic,
-  List,
-  Checkbox,
-  Modal,
-  Spin,
-  Typography,
-  Steps
+  Upload, Button, message, Tag, Space, Progress, Input, Tooltip,
+  Empty, Segmented, Badge, Spin, Drawer, Table, Popconfirm
 } from 'antd'
 import {
-  UploadOutlined,
-  CheckOutlined,
-  CloseOutlined,
-  DownloadOutlined,
-  FileTextOutlined,
-  LoadingOutlined,
-  CheckCircleOutlined,
-  SyncOutlined
+  UploadOutlined, CheckOutlined, CloseOutlined, EditOutlined,
+  DownloadOutlined, RobotOutlined, FileWordOutlined, AimOutlined,
+  ReloadOutlined, DatabaseOutlined, DeleteOutlined
 } from '@ant-design/icons'
 import './index.css'
 
-const { Dragger } = Upload
-const { Text } = Typography
+const { TextArea } = Input
+
+// 问题类型 → 颜色/标签
+const TYPE_META = {
+  compliance: { color: 'volcano', label: '合规' },
+  numeric: { color: 'geekblue', label: '数值' },
+  typo: { color: 'orange', label: '错别字' },
+  redundancy: { color: 'purple', label: '重复' },
+  escalation: { color: 'magenta', label: '待裁决' }
+}
+const STATUS_COLOR = { 不合规: '#cf1322', 不确定: '#d48806', 错别字: '#d46b08', 重复: '#531dab' }
 
 const Review = () => {
+  const [jobId, setJobId] = useState(null)
+  const [docName, setDocName] = useState('')
+  const [mineType, setMineType] = useState('non_outburst')
+  const [blocks, setBlocks] = useState([])
+  const [issues, setIssues] = useState([])
+  const [job, setJob] = useState({ status: 'idle', progress: 0, agent_status: '' })
+  const [selectedId, setSelectedId] = useState(null)
+  const [customFor, setCustomFor] = useState(null)   // 正在写自定义意见的 issue id
+  const [customText, setCustomText] = useState('')
   const [uploading, setUploading] = useState(false)
-  const [analyzing, setAnalyzing] = useState(false)
-  const [taskId, setTaskId] = useState(null)
-  const [reviewResult, setReviewResult] = useState(null)
-  const [selectedChanges, setSelectedChanges] = useState([])
-  const [currentStep, setCurrentStep] = useState(0)
-  const [currentAgent, setCurrentAgent] = useState('')
-  const [knowledgeBases, setKnowledgeBases] = useState([])
-  const [selectedKbId, setSelectedKbId] = useState(3)
+  const [fwOpen, setFwOpen] = useState(false)
+  const [fwData, setFwData] = useState({ counts: {}, items: [] })
+  const [fwLoading, setFwLoading] = useState(false)
 
-  // 智能体步骤配置
-  const agentSteps = [
-    { title: '错别字检测', description: '识别拼写错误和标点问题', icon: '📝' },
-    { title: '语义通顺性', description: '检测语法和表达问题', icon: '💬' },
-    { title: '重复检测', description: '发现冗余和重复内容', icon: '🔍' },
-    { title: '合规性验证', description: '验证技术标准符合性', icon: '✅' }
-  ]
+  const esRef = useRef(null)
+  const docRef = useRef(null)
+  const blockRefs = useRef({})
 
-  // 加载知识库列表
-  React.useEffect(() => {
-    fetchKnowledgeBases()
-  }, [])
-
-  const fetchKnowledgeBases = async () => {
-    try {
-      const response = await fetch('/api/knowledge/bases')
-      if (response.ok) {
-        const data = await response.json()
-        setKnowledgeBases(data)
-      }
-    } catch (error) {
-      console.error('获取知识库列表失败:', error)
-    }
+  // ---------- SSE ----------
+  const closeStream = () => {
+    if (esRef.current) { esRef.current.close(); esRef.current = null }
   }
 
-  // 上传文档
+  const startStream = useCallback((id) => {
+    closeStream()
+    const es = new EventSource(`/api/v9/stream/${id}`)
+    esRef.current = es
+    es.onmessage = (e) => {
+      const msg = JSON.parse(e.data)
+      if (msg.type === 'status') {
+        setJob(j => ({ ...j, ...msg.job }))
+        if (msg.job.paragraphs_ready) fetchDocument(id)
+      } else if (msg.type === 'issue') {
+        setIssues(prev => prev.some(x => x.id === msg.issue.id) ? prev : [...prev, msg.issue])
+      } else if (msg.type === 'end' || msg.type === 'timeout' || msg.type === 'error') {
+        closeStream()
+        fetchDocument(id)
+      }
+    }
+    es.onerror = () => { /* 浏览器会自动重连；done 时已主动 close */ }
+  }, [])
+
+  useEffect(() => () => closeStream(), [])
+
+  // ---------- 文档段落 ----------
+  const fetchDocument = async (id) => {
+    try {
+      const r = await fetch(`/api/v9/document/${id}`)
+      if (r.ok) {
+        const data = await r.json()
+        if (data.blocks?.length) setBlocks(data.blocks)
+      }
+    } catch (err) { console.error('加载文档失败', err) }
+  }
+
+  // ---------- 上传 ----------
   const handleUpload = async (file) => {
     setUploading(true)
-    const formData = new FormData()
-    formData.append('file', file)
-    formData.append('kb_id', selectedKbId)
-
+    setBlocks([]); setIssues([]); setSelectedId(null)
+    setJob({ status: 'pending', progress: 0, agent_status: '已上传，等待 worker 取走...' })
+    const form = new FormData()
+    form.append('file', file)
     try {
-      const response = await fetch(`/api/review/upload?kb_id=${selectedKbId}`, {
-        method: 'POST',
-        body: formData
-      })
-
-      if (response.ok) {
-        const data = await response.json()
-        setTaskId(data.task_id)
-        message.success('文档上传成功，开始分析...')
-
-        // 自动开始分析
-        startAnalysis(data.task_id)
-      } else {
-        const error = await response.json()
-        message.error('文档上传失败: ' + (error.detail || '未知错误'))
-      }
-    } catch (error) {
-      console.error('上传失败:', error)
-      message.error('上传失败: ' + error.message)
+      const r = await fetch(`/api/v9/upload?mine_type=${mineType}`, { method: 'POST', body: form })
+      if (!r.ok) { message.error('上传失败'); setUploading(false); return false }
+      const data = await r.json()
+      setJobId(data.job_id)
+      setDocName(data.doc_name)
+      message.success('上传成功，审查已排队')
+      startStream(data.job_id)
+      // 等段落就绪
+      const t = setInterval(async () => {
+        const jr = await fetch(`/api/v9/status/${data.job_id}`)
+        if (jr.ok) {
+          const j = await jr.json()
+          if (j.paragraphs_path || j.status !== 'pending') { fetchDocument(data.job_id); clearInterval(t) }
+        }
+      }, 1500)
+    } catch (err) {
+      message.error('上传出错: ' + err.message)
     } finally {
       setUploading(false)
     }
-
-    return false // 阻止默认上传行为
+    return false
   }
 
-  // 开始分析
-  const startAnalysis = async (id) => {
-    setAnalyzing(true)
-    setCurrentStep(0)
+  // ---------- 反馈 ----------
+  const pollFeedback = (issueId) => {
+    const t = setInterval(async () => {
+      const r = await fetch(`/api/v9/feedback-status/${issueId}`)
+      if (r.ok) {
+        const s = await r.json()
+        if (s.agent_applied === 1) { // 已改写
+          clearInterval(t)
+          message.success('主智能体已改写文档：' + (s.agent_note || ''))
+          fetchDocument(jobId)
+          setIssues(prev => prev.map(x => x.id === issueId
+            ? { ...x, _resolved: 'applied', agent_note: s.agent_note } : x))
+        } else if (s.agent_applied === 2 || s.agent_applied === -1) {
+          clearInterval(t)
+          setIssues(prev => prev.map(x => x.id === issueId
+            ? { ...x, _resolved: s.agent_applied === 2 ? 'noop' : 'failed', agent_note: s.agent_note } : x))
+        }
+      }
+    }, 1500)
+  }
 
+  const sendFeedback = async (issue, action, text = '') => {
     try {
-      const response = await fetch(`/api/review/analyze/${id}`, {
-        method: 'POST'
+      const r = await fetch('/api/v9/feedback', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ issue_id: issue.id, action, text })
       })
-
-      if (response.ok) {
-        // 轮询获取结果
-        pollResult(id)
+      if (!r.ok) { message.error('反馈失败'); return }
+      if (action === 'reject') {
+        message.success('已驳回，记入数据飞轮（人工层）')
+        setIssues(prev => prev.map(x => x.id === issue.id ? { ...x, _resolved: 'rejected' } : x))
       } else {
-        message.error('启动分析失败')
-        setAnalyzing(false)
+        message.loading({ content: '已提交，主智能体改写中...', key: `fb${issue.id}` })
+        setIssues(prev => prev.map(x => x.id === issue.id ? { ...x, _resolved: 'processing' } : x))
+        pollFeedback(issue.id)
       }
-    } catch (error) {
-      console.error('分析失败:', error)
-      message.error('分析失败: ' + error.message)
-      setAnalyzing(false)
+      setCustomFor(null); setCustomText('')
+    } catch (err) { message.error('反馈出错: ' + err.message) }
+  }
+
+  // ---------- 数据飞轮 ----------
+  const openFlywheel = async () => {
+    setFwOpen(true)
+    setFwLoading(true)
+    try {
+      const r = await fetch('/api/v9/flywheel?limit=300')
+      if (r.ok) setFwData(await r.json())
+    } catch (err) { message.error('加载飞轮失败: ' + err.message) }
+    finally { setFwLoading(false) }
+  }
+  const deleteFlywheel = async (id) => {
+    try {
+      const r = await fetch(`/api/v9/flywheel/${id}`, { method: 'DELETE' })
+      if (r.ok) {
+        message.success('已删除')
+        setFwData(d => ({ ...d, items: d.items.filter(x => x.id !== id) }))
+      } else message.error('删除失败')
+    } catch (err) { message.error('删除出错: ' + err.message) }
+  }
+
+  // ---------- 定位 ----------
+  const locateIssue = (issue) => {
+    setSelectedId(issue.id)
+    const bi = (issue.block_indices || [])[0]
+    if (bi != null && blockRefs.current[bi]) {
+      blockRefs.current[bi].scrollIntoView({ behavior: 'smooth', block: 'center' })
     }
   }
 
-  // 轮询获取结果
-  const pollResult = async (id) => {
-    const maxAttempts = 60 // 最多轮询60次（5分钟）
-    let attempts = 0
+  // 当前选中问题对应的高亮 block 集合 + 原文片段
+  const selected = issues.find(x => x.id === selectedId)
+  const hlBlocks = new Set(selected?.block_indices || [])
+  const hlText = selected?.original_text || ''
 
-    const poll = setInterval(async () => {
-      attempts++
-
-      try {
-        const response = await fetch(`/api/review/result/${id}`)
-        if (response.ok) {
-          const data = await response.json()
-
-          // 更新进度
-          if (data.result && data.result.progress) {
-            const progress = data.result.progress
-            if (progress >= 25 && progress < 50) setCurrentStep(1)
-            else if (progress >= 50 && progress < 75) setCurrentStep(2)
-            else if (progress >= 75 && progress < 100) setCurrentStep(3)
-            else if (progress === 100) setCurrentStep(4)
-          }
-
-          if (data.status === 'completed') {
-            clearInterval(poll)
-            setAnalyzing(false)
-            setCurrentStep(4)
-            setReviewResult(data.result)
-            message.success('文档分析完成！')
-          } else if (data.status === 'failed') {
-            clearInterval(poll)
-            setAnalyzing(false)
-            message.error('文档分析失败: ' + data.error)
-          }
-        }
-
-        if (attempts >= maxAttempts) {
-          clearInterval(poll)
-          setAnalyzing(false)
-          message.error('分析超时，请重试')
-        }
-      } catch (error) {
-        console.error('获取结果失败:', error)
-      }
-    }, 5000) // 每5秒轮询一次
-  }
-
-  // 选择/取消选择修改
-  const handleSelectChange = (changeId, checked) => {
-    if (checked) {
-      setSelectedChanges([...selectedChanges, changeId])
-    } else {
-      setSelectedChanges(selectedChanges.filter(id => id !== changeId))
+  const renderParagraph = (b) => {
+    const isHl = hlBlocks.has(b.block_index)
+    let content = b.text || ' '
+    if (isHl && hlText && b.text?.includes(hlText)) {
+      const i = b.text.indexOf(hlText)
+      content = (<>
+        {b.text.slice(0, i)}
+        <mark className="hl-text">{hlText}</mark>
+        {b.text.slice(i + hlText.length)}
+      </>)
     }
+    return (
+      <p
+        key={b.block_index}
+        ref={el => (blockRefs.current[b.block_index] = el)}
+        className={`doc-para ${isHl ? 'doc-para-hl' : ''} ${b.is_heading ? 'doc-heading' : ''}`}
+      >
+        {content}
+      </p>
+    )
   }
 
-  // 全选
-  const handleSelectAll = () => {
-    if (reviewResult && reviewResult.all_changes) {
-      setSelectedChanges(reviewResult.all_changes.map(c => c.id))
-    }
-  }
+  const renderTable = (b) => (
+    <table key={b.block_index} ref={el => (blockRefs.current[b.block_index] = el)}
+      className={`doc-table ${hlBlocks.has(b.block_index) ? 'doc-para-hl' : ''}`}>
+      <tbody>
+        {(b.rows || []).map((row, ri) => (
+          <tr key={ri}>{row.map((c, ci) => <td key={ci}>{c}</td>)}</tr>
+        ))}
+      </tbody>
+    </table>
+  )
 
-  // 取消全选
-  const handleDeselectAll = () => {
-    setSelectedChanges([])
-  }
-
-  // 接受修改
-  const handleAcceptChanges = () => {
-    if (selectedChanges.length === 0) {
-      message.warning('请先选择要接受的修改')
-      return
-    }
-
-    Modal.confirm({
-      title: '确认接受修改',
-      content: `确定要接受选中的 ${selectedChanges.length} 处修改吗？`,
-      onOk: async () => {
-        try {
-          const response = await fetch('/api/review/apply-changes', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-              file_id: taskId,
-              accepted_change_ids: selectedChanges
-            })
-          })
-
-          if (response.ok) {
-            message.success('修改已应用，可以下载修改后的文档')
-          } else {
-            message.error('应用修改失败')
-          }
-        } catch (error) {
-          console.error('应用修改失败:', error)
-          message.error('应用修改失败: ' + error.message)
-        }
-      }
-    })
-  }
-
-  // 下载修改后的文档
-  const handleDownload = () => {
-    if (!taskId) {
-      message.warning('没有可下载的文档')
-      return
-    }
-
-    const downloadUrl = `/api/review/download/${taskId}`
-    window.open(downloadUrl, '_blank')
-    message.success('开始下载文档')
-  }
-
-  // 获取修改类型的颜色
-  const getChangeTypeColor = (type) => {
-    const colors = {
-      typo: 'red',
-      fluency: 'orange',
-      duplicate: 'purple',
-      compliance: 'volcano'
-    }
-    return colors[type] || 'default'
-  }
-
-  // 获取修改类型的标签
-  const getChangeTypeLabel = (type) => {
-    const labels = {
-      typo: '错别字',
-      fluency: '语义通顺性',
-      duplicate: '内容重复',
-      compliance: '技术标准合规性'
-    }
-    return labels[type] || type
-  }
-
-  const uploadProps = {
-    accept: '.docx,.doc',
-    beforeUpload: handleUpload,
-    showUploadList: false
-  }
+  const activeIssues = issues.filter(x => !x._resolved)
+  const isRunning = ['pending', 'parsing', 'reviewing'].includes(job.status)
 
   return (
-    <div className="review-container">
-      {/* 上传区域 - 始终显示 */}
-      <Card title="文档审查修正" style={{ marginBottom: 16 }}>
-        {/* 知识库选择 */}
-        <div style={{ marginBottom: 16 }}>
-          <Text strong>选择知识库：</Text>
-          <Space style={{ marginLeft: 8 }}>
-            {knowledgeBases.map(kb => (
-              <Button
-                key={kb.id}
-                type={selectedKbId === kb.id ? 'primary' : 'default'}
-                onClick={() => setSelectedKbId(kb.id)}
-                disabled={uploading || analyzing}
-              >
-                {kb.name}
-              </Button>
-            ))}
-          </Space>
+    <div className="v9-review">
+      {/* ===== 顶部：上传 + 主智能体状态 ===== */}
+      <div className="v9-topbar">
+        <div className="v9-topbar-left">
+          <Upload accept=".docx,.doc" beforeUpload={handleUpload} showUploadList={false}
+            disabled={uploading || isRunning}>
+            <Button type="primary" icon={<UploadOutlined />} loading={uploading} disabled={isRunning}>
+              上传待审 Word
+            </Button>
+          </Upload>
+          <Segmented
+            value={mineType}
+            onChange={setMineType}
+            disabled={isRunning}
+            options={[
+              { label: '非突出矿井', value: 'non_outburst' },
+              { label: '突出矿井', value: 'outburst' }
+            ]}
+          />
+          {docName && <span className="v9-docname"><FileWordOutlined /> {docName}</span>}
+        </div>
+        <div className="v9-topbar-right">
+          <Button icon={<DatabaseOutlined />} onClick={openFlywheel}>
+            数据飞轮
+          </Button>
+          <Button icon={<DownloadOutlined />} disabled={!jobId}
+            onClick={() => window.open(`/api/v9/download/${jobId}`, '_blank')}>
+            下载改写后文档
+          </Button>
+        </div>
+      </div>
+
+      {/* 主智能体状态条 */}
+      <div className="v9-agentbar">
+        <div className="v9-agent-head">
+          <RobotOutlined className="v9-agent-icon" />
+          <span className="v9-agent-label">主智能体</span>
+          {isRunning && <Spin size="small" />}
+          <span className={`v9-agent-state-tag ${isRunning ? 'running' : job.status === 'failed' ? 'failed' : ''}`}>
+            {job.status === 'idle' ? '待命' : isRunning ? '工作中' : job.status === 'done' ? '已完成' : job.status === 'failed' ? '失败' : job.status}
+          </span>
+          {job.n_chunks > 0 && (
+            <span className="v9-agent-count">已审 {job.n_done}/{job.n_chunks} 块</span>
+          )}
+          <span className="v9-agent-issues">发现 {issues.length} 处问题</span>
+          <span className="v9-agent-progress">{job.progress || 0}%</span>
+        </div>
+        <div className="v9-agent-statusline">
+          {job.agent_status || (job.status === 'idle' ? '等待上传文档…审查将自动开始，问题会实时出现在左侧。' : job.status)}
+        </div>
+        <Progress percent={job.progress || 0} size="small" showInfo={false}
+          status={job.status === 'failed' ? 'exception' : isRunning ? 'active' : 'normal'} />
+      </div>
+
+      {/* 数据飞轮抽屉 */}
+      <Drawer title={<span><DatabaseOutlined /> 数据飞轮（人工/主智能体裁决沉淀）</span>}
+        open={fwOpen} onClose={() => setFwOpen(false)} width={920}>
+        <Space style={{ marginBottom: 12 }} wrap>
+          <Tag color="red">人工 {fwData.counts?.human || 0}</Tag>
+          <Tag color="blue">主智能体 {fwData.counts?.agent || 0}</Tag>
+          <Button size="small" icon={<ReloadOutlined />} onClick={openFlywheel}>刷新</Button>
+          <span style={{ color: '#999', fontSize: 12 }}>人工裁决为最高层，用于扩充评估集 / 后续动态判例参考</span>
+        </Space>
+        <Table
+          rowKey="id" size="small" loading={fwLoading} dataSource={fwData.items}
+          pagination={{ pageSize: 12 }}
+          columns={[
+            { title: '来源', dataIndex: 'source', width: 80,
+              render: s => <Tag color={s === 'human' ? 'red' : 'blue'}>{s === 'human' ? '人工' : '主智能体'}</Tag> },
+            { title: '裁决', dataIndex: 'final_verdict', width: 110,
+              render: (v, r) => <span><span style={{ color: '#999' }}>{r.model_verdict || '?'}→</span><b>{v}</b></span> },
+            { title: '文档/块', width: 140, render: (_, r) => <span style={{ fontSize: 12 }}>{(r.doc_name || '').slice(0, 12)}<br />ck{r.chunk_index}</span> },
+            { title: '原文', dataIndex: 'pending_content', ellipsis: true,
+              render: t => <Tooltip title={t}><span style={{ fontSize: 12 }}>{(t || '').slice(0, 40)}</span></Tooltip> },
+            { title: '理由', dataIndex: 'reason', ellipsis: true,
+              render: t => <Tooltip title={t}><span style={{ fontSize: 12, color: '#666' }}>{(t || '').slice(0, 40)}</span></Tooltip> },
+            { title: '操作', width: 70, render: (_, r) => (
+              <Popconfirm title="删除这条飞轮记录？" onConfirm={() => deleteFlywheel(r.id)} okText="删除" cancelText="保留">
+                <Button size="small" danger type="text" icon={<DeleteOutlined />} />
+              </Popconfirm>
+            ) }
+          ]}
+        />
+      </Drawer>
+
+      {/* ===== 主体：左问题 + 中文档 ===== */}
+      <div className="v9-body">
+        {/* 左侧：实时问题 */}
+        <div className="v9-issues">
+          <div className="v9-issues-head">
+            <span>发现问题</span>
+            <Badge count={activeIssues.length} showZero color="#cf1322" />
+            <Tooltip title="点击问题可在右侧文档定位">
+              <AimOutlined style={{ color: '#999', marginLeft: 'auto' }} />
+            </Tooltip>
+          </div>
+          <div className="v9-issues-list">
+            {issues.length === 0 && (
+              <Empty description={isRunning ? '审查中，问题将实时出现…' : '暂无问题'}
+                image={Empty.PRESENTED_IMAGE_SIMPLE} style={{ marginTop: 40 }} />
+            )}
+            {issues.map(issue => {
+              const meta = TYPE_META[issue.issue_type] || { color: 'default', label: issue.issue_type }
+              return (
+                <div key={issue.id}
+                  className={`v9-issue ${selectedId === issue.id ? 'v9-issue-sel' : ''} ${issue._resolved ? 'v9-issue-done' : ''}`}
+                  onClick={() => locateIssue(issue)}>
+                  <div className="v9-issue-top">
+                    <Tag color={meta.color}>{meta.label}</Tag>
+                    {issue.status && (
+                      <span className="v9-issue-status" style={{ color: STATUS_COLOR[issue.status] || '#555' }}>
+                        {issue.status}
+                      </span>
+                    )}
+                    {issue.escalation_type && <Tag>{issue.escalation_type}</Tag>}
+                    {issue._resolved && (
+                      <Tag color={issue._resolved === 'applied' ? 'green'
+                        : issue._resolved === 'rejected' ? 'default'
+                          : issue._resolved === 'processing' ? 'processing' : 'red'}>
+                        {{ applied: '已改写', rejected: '已驳回', processing: '改写中',
+                          noop: '未改', failed: '改写失败' }[issue._resolved]}
+                      </Tag>
+                    )}
+                  </div>
+
+                  {issue.original_text && (
+                    <div className="v9-issue-orig" title={issue.original_text}>
+                      原文：{issue.original_text}
+                    </div>
+                  )}
+                  {issue.suggestion && (
+                    <div className="v9-issue-sug">建议：{issue.suggestion}</div>
+                  )}
+                  {issue.reason && <div className="v9-issue-reason">{issue.reason}</div>}
+                  {issue.regulation && <div className="v9-issue-reg">依据：{issue.regulation}</div>}
+                  {(issue.detail?.numeric?.length > 0) && (
+                    <div className="v9-issue-numeric">
+                      {issue.detail.numeric.map((n, i) => (
+                        <div key={i}>🧮 [{n.verdict}] {n.explanation}</div>
+                      ))}
+                    </div>
+                  )}
+
+                  {!issue._resolved && (
+                    <div className="v9-issue-actions" onClick={e => e.stopPropagation()}>
+                      <Button size="small" type="primary" icon={<CheckOutlined />}
+                        onClick={() => sendFeedback(issue, 'accept')}>接受</Button>
+                      <Button size="small" icon={<CloseOutlined />}
+                        onClick={() => sendFeedback(issue, 'reject')}>驳回</Button>
+                      <Button size="small" icon={<EditOutlined />}
+                        onClick={() => { setCustomFor(issue.id); setCustomText('') }}>改写</Button>
+                    </div>
+                  )}
+                  {customFor === issue.id && (
+                    <div className="v9-issue-custom" onClick={e => e.stopPropagation()}>
+                      <TextArea rows={2} value={customText} placeholder="写下你的修改意见，主智能体将据此改写原文…"
+                        onChange={e => setCustomText(e.target.value)} />
+                      <Space style={{ marginTop: 6 }}>
+                        <Button size="small" type="primary" disabled={!customText.trim()}
+                          onClick={() => sendFeedback(issue, 'custom', customText)}>提交给主智能体</Button>
+                        <Button size="small" onClick={() => setCustomFor(null)}>取消</Button>
+                      </Space>
+                    </div>
+                  )}
+                  {issue.agent_note && issue._resolved && (
+                    <div className="v9-issue-agentnote">🤖 {issue.agent_note}</div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
         </div>
 
-        <Dragger {...uploadProps} disabled={uploading || analyzing}>
-          <p className="ant-upload-drag-icon">
-            <FileTextOutlined />
-          </p>
-          <p className="ant-upload-text">点击或拖拽Word文档到此区域上传</p>
-          <p className="ant-upload-hint">
-            支持 .docx 和 .doc 格式，系统将自动进行错别字识别、语义通顺性优化、内容重复检测和技术标准合规性验证
-          </p>
-        </Dragger>
-      </Card>
-
-      {/* 智能体流程图 - 始终显示 */}
-      <Card title="多智能体审查流程" style={{ marginBottom: 16 }}>
-        <Steps
-          current={currentStep}
-          items={agentSteps.map((step, index) => ({
-            title: (
-              <span>
-                <span style={{ fontSize: '20px', marginRight: '8px' }}>{step.icon}</span>
-                {step.title}
-              </span>
-            ),
-            description: step.description,
-            status: analyzing && index === currentStep ? 'process' :
-                    index < currentStep ? 'finish' : 'wait',
-            icon: analyzing && index === currentStep ? <SyncOutlined spin /> :
-                  index < currentStep ? <CheckCircleOutlined /> : null
-          }))}
-        />
-
-        {analyzing && (
-          <div style={{ textAlign: 'center', marginTop: 24 }}>
-            <Spin indicator={<LoadingOutlined style={{ fontSize: 48 }} spin />} />
-            <p style={{ marginTop: 16, fontSize: '16px', fontWeight: 'bold' }}>
-              {agentSteps[currentStep]?.title} 正在工作中...
-            </p>
-            <p style={{ color: '#999' }}>多智能体协同分析，预计需要1-3分钟</p>
+        {/* 中间：Word 文档 */}
+        <div className="v9-doc" ref={docRef}>
+          <div className="v9-doc-head">
+            <FileWordOutlined /> {docName || '文档预览'}
+            {jobId && <Button size="small" type="text" icon={<ReloadOutlined />}
+              onClick={() => fetchDocument(jobId)}>刷新</Button>}
           </div>
-        )}
-      </Card>
-
-      {/* 审查结果 */}
-      {reviewResult && (
-        <>
-          {/* 统计信息 */}
-          <Row gutter={16} style={{ marginBottom: 16 }}>
-            <Col span={6}>
-              <Card>
-                <Statistic
-                  title="总修改建议"
-                  value={reviewResult.total_changes}
-                  prefix={<FileTextOutlined />}
-                  valueStyle={{ color: '#1890ff' }}
-                />
-              </Card>
-            </Col>
-            <Col span={6}>
-              <Card>
-                <Statistic
-                  title="错别字"
-                  value={reviewResult.typo_count}
-                  valueStyle={{ color: '#f5222d' }}
-                />
-              </Card>
-            </Col>
-            <Col span={6}>
-              <Card>
-                <Statistic
-                  title="语义问题"
-                  value={reviewResult.fluency_count}
-                  valueStyle={{ color: '#fa8c16' }}
-                />
-              </Card>
-            </Col>
-            <Col span={6}>
-              <Card>
-                <Statistic
-                  title="合规性问题"
-                  value={reviewResult.compliance_count}
-                  valueStyle={{ color: '#722ed1' }}
-                />
-              </Card>
-            </Col>
-          </Row>
-
-          {/* 操作按钮 */}
-          <Card style={{ marginBottom: 16 }}>
-            <Space>
-              <Button
-                type="primary"
-                icon={<CheckOutlined />}
-                onClick={handleAcceptChanges}
-                disabled={selectedChanges.length === 0}
-              >
-                接受选中修改 ({selectedChanges.length})
-              </Button>
-              <Button onClick={handleSelectAll}>
-                全选
-              </Button>
-              <Button onClick={handleDeselectAll}>
-                取消全选
-              </Button>
-              <Button
-                icon={<DownloadOutlined />}
-                onClick={handleDownload}
-              >
-                下载修改后文档
-              </Button>
-              <Button
-                onClick={() => {
-                  setReviewResult(null)
-                  setSelectedChanges([])
-                  setCurrentStep(0)
-                }}
-              >
-                审查新文档
-              </Button>
-            </Space>
-          </Card>
-
-          {/* 对比视图 */}
-          <Row gutter={16}>
-            {/* 左侧：原文档 */}
-            <Col span={12}>
-              <Card
-                title="原文档"
-                extra={<Tag color="red">待修改</Tag>}
-                style={{ height: '600px', overflow: 'auto' }}
-              >
-                <div className="document-content" style={{ whiteSpace: 'pre-wrap', lineHeight: '1.8' }}>
-                  {reviewResult.original_content}
-                </div>
-              </Card>
-            </Col>
-
-            {/* 右侧：修改建议列表 */}
-            <Col span={12}>
-              <Card
-                title="修改建议"
-                extra={<Tag color="green">共 {reviewResult.total_changes} 处</Tag>}
-                style={{ height: '600px', overflow: 'auto' }}
-              >
-                <List
-                  dataSource={reviewResult.all_changes}
-                  renderItem={(change) => (
-                    <List.Item
-                      key={change.id}
-                      className="change-item"
-                    >
-                      <div style={{ width: '100%' }}>
-                        <Space style={{ marginBottom: 8 }}>
-                          <Checkbox
-                            checked={selectedChanges.includes(change.id)}
-                            onChange={(e) => handleSelectChange(change.id, e.target.checked)}
-                          />
-                          <Tag color={getChangeTypeColor(change.type)}>
-                            {getChangeTypeLabel(change.type)}
-                          </Tag>
-                          {change.severity && (
-                            <Tag color={change.severity === '严重' ? 'red' : 'orange'}>
-                              {change.severity}
-                            </Tag>
-                          )}
-                        </Space>
-
-                        {change.original && (
-                          <div style={{ marginBottom: 8 }}>
-                            <div style={{ color: '#999', fontSize: 12 }}>原文：</div>
-                            <div style={{
-                              background: '#fff1f0',
-                              padding: '8px',
-                              borderRadius: '4px',
-                              color: '#cf1322'
-                            }}>
-                              {change.original}
-                            </div>
-                          </div>
-                        )}
-
-                        {(change.corrected || change.improved || change.suggestion) && (
-                          <div style={{ marginBottom: 8 }}>
-                            <div style={{ color: '#999', fontSize: 12 }}>修改为：</div>
-                            <div style={{
-                              background: '#f6ffed',
-                              padding: '8px',
-                              borderRadius: '4px',
-                              color: '#389e0d'
-                            }}>
-                              {change.corrected || change.improved || change.suggestion}
-                            </div>
-                          </div>
-                        )}
-
-                        {(change.reason || change.issue) && (
-                          <div style={{ color: '#666', fontSize: 12 }}>
-                            原因：{change.reason || change.issue}
-                          </div>
-                        )}
-
-                        {change.reference && (
-                          <div style={{ color: '#1890ff', fontSize: 12, marginTop: 4 }}>
-                            参考：{change.reference}
-                          </div>
-                        )}
-                      </div>
-                    </List.Item>
-                  )}
-                />
-              </Card>
-            </Col>
-          </Row>
-        </>
-      )}
+          <div className="v9-doc-paper">
+            {blocks.length === 0 ? (
+              <Empty description={isRunning ? '正在解析文档…' : '上传 Word 文档后在此显示'}
+                style={{ marginTop: 80 }} />
+            ) : (
+              blocks.map(b => b.kind === 'table' ? renderTable(b) : renderParagraph(b))
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   )
 }

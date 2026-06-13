@@ -8,6 +8,7 @@
 """
 
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -18,8 +19,8 @@ import jieba
 import jieba.analyse
 
 # ── API 配置 ──────────────────────────────────────────
-API_KEY  = "YOUR_API_KEY"
-API_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+API_KEY  = os.getenv("DASHSCOPE_API_KEY")
+API_BASE = os.getenv("DASHSCOPE_BASE_URL")
 MODEL    = "qwen-plus"
 
 # ── 路径配置 ──────────────────────────────────────────
@@ -335,6 +336,10 @@ def main(target_doc: str = None):
         print(f"  [调试模式] 仅处理前 {MAX_CHUNKS} 个 chunks")
 
     # 初始化 Qwen 客户端
+    if not API_KEY:
+        raise RuntimeError("Missing environment variable: DASHSCOPE_API_KEY")
+    if not API_BASE:
+        raise RuntimeError("Missing environment variable: DASHSCOPE_BASE_URL")
     client = OpenAI(api_key=API_KEY, base_url=API_BASE)
 
     # 逐块审查

@@ -1,0 +1,1722 @@
+"""
+混合检索RAG审核系统 v8
+- v4改进：
+  1. 检索立场分类智能体（分类结果仅用于前端展示，不传入审核智能体）
+  2. 审核结果增加"不确定"状态（合规/不合规/不确定）
+  3. 修复v3遗留误判：并列条款、固定数值、幻觉引用等
+  4. 前端：每个chunk卡片固定高度+滚动条；KB参考可点击弹窗查看全文
+  5. 前端：KB参考显示立场分类标签（支持/反对/例外/无关）
+- v5改进：
+  6. 修复误差/偏差/公差范围方向误判：法规"误差在A~B"表示偏差绝对值范围，
+     与待审"±X"（X≤B）等价，不应判为违规
+- v6改进：
+  7. 简化两个审核智能体提示词中"安全触发阈值"（表现C）的判断逻辑，
+     修复传感器报警/断电/复电浓度阈值被误判为违规的问题：
+     - 报警浓度、断电浓度、停工阈值等：待审值 < 法规值 = 更早触发 = 更严格 = 合规
+     - 复电浓度（<X才复电）：待审值 < 法规值 = 要求浓度降得更低才复电 = 更严格 = 合规
+     - 添加明确示例，避免LLM误将"低于法规值"等同于"不满足下限"
+- v7改进：
+  8. 调整执行顺序：合规性审查 -> 结果核验 -> 检索相关性/立场分类。
+     检索相关性仅对最终不合规chunk执行，只用于前端错误展示，不参与合规判断。
+  9. 合规流程、错别字检查、重复性检查三任务并行。
+  10. 提示词增加非突出矿井适用性约束，避免把突出矿井专用条款误用于非突出矿井。
+- v8改进：
+  11. 错别字检查迁移 lzy 后端版本：全文检查、三次重试、中低置信度二次核验。
+  12. 重复性检查迁移 lzy 后端版本：文档级全量向量预筛、0.90 阈值、LLM逐对验证。
+  13. 三条主链并行：文档级重复性检查与逐chunk合规审查链、错别字检查链同时执行。
+"""
+import json
+import hashlib
+import os
+import re
+import time
+from pathlib import Path
+from typing import List, Dict, Any, Tuple, Optional
+from datetime import datetime
+import numpy as np
+
+import dashscope
+from dashscope import TextEmbedding
+import chromadb
+from rank_bm25 import BM25Okapi
+import jieba
+from openai import OpenAI
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ============ 配置 ============
+API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
+BASE_URL = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+dashscope.api_key = API_KEY
+
+QWEN_MODEL = "qwen-plus"
+EMBEDDING_MODEL = "text-embedding-v3"
+
+SIMILARITY_THRESHOLD = 0.1
+TOP_K = 5
+VERIFY_NON_COMPLIANT = True
+DOC_FILTER = []  # 空列表 = 审核全部文档（004、006、066）
+MAX_PENDING_DOCS = 1  # 临时限速：只审核前N个待审文档；设为None或0表示审核全部
+TYPO_MIN_CHUNK_LEN = 10
+REDUNDANCY_SIMILARITY_THRESHOLD = 0.90
+REDUNDANCY_MIN_CHUNK_LEN = 40
+
+KB_CHUNKS_DIR = Path("chunks_visualization")
+PENDING_CHUNKS_DIR = Path("chunks_visualization")
+CHROMA_DB_DIR = Path("data/hybrid_rag_chroma")
+OUTPUT_DIR = Path("review_results")
+
+MINE_APPLICABILITY_NOTE = """【矿井适用性约束】
+本批待审对象按非突出矿井处理。若参考法规片段明确限定为“突出矿井”“煤与瓦斯突出矿井”“突出煤层”“突出危险区域”等突出矿井专用场景：
+- 不得直接作为非突出矿井待审内容的违规依据；
+- 只有待审内容本身明确属于突出矿井/突出煤层/突出危险场景时，才可适用该条款；
+- 若条款既包含突出矿井专用要求又包含通用要求，只能依据其中明确适用于所有矿井或一般场景的部分判断。"""
+
+
+class HybridRAGReviewerV8:
+    """混合检索RAG审核器 v8（三并行：合规链、错别字链、文档级重复性链）"""
+
+    def __init__(self):
+        if not API_KEY:
+            raise ValueError("请设置环境变量 DASHSCOPE_API_KEY")
+        self.llm_client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+        self.kb_chunks: List[Dict] = []
+        self.kb_texts: List[str] = []
+        self.kb_tokenized: List[List[str]] = []
+        self.bm25: BM25Okapi = None
+        self.chroma_client = None
+        self.collection = None
+
+    # ============ 向量 & 搜索 ============
+
+    def get_embeddings(self, texts: List[str]) -> List[List[float]]:
+        batch_size = 10
+        all_embeddings = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            batch = [t if t.strip() else " " for t in batch]
+            resp = TextEmbedding.call(model=EMBEDDING_MODEL, input=batch)
+            if resp.status_code == 200:
+                for item in resp.output['embeddings']:
+                    all_embeddings.append(item['embedding'])
+            else:
+                raise Exception(f"Embedding 失败: {resp.code} - {resp.message}")
+        return all_embeddings
+
+    def load_knowledge_base(self, kb_json_path: str = None):
+        if kb_json_path is None:
+            latest_v6 = KB_CHUNKS_DIR / "chunks_v6_latest.json"
+            v6_files = sorted(KB_CHUNKS_DIR.glob("chunks_v6_20*.json"), reverse=True)
+            latest_v5 = KB_CHUNKS_DIR / "chunks_v5_latest.json"
+            v5_files = sorted(KB_CHUNKS_DIR.glob("chunks_v5_20*.json"), reverse=True)
+            v4_files = sorted(KB_CHUNKS_DIR.glob("chunks_v4_*.json"), reverse=True)
+            if latest_v6.exists():
+                kb_json_path = latest_v6
+            elif v6_files:
+                kb_json_path = v6_files[0]
+            elif latest_v5.exists():
+                kb_json_path = latest_v5
+            elif v5_files:
+                kb_json_path = v5_files[0]
+            elif v4_files:
+                kb_json_path = v4_files[0]
+            else:
+                raise FileNotFoundError("未找到知识库chunks文件")
+        print(f"加载知识库: {kb_json_path}")
+        self.kb_json_path = kb_json_path
+        with open(kb_json_path, 'r', encoding='utf-8') as f:
+            kb_data = json.load(f)
+        chunk_id = 0
+        for doc_name, chunks in kb_data.items():
+            for chunk in chunks:
+                if chunk.get('retrievable', True) is False:
+                    continue
+                chunk['id'] = f"kb_{chunk_id}"
+                chunk['doc_name'] = doc_name
+                chunk_id += 1
+                self.kb_chunks.append(chunk)
+                self.kb_texts.append(chunk.get('retrieval_text') or chunk['content'])
+        print(f"  加载 {len(self.kb_chunks)} 个知识库chunks")
+
+    def build_bm25_index(self):
+        print("构建BM25索引...")
+        self.kb_tokenized = [list(jieba.cut(text)) for text in self.kb_texts]
+        self.bm25 = BM25Okapi(self.kb_tokenized)
+
+    def build_vector_index(self):
+        print("构建向量索引...")
+        CHROMA_DB_DIR.mkdir(parents=True, exist_ok=True)
+        self.chroma_client = chromadb.PersistentClient(path=str(CHROMA_DB_DIR))
+        try:
+            self.chroma_client.delete_collection("kb_chunks")
+        except:
+            pass
+        self.collection = self.chroma_client.create_collection(
+            name="kb_chunks", metadata={"hnsw:space": "cosine"}
+        )
+        valid_chunks = [
+            (i, c) for i, c in enumerate(self.kb_chunks)
+            if (c.get('retrieval_text') or c['content']).strip()
+        ]
+        print(f"  准备 {len(valid_chunks)} 个有效文档...")
+        batch_size = 10
+        for batch_start in range(0, len(valid_chunks), batch_size):
+            batch = valid_chunks[batch_start:batch_start + batch_size]
+            batch_num = batch_start // batch_size + 1
+            total_batches = (len(valid_chunks) - 1) // batch_size + 1
+            print(f"  处理批次 {batch_num}/{total_batches}...")
+            texts = [c.get('retrieval_text') or c['content'] for _, c in batch]
+            ids = [c['id'] for _, c in batch]
+            metadatas = [{
+                'doc_name': c['doc_name'],
+                'chapter': c.get('chapter', ''),
+                'section': c.get('section', ''),
+                'chunk_level': c.get('chunk_level', ''),
+                'page_range': c.get('page_range', '')
+            } for _, c in batch]
+            embeddings = self.get_embeddings(texts)
+            self.collection.add(ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
+            time.sleep(0.5)
+        print(f"  向量索引构建完成，共 {len(valid_chunks)} 个文档")
+
+    def load_or_build_index(self):
+        marker_file = CHROMA_DB_DIR / "kb_source.txt"
+        if hasattr(self, 'kb_json_path'):
+            source_path = Path(self.kb_json_path)
+            source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            current_source = f"{source_path.resolve()}|sha256:{source_hash}"
+        else:
+            current_source = str(len(self.kb_chunks))
+        need_rebuild = True
+        if (CHROMA_DB_DIR / "chroma.sqlite3").exists() and marker_file.exists():
+            if marker_file.read_text(encoding='utf-8').strip() == current_source:
+                need_rebuild = False
+        if not need_rebuild:
+            print("加载已有向量索引（来源匹配）...")
+            self.chroma_client = chromadb.PersistentClient(path=str(CHROMA_DB_DIR))
+            try:
+                self.collection = self.chroma_client.get_collection("kb_chunks")
+                count = self.collection.count()
+                if count > 0:
+                    print(f"  已加载 {count} 个向量")
+                else:
+                    need_rebuild = True
+            except:
+                need_rebuild = True
+        if need_rebuild:
+            print("知识库来源已变更或索引不存在，重新构建向量索引...")
+            self.build_vector_index()
+            CHROMA_DB_DIR.mkdir(parents=True, exist_ok=True)
+            marker_file.write_text(current_source, encoding='utf-8')
+        self.build_bm25_index()
+
+    def vector_search(self, query: str, k: int = TOP_K,
+                      return_timings: bool = False):
+        embedding_start = time.time()
+        query_embedding = self.get_embeddings([query])[0]
+        embedding_elapsed = time.time() - embedding_start
+
+        chroma_start = time.time()
+        results = self.collection.query(query_embeddings=[query_embedding], n_results=k)
+        chroma_elapsed = time.time() - chroma_start
+
+        map_start = time.time()
+        matched = []
+        if results and results['ids'] and results['ids'][0]:
+            for i, chunk_id in enumerate(results['ids'][0]):
+                for chunk in self.kb_chunks:
+                    if chunk['id'] == chunk_id:
+                        distance = results['distances'][0][i] if results.get('distances') else 0
+                        matched.append((chunk, 1 - distance))
+                        break
+        map_elapsed = time.time() - map_start
+        if return_timings:
+            return matched, {
+                'embedding': embedding_elapsed,
+                'chroma': chroma_elapsed,
+                'vector_map': map_elapsed,
+            }
+        return matched
+
+    def bm25_search(self, query: str, k: int = TOP_K) -> List[Tuple[Dict, float]]:
+        query_tokens = list(jieba.cut(query))
+        scores = self.bm25.get_scores(query_tokens)
+        top_indices = np.argsort(scores)[::-1][:k]
+        matched = []
+        for idx in top_indices:
+            if scores[idx] > 0:
+                matched.append((self.kb_chunks[idx], scores[idx] / (scores[idx] + 1)))
+        return matched
+
+    def hybrid_search(self, query: str, k: int = TOP_K,
+                      vector_weight: float = 0.5,
+                      vector_query: str = None,
+                      return_timings: bool = False):
+        # 向量检索和BM25都使用完整chunk，避免长chunk后半段的关键约束漏召回。
+        vector_out = self.vector_search(vector_query or query, k=k * 2, return_timings=return_timings)
+        if return_timings:
+            vector_results, timings = vector_out
+        else:
+            vector_results = vector_out
+            timings = {}
+
+        bm25_start = time.time()
+        bm25_results = self.bm25_search(query, k=k * 2)
+        timings['bm25'] = time.time() - bm25_start
+
+        fusion_start = time.time()
+        rrf_scores = {}
+        similarity_scores = {}
+        chunk_map = {}
+        for rank, (chunk, similarity) in enumerate(vector_results):
+            cid = chunk['id']
+            chunk_map[cid] = chunk
+            rrf_scores[cid] = rrf_scores.get(cid, 0) + vector_weight / (rank + 60)
+            if cid not in similarity_scores:
+                similarity_scores[cid] = similarity
+        for rank, (chunk, score) in enumerate(bm25_results):
+            cid = chunk['id']
+            chunk_map[cid] = chunk
+            rrf_scores[cid] = rrf_scores.get(cid, 0) + (1 - vector_weight) / (rank + 60)
+        sorted_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)[:k]
+        fused_results = [(chunk_map[cid], similarity_scores.get(cid, 0.5)) for cid in sorted_ids]
+        timings['fusion'] = time.time() - fusion_start
+        if return_timings:
+            timings['total'] = sum(timings.values())
+            return fused_results, timings
+        return fused_results
+
+    def search_relevant(self, query: str, k: int = TOP_K,
+                        threshold: float = SIMILARITY_THRESHOLD,
+                        return_timings: bool = False):
+        search_out = self.hybrid_search(query, k=k, return_timings=return_timings)
+        if return_timings:
+            results, timings = search_out
+        else:
+            results = search_out
+            timings = {}
+        relevant = [
+            {'chunk': chunk, 'score': score}
+            for chunk, score in results
+            if score >= threshold
+        ]
+        if return_timings:
+            return relevant, timings
+        return relevant
+
+    @staticmethod
+    def _format_chunk_timings(retrieval_elapsed: float, agent_timings: Dict[str, float]) -> str:
+        def fmt(key: str) -> str:
+            return f"{agent_timings[key]:.1f}s" if key in agent_timings else "-"
+
+        return (
+            f"检索 {retrieval_elapsed:.1f}s / "
+            f"合规初审 {fmt('compliance_review')} / "
+            f"二次验证 {fmt('verification')} / "
+            f"相关性分类 {fmt('kb_classification')} / "
+            f"错别字 {fmt('typo')} / "
+            "重复性 后台并行"
+        )
+
+    # ============ 构建知识库上下文 ============
+
+    def _build_kb_context(self, kb_results: List[Dict]) -> str:
+        kb_context = ""
+        for i, result in enumerate(kb_results, 1):
+            chunk = result['chunk']
+            kb_context += f"\n【参考法规{i}】来源: {chunk['doc_name']}\n"
+            if chunk.get('chapter'):
+                kb_context += f"章节: {chunk['chapter']}\n"
+            if chunk.get('section'):
+                kb_context += f"小节: {chunk['section']}\n"
+            kb_context += f"内容: {chunk['content']}\n"
+            kb_context += "-" * 50
+        return kb_context
+
+    # ============ 智能体1：立场分类 ============
+
+    def classify_kb_chunks(self, pending_chunk: Dict, kb_results: List[Dict]) -> List[Dict]:
+        """
+        立场分类智能体：对每条检索到的KB chunk判断其立场。
+        输出结果仅用于前端展示，不传入审核智能体。
+        分类：支持 / 反对 / 例外 / 无关
+        """
+        pending_content = pending_chunk['content']
+
+        chunk_list_text = ""
+        for i, result in enumerate(kb_results, 1):
+            chunk = result['chunk']
+            chunk_list_text += f"\n[{i}] 来源: {chunk['doc_name']}"
+            if chunk.get('chapter'):
+                chunk_list_text += f" / {chunk['chapter']}"
+            chunk_list_text += f"\n内容: {chunk['content'][:400]}\n"
+
+        prompt = f"""你是煤矿安全法规专家。请判断下方每条法规片段对于"待审内容是否合规"这一问题的立场。
+
+【待审内容】
+{pending_content[:600]}
+
+【待检索到的法规片段列表】
+{chunk_list_text}
+
+{MINE_APPLICABILITY_NOTE}
+
+请对每条法规片段进行立场分类，分类定义：
+- 支持：该片段表明待审内容符合规定（待审内容不违反此片段要求）
+- 反对：该片段表明待审内容存在违规风险（待审内容可能违反此片段要求）
+- 例外：该片段是一个例外或特殊条款，可能允许待审内容的做法
+- 无关：该片段与待审内容无实质关联
+
+注意：
+- "支持"不代表待审内容一定合规，只代表该片段不构成阻碍
+- "反对"不代表一定违规，只代表该片段需要关注
+- 分类依据仅限于片段内容，不做完整合规判断
+
+请输出JSON：
+{{
+  "classifications": [
+    {{"index": 1, "classification": "支持/反对/例外/无关", "reason": "简要原因（20字内）"}},
+    {{"index": 2, "classification": "...", "reason": "..."}},
+    ...
+  ]
+}}
+"""
+        default = [
+            {"index": i + 1, "chunk_id": kb_results[i]['chunk']['id'],
+             "classification": "无关", "reason": "分类失败"}
+            for i in range(len(kb_results))
+        ]
+        try:
+            response = self.llm_client.chat.completions.create(
+                model=QWEN_MODEL,
+                messages=[
+                    {"role": "system", "content": "你是煤矿安全法规专家，负责判断法规片段对待审内容的立场。严格按JSON格式输出。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1
+            )
+            result_text = response.choices[0].message.content
+            json_match = re.search(r'\{[\s\S]*\}', result_text)
+            if not json_match:
+                return default
+            parsed = json.loads(json_match.group())
+            classifications = parsed.get('classifications', [])
+            result = []
+            for i, kb_r in enumerate(kb_results):
+                entry = {"index": i + 1, "chunk_id": kb_r['chunk']['id'],
+                         "classification": "无关", "reason": ""}
+                for c in classifications:
+                    if c.get('index') == i + 1:
+                        entry["classification"] = c.get("classification", "无关")
+                        entry["reason"] = c.get("reason", "")
+                        break
+                result.append(entry)
+            return result
+        except Exception as e:
+            print(f"    分类失败: {e}")
+            return default
+
+    # ============ 智能体2：初审 ============
+
+    def review_chunk_with_llm(self, pending_chunk: Dict, kb_results: List[Dict]) -> Dict:
+        """
+        初审智能体：7条核心原则 + 不确定状态支持。
+        """
+        kb_context = self._build_kb_context(kb_results)
+        pending_content = pending_chunk['content']
+        pending_meta = f"章: {pending_chunk.get('chapter', '')} | 节: {pending_chunk.get('section', '')}"
+
+        prompt = f"""你是一位煤矿安全法规审核专家。请根据下方知识库，判断待审内容是否违反法规要求。
+
+【核心判断规则】
+
+A. 禁止行为
+  - 待审内容**实施**了被禁止的行为 → 违规
+  - 待审内容**禁止**了该行为（写了"严禁/不得"）→ 合规，不得反向判违规
+
+B. 普通数值（尺寸、距离、支护参数等）
+  - 数值下限（不得低于/至少/≥X）：待审值 < 法规值 → 违规；待审值 ≥ 法规值 → 合规
+  - 数值上限（不得超过/最多/≤X）：待审值 > 法规值 → 违规；待审值 ≤ 法规值 → 合规
+  - 数值区间（A~B）：下限和上限分别判断
+
+C. 安全触发阈值（★重要，最常见误判点★）
+  定义：到达某浓度/温度时必须停工、断电、报警、撤人的触发类参数。
+  典型名称：报警浓度、断电浓度、复电浓度、停工阈值、断电阈值。
+  判断逻辑：
+    - 报警浓度≥X、断电浓度≥X、停工阈值≥X：X越小 = 越早触发保护 = 越严格
+      → 待审X < 法规X → 更早触发 → 合规，绝对不得以"低于法规值"判违规
+    - 复电浓度<X（恢复送电的气体浓度上限）：X越小 = 要求浓度降得更低才能复电 = 越严格
+      → 待审X < 法规X → 更严格 → 合规
+  法规表格示例（合规判断）：
+    法规表格"掘进工作面 | 报警≥1.0 | 断电≥1.5 | 复电<1.0"
+    待审设定"报警≥0.8，断电≥1.2，复电<0.8"
+    → 0.8<1.0，1.2<1.5，0.8<1.0 → 三项均更早/更严触发 → 全部合规
+  注意：仅当待审值 > 法规值时（如法规断电≥1.5%，待审断电≥1.8%，更晚断电），才违规。
+  注意：若待审在某地点设定了比法规更严格的触发阈值（如0.8%），不得以"无上位依据"判违规。严于法规即合规。
+
+D. 误差/偏差/公差
+  法规"误差在A~B"或"偏差±X"表示偏差绝对值范围，不区分正负。
+  待审偏差绝对值 ≤ 法规上限 → 合规。
+
+【结论规则】
+  - 知识库中无相关条款 → 合规，注明"知识库中无对应条款"
+  - 知识库有条款但关键数值缺失 → 不确定，issues为空
+  - 待审内容违反某条款 → 不合规，issues记录冲突
+  - issues为空 → compliance_status必须为"合规"
+  - 证据不足（双向解读均合理）→ "不确定"
+
+【待审文档信息】
+{pending_meta}
+
+【待审内容】
+{pending_content}
+
+【参考法规知识库】
+{kb_context}
+
+{MINE_APPLICABILITY_NOTE}
+
+【审核要点】
+1. 禁止行为冲突：待审内容是否实施了法规明确禁止的行为（关注实质，不受措辞限制）
+2. 数值冲突：待审数值是否超出法规上限或低于法规下限（区间需两端分别比较）
+
+请以JSON格式输出审核结果：
+{{
+    "compliance_status": "合规/不合规/不确定",
+    "issues": [
+        {{
+            "type": "数值冲突/规则冲突",
+            "pending_content": "待审文档中的具体内容（原文引用）",
+            "regulation_content": "知识库中对应的法规要求（必须是知识库原文）",
+            "description": "冲突说明（简洁，不超过100字）",
+            "suggestion": "修改建议"
+        }}
+    ],
+    "summary": "一句话审核结论"
+}}
+
+注意：
+- issues为空时compliance_status必须为"合规"
+- "不确定"状态仅用于知识库信息不足以判断的情况，issues可以包含待确认项
+"""
+
+        try:
+            response = self.llm_client.chat.completions.create(
+                model=QWEN_MODEL,
+                messages=[
+                    {"role": "system",
+                     "content": "你是煤矿安全法规审核专家。只关注数值冲突和规则冲突，严于法规的要求视为合规。严格按JSON格式输出，不引用知识库以外的内容。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1
+            )
+            result_text = response.choices[0].message.content
+            json_match = re.search(r'\{[\s\S]*\}', result_text)
+            if json_match:
+                return json.loads(json_match.group())
+            return {"raw_response": result_text, "parse_error": "无法提取JSON"}
+        except json.JSONDecodeError:
+            return {"raw_response": result_text, "parse_error": "JSON解析失败"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    # ============ 智能体3：验证 ============
+
+    def verify_review_result(self, pending_chunk: Dict, kb_results: List[Dict],
+                             initial_result: Dict) -> Dict:
+        """
+        验证智能体：对初审"不合规"/"不确定"结果进行二次核查，过滤5类误判。
+        只删除误判项，不新增问题。
+        """
+        kb_context = self._build_kb_context(kb_results)
+        pending_content = pending_chunk['content']
+        initial_issues_text = json.dumps(
+            initial_result.get('issues', []), ensure_ascii=False, indent=2
+        )
+
+        prompt = f"""你是一位资深合规审核质量控制专家。请检查初步审核结果，识别并纠正其中的误判。
+你只能删除误判项，不能新增问题，不能修改正确的违规判断。
+
+【待审内容】
+{pending_content}
+
+【参考法规知识库（唯一允许引用的依据）】
+{kb_context}
+
+{MINE_APPLICABILITY_NOTE}
+
+【初步审核发现的问题（需逐条核查）】
+{initial_issues_text}
+
+请逐条检查以下误判类型，符合则删除：
+
+━━ 误判类型1：严于法规被错判违规 ━━
+
+表现A（普通数值方向误判）
+  - 上限约束：待审上限 < 法规上限 → 更严 → 删除；待审上限 > 法规上限 → 真实违规 → 保留
+  - 下限约束：待审下限 > 法规下限 → 更严 → 删除；待审下限 < 法规下限 → 真实违规 → 保留
+
+表现B（禁止行为方向误判）
+  待审原文写了"严禁/不得"来约束某行为，却被误判为"实施了该违规行为"。
+  → 检查待审原文，若是"严禁/不得"修饰，则删除。
+
+表现C（安全触发阈值误判）★最常见错误★
+  适用场景：问题涉及"报警浓度""断电浓度""复电浓度""停工阈值""断电阈值"等传感器/应急触发参数。
+  判断规则：
+    · 报警≥X、断电≥X、停工≥X：X越小=越早触发=越严格。待审X < 法规X → 删除（合规）
+    · 复电<X：X越小=要求浓度降得更低才能复电=越严格。待审X < 法规X → 删除（合规）
+    · 若理由是"无上位依据"但待审值比法规更严（更早触发）→ 也删除（严于法规即合规）
+  关键示例1（法规表格行）：
+    法规表格"掘进工作面 | 报警≥1.0 | 断电≥1.5 | 复电<1.0"
+    待审"T1：报警≥0.8，断电≥1.2，复电<0.8"
+    → 逐项：0.8<1.0 ✓，1.2<1.5 ✓，0.8<1.0 ✓ → 三项全部更早/更严触发 → 全部合规 → 删除
+  关键示例2（回风流断电阈值）：
+    法规§193"风流中甲烷≥1.0%时停止用电作业"
+    待审"回风流≥0.8%时停止工作" → 0.8<1.0，更早停工，严于法规 → 合规 → 删除
+  反例（不删除）：法规"报警≥1.0%"，待审"报警≥1.2%"→ 1.2>1.0，更晚报警，真实违规，保留。
+
+━━ 误判类型2：引用知识库外条款或数据缺失 ━━
+  问题引用的条款/数值在知识库原文中不存在，或法规字段为空/"数据不完整"。
+  → 删除，整体结果改为"不确定"。
+
+━━ 误判类型3：并列条件被误读为"任择其一" ━━
+  → 删除。
+
+━━ 误判类型4：固定数值因"刚性"被判违规 ━━
+  固定数值本身在法规允许范围内，仅因为是固定值而被判违规。
+  → 检查该值是否违反法规数值限制，若未违反则删除。
+
+━━ 误判类型5：等待后检查被判违反"先检查"原则 ━━
+  → 删除。
+
+━━ 误判类型6：误差/偏差范围方向误判 ━━
+  法规"误差在A~B"，待审"±X"（X≤B），初审认为"允许负偏差"违规。
+  → 删除（偏差范围不区分正负方向）。
+
+【保留原则】真实数值冲突（待审数值确实比法规更宽松）和真实规则冲突必须保留。不确定是否误判时，保留。
+
+请输出修正后的完整审核结果：
+{{
+    "compliance_status": "合规/不合规/不确定",
+    "issues": [...],
+    "summary": "修正后的一句话结论",
+    "verification_notes": "说明删除了哪些误判项及原因（若无修正填'初审结果准确，无误判'）"
+}}
+"""
+
+        try:
+            response = self.llm_client.chat.completions.create(
+                model=QWEN_MODEL,
+                messages=[
+                    {"role": "system",
+                     "content": "你是合规审核质量控制专家，专门纠正初审中的误判。只删除误判项，不新增问题。严格按JSON格式输出。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1
+            )
+            result_text = response.choices[0].message.content
+            json_match = re.search(r'\{[\s\S]*\}', result_text)
+            if json_match:
+                verified = json.loads(json_match.group())
+                # 尊重验证智能体返回的状态（如"不确定"）；只在状态缺失时按issues推断
+                if 'compliance_status' not in verified or not verified['compliance_status']:
+                    verified['compliance_status'] = '合规' if not verified.get('issues') else '不合规'
+                elif not verified.get('issues') and verified.get('compliance_status') not in ('不确定',):
+                    verified['compliance_status'] = '合规'
+                return verified
+            return initial_result
+        except Exception as e:
+            print(f"    验证失败: {e}，使用初审结果")
+            return initial_result
+
+    # ============ 完整三智能体审核流程 ============
+
+    @staticmethod
+    def _is_noncompliant_review(review_result: Dict) -> bool:
+        """Return True only when the final compliance result should be shown as an error."""
+        status = str(review_result.get('compliance_status', ''))
+        return bool(review_result.get('issues')) or ('不合规' in status)
+
+    def review_chunk_complete(self, pending_chunk: Dict,
+                              kb_results: List[Dict]) -> Tuple[Dict, List[Dict], Dict[str, float]]:
+        """
+        完整合规审核流程：
+        1. 合规性审查智能体
+        2. 结果核验智能体（仅对不合规/不确定调用）
+        3. 检索相关性/立场分类智能体（仅最终不合规时调用，仅用于前端展示）
+        返回 (审核结果, 分类结果列表, 各智能体耗时)
+        """
+        classifications: List[Dict] = []
+        timings: Dict[str, float] = {}
+
+        # Stage 1: 合规性审查
+        review_start = time.time()
+        draft = self.review_chunk_with_llm(pending_chunk, kb_results)
+        timings['compliance_review'] = time.time() - review_start
+        if draft.get('error') or draft.get('parse_error'):
+            draft['verified'] = False
+            return draft, classifications, timings
+
+        has_issues = bool(draft.get('issues'))
+        status = draft.get('compliance_status', '')
+        needs_verify = VERIFY_NON_COMPLIANT and has_issues and ('不合规' in status or '不确定' in status)
+
+        # Stage 2: 结果核验
+        if needs_verify:
+            print("（二次验证）", end=" ", flush=True)
+            verify_start = time.time()
+            final_result = self.verify_review_result(pending_chunk, kb_results, draft)
+            timings['verification'] = time.time() - verify_start
+            final_result['verified'] = True
+            final_result['draft_issue_count'] = len(draft.get('issues', []))
+        else:
+            draft['verified'] = False
+            final_result = draft
+
+        # Stage 3: 检索相关性/立场分类，仅对最终不合规chunk做前端展示
+        if self._is_noncompliant_review(final_result):
+            print("（相关性分类）", end=" ", flush=True)
+            classify_start = time.time()
+            classifications = self.classify_kb_chunks(pending_chunk, kb_results)
+            timings['kb_classification'] = time.time() - classify_start
+
+        return final_result, classifications, timings
+
+    # ============ 智能体4：错别字检查 ============
+
+    TYPO_SYSTEM_PROMPT = """你是一名专业的煤矿安全文档审校专家，负责检查作业规程中的错别字和用词错误。
+
+检查范围（只报告以下类型）：
+1. 错别字：汉字写错，如"既"与"即"、"做"与"作"、"在"与"再"混用
+2. 术语错误：煤矿专业术语写错，如"综采"误写为"综彩"
+3. 明显用词错误：在上下文中明显不通顺或语义矛盾的词语
+
+不检查的内容：
+- 标点符号、格式、排版问题
+- 数字、单位数值（单位符号错误由规程审查负责，此处不报）
+- 纯符号数学公式（如仅由字母、数字、运算符、括号组成的表达式，不含汉字）
+- 单位格式问题：上标缺失（"m 2"）、单位字母拆分（"m i n"）、斜杠截断（"m 3 /"）等
+- 语法不通顺但无错字的句子
+- 专有名词、地名、人名的用字习惯差异
+- 行业内约定俗成的缩写简称（如"安培中心""通防"等）
+- 以下 OCR 扫描噪声，一律不报：
+  * 型号/规格中多余的符号或空格（如"MD155-. 30×4"中的"-."）
+  * 编号中字母与数字形近的OCR误读（如"S↔5"、"O↔0"）
+  * 文本末尾孤立的单个字母（如"200 mm c"末尾的"c"）
+  * 重复的间隔符（如"··"）
+
+审查原则：
+- 积极报告：在正文汉字句子中发现疑似错别字时，应上报，不要因"可能是专业术语"就放弃
+- 煤矿专业术语存疑时仍可上报，但在 reason 中注明"不确定是否为专业术语，建议人工核实"
+- 不得以全称替代简称为由报告错别字
+- 每个错别字单独报告，不合并
+
+输出格式（严格 JSON 数组，不含任何 Markdown 代码块标记）：
+若发现错别字，返回：
+[
+  {
+    "wrong_char": "错误的字或词",
+    "correct_char": "正确的字或词",
+    "context": "包含错别字的原文片段（前后各约10个字）",
+    "reason": "判断依据（简短说明为何是错别字）",
+    "confidence": "高|中|低"
+  }
+]
+confidence 说明：高=确定是错别字；中=可能是错别字但有一定不确定性；低=存疑，可能是专业术语或OCR噪声。
+若无错别字，返回：[]"""
+
+    TYPO_VERIFY_PROMPT = """判断以下错别字报告是否为误报。
+
+原文上下文：{context}
+报告的错误：「{wrong_char}」→「{correct_char}」
+判断依据：{reason}
+
+以下情形为误报，回答 false：
+- 煤矿专业术语（即使普通词典未收录）
+- OCR 扫描噪声（多余符号、字母数字形近误读）
+- 单位/公式/编号的格式问题
+- 行业缩写简称
+
+只回答 true（确实是错别字）或 false（误报），不输出其他内容。"""
+
+    @staticmethod
+    def _strip_json_fence(raw: str) -> str:
+        raw = raw.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        return raw.strip()
+
+    def _verify_typo_issue(self, issue: Dict) -> bool:
+        """中、低置信度条目二次验证；验证调用失败时保留。"""
+        if issue.get("confidence") == "高":
+            return True
+        prompt = self.TYPO_VERIFY_PROMPT.format(
+            context=issue.get("context", ""),
+            wrong_char=issue.get("wrong_char", ""),
+            correct_char=issue.get("correct_char", ""),
+            reason=issue.get("reason", ""),
+        )
+        try:
+            resp = self.llm_client.chat.completions.create(
+                model=QWEN_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=5,
+            )
+            return resp.choices[0].message.content.strip().lower().startswith("true")
+        except Exception:
+            return True
+
+    def check_typos(self, pending_chunk: Dict) -> Dict:
+        """按 lzy 后端逻辑进行全文检查，并兼容当前结果结构。"""
+        content = pending_chunk.get("content", "").strip()
+        default = {"has_issues": False, "issues": [], "summary": "未发现错别字"}
+        if len(content) < TYPO_MIN_CHUNK_LEN:
+            return default
+
+        user_msg = f"请检查以下文本中的错别字：\n\n{content}"
+        last_error = ""
+        for attempt in range(3):
+            try:
+                resp = self.llm_client.chat.completions.create(
+                    model=QWEN_MODEL,
+                    messages=[
+                        {"role": "system", "content": self.TYPO_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    temperature=0.0,
+                )
+                raw = self._strip_json_fence(resp.choices[0].message.content or "")
+                if not raw:
+                    raise ValueError("空响应")
+                result = json.loads(raw)
+                if not isinstance(result, list):
+                    return default
+
+                skip_keywords = ("未出现", "暂不报", "无需报告", "不报告", "不存在", "无错")
+                filtered = [
+                    item for item in result
+                    if isinstance(item, dict)
+                    and item.get("wrong_char", "").strip()
+                    and item.get("wrong_char", "").strip() != item.get("correct_char", "").strip()
+                    and not any(kw in item.get("correct_char", "") for kw in skip_keywords)
+                    and not any(kw in item.get("reason", "") for kw in skip_keywords)
+                ]
+                filtered = [item for item in filtered if self._verify_typo_issue(item)]
+                issues = [
+                    {
+                        **item,
+                        "original": item.get("wrong_char", ""),
+                        "suggestion": item.get("correct_char", ""),
+                    }
+                    for item in filtered
+                ]
+                return {
+                    "has_issues": bool(issues),
+                    "issues": issues,
+                    "summary": f"发现 {len(issues)} 处疑似错别字" if issues else "未发现错别字",
+                }
+            except Exception as e:
+                last_error = str(e)
+                if attempt < 2:
+                    time.sleep(1)
+        return {**default, "summary": f"检查异常（重试3次）: {last_error[:60]}"}
+
+    # ============ 智能体5：重复性检查 ============
+
+    REDUNDANCY_PROMPT = """你是煤矿作业规程专家。判断以下两段作业规程内容是否存在实质性重复。
+
+【片段A】
+位置：{chapter_a} / {section_a}
+{content_a}
+
+【片段B】
+位置：{chapter_b} / {section_b}
+{content_b}
+
+判断规则：
+1. 两段内容表述相同要求（哪怕用词不同）→ "重复"
+2. 两段内容属于同类操作的不同场景、不同工序或不同层级要求 → "正常"
+
+只输出以下 JSON（无 Markdown 标记）：
+{{"type":"重复"|"正常","description":"简要说明（30字以内）"}}"""
+
+    def _verify_redundancy_pair(self, chunk_a: Dict, chunk_b: Dict) -> Dict:
+        prompt = self.REDUNDANCY_PROMPT.format(
+            chapter_a=chunk_a.get("chapter", ""),
+            section_a=chunk_a.get("section", ""),
+            content_a=chunk_a.get("content", "")[:600],
+            chapter_b=chunk_b.get("chapter", ""),
+            section_b=chunk_b.get("section", ""),
+            content_b=chunk_b.get("content", "")[:600],
+        )
+        try:
+            resp = self.llm_client.chat.completions.create(
+                model=QWEN_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=150,
+            )
+            return json.loads(self._strip_json_fence(resp.choices[0].message.content or ""))
+        except Exception:
+            return {"type": "正常", "description": ""}
+
+    @staticmethod
+    def _empty_repetition_result(summary: str = "无重复内容") -> Dict:
+        return {"has_duplicates": False, "duplicates": [], "summary": summary}
+
+    def _embed_repetition_texts(self, texts: List[str]) -> np.ndarray:
+        """与 lzy 后端一致，通过 OpenAI 兼容接口分批获取重复检测向量。"""
+        vectors = []
+        for i in range(0, len(texts), 10):
+            response = self.llm_client.embeddings.create(
+                model=EMBEDDING_MODEL,
+                input=texts[i:i + 10],
+            )
+            vectors.extend(item.embedding for item in response.data)
+        return np.asarray(vectors, dtype=np.float32)
+
+    def check_document_repetition(self, doc_name: str, chunks: List[Dict]) -> Tuple[Dict[int, Dict], Dict[str, float]]:
+        """按 lzy 后端逻辑一次性检查整篇文档，并将重复对映射回两个 chunk。"""
+        started = time.time()
+        results = {i: self._empty_repetition_result() for i in range(len(chunks))}
+        valid = [
+            (i, {**chunk, "doc_name": doc_name})
+            for i, chunk in enumerate(chunks)
+            if len(chunk.get("content", "")) >= REDUNDANCY_MIN_CHUNK_LEN
+        ]
+        if len(valid) < 2:
+            return results, {"embedding": 0.0, "verification": 0.0, "total": time.time() - started}
+
+        embedding_start = time.time()
+        vectors = self._embed_repetition_texts([chunk["content"] for _, chunk in valid])
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        vectors = vectors / np.where(norms == 0, 1, norms)
+        similarity_matrix = vectors @ vectors.T
+        embedding_elapsed = time.time() - embedding_start
+
+        candidates = []
+        for i in range(len(valid)):
+            for j in range(i + 1, len(valid)):
+                if valid[i][1].get("doc_name") != valid[j][1].get("doc_name"):
+                    continue
+                similarity = float(similarity_matrix[i, j])
+                if similarity >= REDUNDANCY_SIMILARITY_THRESHOLD:
+                    candidates.append((i, j, similarity))
+        candidates.sort(key=lambda item: -item[2])
+
+        verify_start = time.time()
+        for valid_i, valid_j, similarity in candidates:
+            chunk_i, chunk_a = valid[valid_i]
+            chunk_j, chunk_b = valid[valid_j]
+            verdict = self._verify_redundancy_pair(chunk_a, chunk_b)
+            if verdict.get("type", "正常") != "重复":
+                continue
+            description = verdict.get("description", "")
+            pair_data = {
+                "redundancy_type": "重复",
+                "similarity": round(similarity, 3),
+                "description": description,
+                "chunk_a": {
+                    "doc_name": doc_name,
+                    "chapter": chunk_a.get("chapter", ""),
+                    "section": chunk_a.get("section", ""),
+                    "content": chunk_a.get("content", ""),
+                    "page_range": chunk_a.get("page_range", ""),
+                },
+                "chunk_b": {
+                    "doc_name": doc_name,
+                    "chapter": chunk_b.get("chapter", ""),
+                    "section": chunk_b.get("section", ""),
+                    "content": chunk_b.get("content", ""),
+                    "page_range": chunk_b.get("page_range", ""),
+                },
+            }
+            for own_idx, other_idx, other_chunk in (
+                (chunk_i, chunk_j, chunk_b),
+                (chunk_j, chunk_i, chunk_a),
+            ):
+                duplicate = {
+                    **pair_data,
+                    "chunk_ref": (
+                        f"Chunk#{other_idx + 1}"
+                        f"（{other_chunk.get('chapter', '')} / {other_chunk.get('section', '')}）"
+                    ),
+                    "note": description,
+                }
+                results[own_idx]["duplicates"].append(duplicate)
+                results[own_idx]["has_duplicates"] = True
+
+        for result in results.values():
+            if result["has_duplicates"]:
+                result["summary"] = f"发现 {len(result['duplicates'])} 处实质性重复"
+        verification_elapsed = time.time() - verify_start
+        return results, {
+            "embedding": embedding_elapsed,
+            "verification": verification_elapsed,
+            "total": time.time() - started,
+            "candidates": len(candidates),
+        }
+
+    # ============ 并行任务调度 ============
+
+    @staticmethod
+    def _timed_call(fn, *args):
+        start = time.time()
+        result = fn(*args)
+        return result, time.time() - start
+
+    def review_chunk_all_tasks(self, pending_chunk: Dict,
+                               kb_results: List[Dict]) -> Tuple[Dict, List[Dict], Dict, Dict[str, float]]:
+        """并行执行合规审查链与错别字检查；文档级重复性检查在外层并行。"""
+        with ThreadPoolExecutor(max_workers=2) as exe:
+            f_compliance = exe.submit(self.review_chunk_complete, pending_chunk, kb_results)
+            f_typo = exe.submit(self._timed_call, self.check_typos, pending_chunk)
+            compliance_result, classifications, agent_timings = f_compliance.result()
+            typo_result, typo_elapsed = f_typo.result()
+        agent_timings['typo'] = typo_elapsed
+        return compliance_result, classifications, typo_result, agent_timings
+
+    # ============ 审核待审文档 ============
+
+    def review_pending_document(self, pending_json_path: str = None,
+                                doc_filter: List[str] = None,
+                                max_documents: Optional[int] = MAX_PENDING_DOCS) -> Dict:
+        if pending_json_path is None:
+            for version in ['v9', 'v8', 'v7', 'v6', 'v5', 'v4', 'v3', 'v2']:
+                files = sorted(PENDING_CHUNKS_DIR.glob(f"pending_doc_chunks_{version}_*.json"), reverse=True)
+                if files:
+                    pending_json_path = files[0]
+                    break
+            if pending_json_path is None:
+                raise FileNotFoundError("未找到待审文档chunks文件")
+
+        print(f"\n加载待审文档: {pending_json_path}")
+        with open(pending_json_path, 'r', encoding='utf-8') as f:
+            pending_data = json.load(f)
+
+        if doc_filter is None:
+            doc_filter = DOC_FILTER
+        if doc_filter:
+            pending_data = {
+                k: v for k, v in pending_data.items()
+                if any(f in k for f in doc_filter)
+            }
+            print(f"  过滤后文档数: {len(pending_data)} (过滤条件: {doc_filter})")
+
+        if max_documents and max_documents > 0:
+            pending_data = dict(list(pending_data.items())[:max_documents])
+            print(f"  临时限制：仅审核前 {max_documents} 个待审文档: {list(pending_data.keys())}")
+
+        # ---- 断点续跑：加载已有增量结果 ----
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        incremental_suffix = f"_first_{max_documents}" if max_documents and max_documents > 0 else ""
+        incremental_path = OUTPUT_DIR / f"review_result_v8_incremental{incremental_suffix}.json"
+        all_results: Dict = {}
+        if incremental_path.exists():
+            try:
+                with open(incremental_path, 'r', encoding='utf-8') as f:
+                    all_results = json.load(f)
+                print(f"  [续跑] 已加载增量结果，跳过已完成文档: {list(all_results.keys())}")
+            except Exception:
+                all_results = {}
+
+        total_chunks = sum(len(c) for c in pending_data.values())
+        processed = sum(
+            len(all_results[k]) for k in all_results if k in pending_data
+        )
+        doc_timings = {}
+        total_start = time.time()
+        api_fatal = False  # 账户欠费等致命错误标志
+
+        for doc_name, chunks in pending_data.items():
+            if doc_name in all_results:
+                print(f"\n跳过（已有结果）: {doc_name}")
+                continue
+            if api_fatal:
+                print(f"\n[跳过] API不可用，暂停后续文档: {doc_name}")
+                continue
+
+            doc_start = time.time()
+            print(f"\n审核文档: {doc_name} ({len(chunks)} chunks)")
+            doc_results = []
+
+            # 第三条并行主链：整篇文档的重复性检查在后台执行。
+            repetition_executor = ThreadPoolExecutor(max_workers=1)
+            repetition_future = repetition_executor.submit(
+                self.check_document_repetition, doc_name, chunks
+            )
+            print("  已启动三并行：文档级重复性检查 ‖ 合规审查链 ‖ 错别字检查链")
+
+            for i, chunk in enumerate(chunks):
+                if api_fatal:
+                    break
+                processed += 1
+                chunk_start = time.time()
+                print(f"  [{processed}/{total_chunks}] chunk {i + 1}/{len(chunks)}...", end=" ", flush=True)
+
+                retrieval_start = time.time()
+                retrieval_elapsed = 0.0
+                agent_timings: Dict[str, float] = {}
+                try:
+                    query = chunk['content']
+                    kb_results = self.search_relevant(query, k=TOP_K, threshold=SIMILARITY_THRESHOLD)
+                    retrieval_elapsed = time.time() - retrieval_start
+                except Exception as e:
+                    retrieval_elapsed = time.time() - retrieval_start
+                    err_str = str(e)
+                    if 'Arrearage' in err_str or 'overdue' in err_str.lower() or 'Access denied' in err_str:
+                        print(f"\n  [致命] API欠费，保存已有结果后退出: {err_str[:80]}")
+                        api_fatal = True
+                        break
+                    print(f"检索失败({err_str[:60]})，跳过")
+                    kb_results = []
+
+                if not kb_results:
+                    print("未找到相关法规，执行错别字检查...", end=" ", flush=True)
+                    try:
+                        typo_start = time.time()
+                        typo_result = self.check_typos(chunk)
+                        agent_timings['typo'] = time.time() - typo_start
+                    except Exception as e:
+                        err_str = str(e)
+                        if 'Arrearage' in err_str or 'Access denied' in err_str:
+                            print(f"\n  [致命] API欠费，保存已有结果后退出")
+                            api_fatal = True
+                            break
+                        typo_result = {"has_issues": False, "issues": [], "summary": "检查异常"}
+                    rep_result = self._empty_repetition_result("等待文档级重复性检查回填")
+                    chunk_elapsed = time.time() - chunk_start
+                    print(f"耗时 {chunk_elapsed:.1f}s（{self._format_chunk_timings(retrieval_elapsed, agent_timings)}）")
+                    doc_results.append({
+                        'chunk_index': i,
+                        'chunk_content': chunk['content'],
+                        'chunk_meta': {
+                            'chapter': chunk.get('chapter', ''),
+                            'section': chunk.get('section', ''),
+                            'page_range': chunk.get('page_range', '')
+                        },
+                        'kb_matches': 0,
+                        'kb_refs': [],
+                        'kb_classifications': [],
+                        'review_result': {"compliance_status": "不确定", "summary": "未找到相关法规", "issues": []},
+                        'typo_result': typo_result,
+                        'repetition_result': rep_result,
+                    })
+                    continue
+
+                print(f"找到 {len(kb_results)} 条相关法规，并行合规链与错别字检查...", end=" ", flush=True)
+                try:
+                    review_result, classifications, typo_result, agent_timings = \
+                        self.review_chunk_all_tasks(chunk, kb_results)
+                except Exception as e:
+                    err_str = str(e)
+                    if 'Arrearage' in err_str or 'Access denied' in err_str:
+                        print(f"\n  [致命] API欠费，保存已有结果后退出")
+                        api_fatal = True
+                        break
+                    print(f"LLM调用失败({err_str[:60]})，标记不确定")
+                    review_result = {"compliance_status": "不确定", "summary": f"调用失败: {err_str[:60]}", "issues": []}
+                    classifications = []
+                    typo_result = {"has_issues": False, "issues": [], "summary": "检查异常"}
+                rep_result = self._empty_repetition_result("等待文档级重复性检查回填")
+                chunk_elapsed = time.time() - chunk_start
+                print(f"耗时 {chunk_elapsed:.1f}s（{self._format_chunk_timings(retrieval_elapsed, agent_timings)}）")
+
+                show_kb_refs = self._is_noncompliant_review(review_result)
+                doc_results.append({
+                    'chunk_index': i,
+                    'chunk_content': chunk['content'],
+                    'chunk_meta': {
+                        'chapter': chunk.get('chapter', ''),
+                        'section': chunk.get('section', ''),
+                        'page_range': chunk.get('page_range', '')
+                    },
+                    'kb_matches': len(kb_results) if show_kb_refs else 0,
+                    'kb_refs': [
+                        {
+                            'doc': r['chunk']['doc_name'],
+                            'chapter': r['chunk'].get('chapter', ''),
+                            'section': r['chunk'].get('section', ''),
+                            'score': round(r['score'], 4),
+                            'chunk_id': r['chunk']['id'],
+                            'content': r['chunk']['content'],
+                        }
+                        for r in kb_results
+                    ] if show_kb_refs else [],
+                    'kb_classifications': classifications if show_kb_refs else [],
+                    'review_result': review_result,
+                    'typo_result': typo_result,
+                    'repetition_result': rep_result,
+                })
+
+            print("  等待文档级重复性检查并回填结果...", end=" ", flush=True)
+            try:
+                repetition_by_chunk, repetition_timings = repetition_future.result()
+                print(
+                    f"候选对 {repetition_timings.get('candidates', 0)}，"
+                    f"耗时 {repetition_timings.get('total', 0.0):.1f}s"
+                )
+            except Exception as e:
+                print(f"失败({str(e)[:60]})")
+                repetition_by_chunk = {
+                    i: self._empty_repetition_result(f"检查异常: {str(e)[:60]}")
+                    for i in range(len(chunks))
+                }
+            finally:
+                repetition_executor.shutdown(wait=True)
+
+            for result in doc_results:
+                result['repetition_result'] = repetition_by_chunk.get(
+                    result['chunk_index'],
+                    self._empty_repetition_result("未取得重复性检查结果"),
+                )
+
+            doc_elapsed = time.time() - doc_start
+            doc_timings[doc_name] = doc_elapsed
+
+            # 每完成一个文档立即保存增量结果
+            if doc_results:
+                all_results[doc_name] = doc_results
+                self._save_incremental(all_results, incremental_path)
+                print(f"  文档审核完成，耗时 {doc_elapsed:.1f}s  [已增量保存]")
+            else:
+                print(f"  文档无结果（可能因API中断），耗时 {doc_elapsed:.1f}s")
+
+        total_elapsed = time.time() - total_start
+        print(f"\n全部处理完毕，总耗时 {total_elapsed:.1f}s")
+        for name, t in doc_timings.items():
+            print(f"  {name}: {t:.1f}s")
+        if api_fatal:
+            print("  ⚠️  因API欠费提前终止，请充值后重新运行（将自动续跑）")
+
+        return all_results
+
+    def _save_incremental(self, results: Dict, path):
+        """将结果保存到增量文件（不含KB全文）。"""
+        slim = {}
+        for doc_name, doc_results in results.items():
+            slim[doc_name] = []
+            for r in doc_results:
+                r_slim = dict(r)
+                r_slim['kb_refs'] = [
+                    {k: v for k, v in ref.items() if k != 'content'}
+                    for ref in r.get('kb_refs', [])
+                ]
+                slim[doc_name].append(r_slim)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(slim, f, ensure_ascii=False, indent=2)
+
+    # ============ 保存与报告 ============
+
+    def save_results(self, results: Dict, output_path: str = None):
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        if output_path is None:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_path = OUTPUT_DIR / f"review_result_v8_{timestamp}.json"
+        # 保存时不含kb全文（减小体积）
+        slim = {}
+        for doc_name, doc_results in results.items():
+            slim[doc_name] = []
+            for r in doc_results:
+                r_slim = dict(r)
+                r_slim['kb_refs'] = [
+                    {k: v for k, v in ref.items() if k != 'content'}
+                    for ref in r.get('kb_refs', [])
+                ]
+                slim[doc_name].append(r_slim)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(slim, f, ensure_ascii=False, indent=2)
+        print(f"\n审核结果已保存: {output_path}")
+        return output_path
+
+    def generate_report(self, results: Dict, output_path: str = None):
+        """生成HTML审核报告 v8（合规链 + lzy版错别字 + 文档级重复性）"""
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        if output_path is None:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_path = OUTPUT_DIR / f"review_report_v8_{timestamp}.html"
+
+        # ---- 统计 ----
+        total_chunks = 0
+        status_counts = {'合规': 0, '不合规': 0, '不确定': 0}
+        verified_count = 0
+        corrected_count = 0
+        typo_chunk_count = 0
+        typo_issue_count = 0
+        rep_chunk_count = 0
+
+        for doc_results in results.values():
+            for r in doc_results:
+                total_chunks += 1
+                review = r.get('review_result', {})
+                status = review.get('compliance_status', '不确定')
+                if '合规' in status and '不' not in status:
+                    status_counts['合规'] += 1
+                elif '不合规' in status:
+                    status_counts['不合规'] += 1
+                else:
+                    status_counts['不确定'] += 1
+                if review.get('verified'):
+                    verified_count += 1
+                    if len(review.get('issues', [])) < review.get('draft_issue_count', 0):
+                        corrected_count += 1
+                typo = r.get('typo_result', {})
+                if typo.get('has_issues'):
+                    typo_chunk_count += 1
+                    typo_issue_count += len(typo.get('issues', []))
+                if r.get('repetition_result', {}).get('has_duplicates'):
+                    rep_chunk_count += 1
+
+        # ---- 分类颜色映射 ----
+        clf_colors = {
+            '支持': '#27ae60',
+            '反对': '#e74c3c',
+            '例外': '#e67e22',
+            '无关': '#95a5a6',
+        }
+
+        # ---- 构建KB弹窗数据 ----
+        # 收集所有KB chunk的全文，用于JS弹窗
+        kb_full_texts: Dict[str, str] = {}
+        for doc_results in results.values():
+            for r in doc_results:
+                for ref in r.get('kb_refs', []):
+                    cid = ref.get('chunk_id', '')
+                    if cid and cid not in kb_full_texts:
+                        kb_full_texts[cid] = ref.get('content', '')
+
+        # 转义HTML
+        def esc(s: str) -> str:
+            return (str(s).replace('&', '&amp;').replace('<', '&lt;')
+                    .replace('>', '&gt;').replace('"', '&quot;')
+                    .replace("'", '&#39;').replace('\n', '<br>'))
+
+        # ---- CSS & JS ----
+        style = """
+body { font-family: 'Microsoft YaHei', Arial, sans-serif; margin: 0; background: #f0f2f5; }
+.page-header { background: #2c3e50; color: white; padding: 20px 30px; }
+.page-header h1 { margin: 0 0 6px 0; font-size: 1.4em; }
+.page-header .meta { font-size: 0.85em; opacity: 0.8; }
+.main { max-width: 1200px; margin: 20px auto; padding: 0 20px; }
+.summary-card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-top: 12px; }
+.stat-card { padding: 14px; border-radius: 8px; text-align: center; color: white; }
+.stat-card.blue { background: linear-gradient(135deg,#3498db,#2980b9); }
+.stat-card.green { background: linear-gradient(135deg,#27ae60,#219a52); }
+.stat-card.red { background: linear-gradient(135deg,#e74c3c,#c0392b); }
+.stat-card.gray { background: linear-gradient(135deg,#95a5a6,#7f8c8d); }
+.stat-card.purple { background: linear-gradient(135deg,#8e44ad,#7d3c98); }
+.stat-card.orange { background: linear-gradient(135deg,#e67e22,#ca6f1e); }
+.stat-value { font-size: 2em; font-weight: bold; }
+.stat-label { font-size: 0.8em; margin-top: 4px; opacity: 0.9; }
+.doc-header { background: #34495e; color: white; padding: 10px 16px; border-radius: 6px;
+  margin: 24px 0 10px 0; font-size: 1.05em; }
+.chunk-card { background: white; border-radius: 8px; margin-bottom: 12px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.08); overflow: hidden; }
+.chunk-card-header { display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+  border-bottom: 1px solid #f0f0f0; flex-wrap: wrap; }
+.chunk-num { font-weight: bold; color: #2c3e50; font-size: 1em; }
+.chunk-level-tag { background: #ecf0f1; color: #555; font-size: 0.75em;
+  padding: 2px 8px; border-radius: 10px; }
+.status-badge { padding: 4px 12px; border-radius: 4px; color: white;
+  font-weight: bold; font-size: 0.85em; }
+.badge-compliant { background: #27ae60; }
+.badge-noncompliant { background: #e74c3c; }
+.badge-uncertain { background: #f39c12; }
+.badge-verified { background: #8e44ad; font-size: 0.75em; padding: 2px 8px; }
+.badge-corrected { background: #e67e22; font-size: 0.75em; padding: 2px 8px; }
+.badge-typo { background: #d35400; font-size: 0.75em; padding: 2px 8px; }
+.badge-rep { background: #16a085; font-size: 0.75em; padding: 2px 8px; }
+.typo-list, .rep-list { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+.typo-item { background: #fef9e7; border: 1px solid #f9ca24; border-radius: 4px;
+  padding: 7px 10px; font-size: 0.85em; }
+.typo-wrong { font-weight: bold; color: #c0392b; }
+.typo-fix { color: #27ae60; }
+.typo-ctx { color: #7f8c8d; font-size: 0.82em; }
+.rep-item { background: #eafaf1; border: 1px solid #82e0aa; border-radius: 4px;
+  padding: 7px 10px; font-size: 0.85em; }
+.rep-ref { font-weight: bold; color: #1a5276; }
+.rep-note { color: #555; }
+.chunk-meta { color: #7f8c8d; font-size: 0.82em; padding: 6px 16px 0 16px; }
+.chunk-body { padding: 12px 16px; max-height: 320px; overflow-y: auto; }
+.content-box { background: #fafafa; border: 1px solid #eee; border-radius: 4px;
+  padding: 10px; white-space: pre-wrap; font-size: 0.88em; line-height: 1.6;
+  max-height: 180px; overflow-y: auto; color: #333; }
+.section-title { font-weight: bold; color: #2c3e50; margin: 10px 0 6px 0; font-size: 0.9em; }
+.kb-refs-list { display: flex; flex-direction: column; gap: 6px; }
+.kb-ref-item { display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px;
+  background: #f8f9fa; border-radius: 4px; border: 1px solid #e9ecef; font-size: 0.85em; }
+.kb-ref-info { flex: 1; min-width: 0; }
+.kb-ref-title { color: #2c3e50; font-weight: 500; margin-bottom: 2px; }
+.kb-ref-sub { color: #7f8c8d; font-size: 0.85em; }
+.clf-badge { padding: 2px 8px; border-radius: 10px; color: white;
+  font-size: 0.78em; white-space: nowrap; font-weight: bold; }
+.clf-btn { background: none; border: 1px solid #bdc3c7; border-radius: 4px;
+  padding: 2px 8px; font-size: 0.78em; cursor: pointer; color: #555;
+  white-space: nowrap; }
+.clf-btn:hover { background: #ecf0f1; }
+.issues-list { margin-top: 8px; }
+.issue-item { background: #fff5f5; border: 1px solid #ffcccc; border-radius: 4px;
+  padding: 10px 12px; margin-bottom: 6px; }
+.issue-type { font-weight: bold; color: #c0392b; font-size: 0.85em; }
+.issue-desc { color: #333; margin: 4px 0; font-size: 0.88em; }
+.issue-quote { color: #7f8c8d; font-size: 0.82em; margin: 2px 0; }
+.issue-suggestion { color: #27ae60; font-size: 0.85em; margin-top: 4px; }
+.verify-note { background: #f3e5f5; border-left: 3px solid #8e44ad;
+  padding: 8px 10px; margin-top: 8px; border-radius: 0 4px 4px 0;
+  font-size: 0.85em; color: #555; }
+.summary-text { color: #2c3e50; font-size: 0.9em; margin-top: 8px;
+  padding: 8px 10px; background: #f8f9fa; border-radius: 4px; }
+/* Modal */
+.modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+  background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center; }
+.modal-overlay.active { display: flex; }
+.modal-box { background: white; border-radius: 8px; max-width: 700px; width: 90%;
+  max-height: 80vh; display: flex; flex-direction: column; box-shadow: 0 8px 32px rgba(0,0,0,0.2); }
+.modal-header { padding: 16px 20px; border-bottom: 1px solid #eee;
+  display: flex; justify-content: space-between; align-items: flex-start; }
+.modal-title { font-weight: bold; color: #2c3e50; font-size: 0.95em; flex: 1; margin-right: 12px; }
+.modal-close { background: none; border: none; font-size: 1.4em; cursor: pointer;
+  color: #7f8c8d; line-height: 1; padding: 0; }
+.modal-close:hover { color: #e74c3c; }
+.modal-body { padding: 16px 20px; overflow-y: auto; flex: 1; }
+.modal-content { white-space: pre-wrap; font-size: 0.88em; line-height: 1.7;
+  color: #333; background: #fafafa; padding: 12px; border-radius: 4px; }
+"""
+
+        js = """
+const kbTexts = %s;
+
+function showKB(chunkId, title) {
+  const text = kbTexts[chunkId] || '（内容不可用）';
+  document.getElementById('modal-title').textContent = title;
+  document.getElementById('modal-content').textContent = text;
+  document.getElementById('kb-modal').classList.add('active');
+}
+
+function closeModal() {
+  document.getElementById('kb-modal').classList.remove('active');
+}
+
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') closeModal();
+});
+""" % json.dumps(kb_full_texts, ensure_ascii=False)
+
+        # ---- 构建HTML ----
+        parts = [
+            "<!DOCTYPE html>",
+            "<html lang='zh-CN'><head>",
+            "<meta charset='utf-8'>",
+            "<meta name='viewport' content='width=device-width, initial-scale=1'>",
+            "<title>煤矿作业规程合规审核报告 v8</title>",
+            f"<style>{style}</style>",
+            "</head><body>",
+            # 头部
+            "<div class='page-header'>",
+            "<h1>煤矿作业规程合规审核报告 v8</h1>",
+            f"<div class='meta'>生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
+            f"相似度阈值: {SIMILARITY_THRESHOLD} | TopK: {TOP_K} | "
+            f"三并行模式（合规审查+核验+错误相关性分类 ‖ 错别字 ‖ 重复性）</div>",
+            "</div>",
+            # 主体
+            "<div class='main'>",
+            # 概览卡片
+            "<div class='summary-card'>",
+            "<h2 style='margin:0 0 8px 0;color:#2c3e50;font-size:1.1em;'>审核概览</h2>",
+            "<div class='stats-grid'>",
+            f"<div class='stat-card blue'><div class='stat-value'>{len(results)}</div><div class='stat-label'>审核文档数</div></div>",
+            f"<div class='stat-card blue'><div class='stat-value'>{total_chunks}</div><div class='stat-label'>审核chunks数</div></div>",
+            f"<div class='stat-card green'><div class='stat-value'>{status_counts['合规']}</div><div class='stat-label'>合规</div></div>",
+            f"<div class='stat-card red'><div class='stat-value'>{status_counts['不合规']}</div><div class='stat-label'>不合规</div></div>",
+            f"<div class='stat-card gray'><div class='stat-value'>{status_counts['不确定']}</div><div class='stat-label'>不确定</div></div>",
+            f"<div class='stat-card purple'><div class='stat-value'>{verified_count}</div><div class='stat-label'>经二次验证</div></div>",
+            f"<div class='stat-card orange'><div class='stat-value'>{corrected_count}</div><div class='stat-label'>验证纠正误判</div></div>",
+            f"<div class='stat-card' style='background:linear-gradient(135deg,#d35400,#e67e22)'>"
+            f"<div class='stat-value'>{typo_chunk_count}</div><div class='stat-label'>含错别字chunks</div></div>",
+            f"<div class='stat-card' style='background:linear-gradient(135deg,#16a085,#1abc9c)'>"
+            f"<div class='stat-value'>{rep_chunk_count}</div><div class='stat-label'>含重复内容chunks</div></div>",
+            "</div></div>",
+        ]
+
+        # ---- 各文档 ----
+        for doc_name, doc_results in results.items():
+            visible_results = [
+                r for r in doc_results
+                if self._is_noncompliant_review(r.get('review_result', {}))
+                or r.get('typo_result', {}).get('has_issues')
+                or r.get('repetition_result', {}).get('has_duplicates')
+            ]
+            if not visible_results:
+                continue
+            parts.append(f"<div class='doc-header'>📄 {esc(doc_name)}</div>")
+
+            for r in visible_results:
+                review = r.get('review_result', {})
+                status = review.get('compliance_status', '不确定')
+                is_verified = review.get('verified', False)
+                draft_count = review.get('draft_issue_count', 0)
+                final_count = len(review.get('issues', []))
+                was_corrected = is_verified and final_count < draft_count
+                typo = r.get('typo_result', {})
+                rep = r.get('repetition_result', {})
+                has_display_issue = (
+                    self._is_noncompliant_review(review)
+                    or typo.get('has_issues')
+                    or rep.get('has_duplicates')
+                )
+                if not has_display_issue:
+                    continue
+
+                if '合规' in status and '不' not in status:
+                    badge_cls = 'badge-compliant'
+                elif '不合规' in status:
+                    badge_cls = 'badge-noncompliant'
+                else:
+                    badge_cls = 'badge-uncertain'
+
+                meta = r.get('chunk_meta', {})
+                chunk_idx = r['chunk_index']
+
+                # 卡片
+                parts.append("<div class='chunk-card'>")
+
+                # 卡片头
+                parts.append("<div class='chunk-card-header'>")
+                parts.append(f"<span class='chunk-num'>Chunk #{chunk_idx + 1}</span>")
+                if meta.get('section'):
+                    parts.append(f"<span class='chunk-level-tag'>section</span>")
+                elif meta.get('chapter'):
+                    parts.append(f"<span class='chunk-level-tag'>chapter</span>")
+                parts.append(f"<span class='status-badge {badge_cls}'>{esc(status)}</span>")
+                if is_verified:
+                    parts.append("<span class='status-badge badge-verified'>已二次验证</span>")
+                if was_corrected:
+                    parts.append(f"<span class='status-badge badge-corrected'>误判纠正 {draft_count}→{final_count}项</span>")
+                if typo.get('has_issues'):
+                    n = len(typo.get('issues', []))
+                    parts.append(f"<span class='status-badge badge-typo'>错别字 {n}处</span>")
+                if rep.get('has_duplicates'):
+                    parts.append("<span class='status-badge badge-rep'>重复内容</span>")
+                parts.append("</div>")
+
+                # 元信息
+                parts.append(
+                    f"<div class='chunk-meta'>"
+                    f"章: {esc(meta.get('chapter', ''))} | "
+                    f"节: {esc(meta.get('section', ''))} | "
+                    f"页码: {esc(meta.get('page_range', ''))}"
+                    f"</div>"
+                )
+
+                # 卡片体（带滚动）
+                parts.append("<div class='chunk-body'>")
+
+                # 待审内容
+                parts.append("<div class='section-title'>待审内容</div>")
+                parts.append(f"<div class='content-box'>{esc(r.get('chunk_content', ''))}</div>")
+
+                # KB参考
+                kb_refs = r.get('kb_refs', [])
+                kb_clf = {c['index'] - 1: c for c in r.get('kb_classifications', [])}
+                if kb_refs:
+                    parts.append("<div class='section-title'>参考法规</div>")
+                    parts.append("<div class='kb-refs-list'>")
+                    for j, ref in enumerate(kb_refs):
+                        clf_info = kb_clf.get(j, {})
+                        clf_label = clf_info.get('classification', '无关')
+                        clf_color = clf_colors.get(clf_label, '#95a5a6')
+                        clf_reason = esc(clf_info.get('reason', ''))
+                        chunk_id = ref.get('chunk_id', '')
+                        title_str = esc(f"{ref.get('doc', '')} / {ref.get('chapter', '')} / {ref.get('section', '')}")
+
+                        parts.append("<div class='kb-ref-item'>")
+                        parts.append(
+                            f"<span class='clf-badge' style='background:{clf_color}' "
+                            f"title='{clf_reason}'>{esc(clf_label)}</span>"
+                        )
+                        parts.append("<div class='kb-ref-info'>")
+                        parts.append(f"<div class='kb-ref-title'>📚 {title_str}</div>")
+                        parts.append(
+                            f"<div class='kb-ref-sub'>相似度: {ref.get('score', 0)}"
+                            + (f" | {clf_reason}" if clf_reason else "") + "</div>"
+                        )
+                        parts.append("</div>")
+                        if chunk_id:
+                            parts.append(
+                                f"<button class='clf-btn' "
+                                f"onclick=\"showKB('{chunk_id}', '{title_str}')\">查看全文</button>"
+                            )
+                        parts.append("</div>")
+                    parts.append("</div>")
+
+                # 问题列表
+                issues = review.get('issues', [])
+                if issues:
+                    parts.append("<div class='section-title'>发现问题</div>")
+                    parts.append("<div class='issues-list'>")
+                    for issue in issues:
+                        parts.append("<div class='issue-item'>")
+                        parts.append(f"<div class='issue-type'>[{esc(issue.get('type', ''))}]</div>")
+                        parts.append(f"<div class='issue-desc'>{esc(issue.get('description', ''))}</div>")
+                        if issue.get('pending_content'):
+                            parts.append(f"<div class='issue-quote'>待审: {esc(issue['pending_content'])}</div>")
+                        if issue.get('regulation_content'):
+                            parts.append(f"<div class='issue-quote'>法规: {esc(issue['regulation_content'])}</div>")
+                        if issue.get('suggestion'):
+                            parts.append(f"<div class='issue-suggestion'>建议: {esc(issue['suggestion'])}</div>")
+                        parts.append("</div>")
+                    parts.append("</div>")
+
+                # 验证说明
+                vn = review.get('verification_notes', '')
+                if vn and vn != '初审结果准确，无误判':
+                    parts.append(f"<div class='verify-note'>🔍 <strong>验证说明:</strong> {esc(vn)}</div>")
+
+                # 审核意见
+                if review.get('summary'):
+                    parts.append(f"<div class='summary-text'>📝 {esc(review['summary'])}</div>")
+
+                # 错别字结果
+                if typo.get('has_issues') and typo.get('issues'):
+                    parts.append("<div class='section-title'>✏️ 错别字检查</div>")
+                    parts.append("<div class='typo-list'>")
+                    for ti in typo['issues']:
+                        parts.append("<div class='typo-item'>")
+                        parts.append(
+                            f"<span class='typo-wrong'>「{esc(ti.get('original', ''))}」</span>"
+                            f" → <span class='typo-fix'>「{esc(ti.get('suggestion', ''))}」</span>"
+                        )
+                        if ti.get('context'):
+                            parts.append(f"<div class='typo-ctx'>上下文: …{esc(ti['context'])}…</div>")
+                        if ti.get('reason'):
+                            parts.append(f"<div class='typo-ctx'>依据: {esc(ti['reason'])}</div>")
+                        if ti.get('confidence'):
+                            parts.append(f"<div class='typo-ctx'>置信度: {esc(ti['confidence'])}</div>")
+                        parts.append("</div>")
+                    parts.append("</div>")
+                elif typo:
+                    parts.append(f"<div class='summary-text' style='color:#7f8c8d;'>✏️ {esc(typo.get('summary', ''))}</div>")
+
+                # 重复性结果
+                if rep.get('has_duplicates') and rep.get('duplicates'):
+                    parts.append("<div class='section-title'>🔁 重复性检查</div>")
+                    parts.append("<div class='rep-list'>")
+                    for ri in rep['duplicates']:
+                        parts.append("<div class='rep-item'>")
+                        parts.append(f"<span class='rep-ref'>{esc(ri.get('chunk_ref', ''))}</span>")
+                        if ri.get('note'):
+                            parts.append(f"<span class='rep-note'>：{esc(ri['note'])}</span>")
+                        if ri.get('similarity') is not None:
+                            parts.append(f"<span class='rep-note'>（相似度 {esc(ri['similarity'])}）</span>")
+                        parts.append("</div>")
+                    parts.append("</div>")
+
+                parts.append("</div>")  # chunk-body
+                parts.append("</div>")  # chunk-card
+
+        parts.append("</div>")  # main
+
+        # ---- Modal ----
+        parts.append("""
+<div class='modal-overlay' id='kb-modal' onclick='if(event.target===this)closeModal()'>
+  <div class='modal-box'>
+    <div class='modal-header'>
+      <div class='modal-title' id='modal-title'></div>
+      <button class='modal-close' onclick='closeModal()'>×</button>
+    </div>
+    <div class='modal-body'>
+      <div class='modal-content' id='modal-content'></div>
+    </div>
+  </div>
+</div>
+""")
+
+        parts.append(f"<script>{js}</script>")
+        parts.append("</body></html>")
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(parts))
+
+        print(f"审核报告已生成: {output_path}")
+        return output_path
+
+
+def main():
+    print("=" * 70)
+    print("煤矿作业规程合规审核系统 v8 - 三并行（合规链 ‖ 错别字链 ‖ 文档级重复性链）")
+    print(f"相似度阈值: {SIMILARITY_THRESHOLD} | TopK: {TOP_K}")
+    print(f"文档过滤: {DOC_FILTER if DOC_FILTER else '全部'}")
+    print(f"二次验证: {'开启' if VERIFY_NON_COMPLIANT else '关闭'}")
+    print("=" * 70)
+
+    reviewer = HybridRAGReviewerV8()
+    reviewer.load_knowledge_base()
+    reviewer.load_or_build_index()
+    results = reviewer.review_pending_document(max_documents=MAX_PENDING_DOCS)
+
+    # 只有当前审核范围内的文档都完成才保存正式结果并清理增量文件
+    incremental_suffix = f"_first_{MAX_PENDING_DOCS}" if MAX_PENDING_DOCS and MAX_PENDING_DOCS > 0 else ""
+    incremental_path = OUTPUT_DIR / f"review_result_v8_incremental{incremental_suffix}.json"
+    all_done = all(k in results for k in results)  # 总是True，但下面判断文档数
+    pending_json_files = sorted(
+        (OUTPUT_DIR.parent / "chunks_visualization").glob("pending_doc_chunks_v*_*.json"), reverse=True
+    )
+    if pending_json_files:
+        import json as _json
+        with open(pending_json_files[0], 'r', encoding='utf-8') as _f:
+            _pending = _json.load(_f)
+        if DOC_FILTER:
+            _pending = {
+                k: v for k, v in _pending.items()
+                if any(f in k for f in DOC_FILTER)
+            }
+        if MAX_PENDING_DOCS and MAX_PENDING_DOCS > 0:
+            _pending = dict(list(_pending.items())[:MAX_PENDING_DOCS])
+        all_done = all(k in results for k in _pending)
+
+    if all_done:
+        reviewer.save_results(results)
+        reviewer.generate_report(results)
+        if incremental_path.exists():
+            incremental_path.unlink()
+            print("  增量文件已清理")
+    else:
+        # 部分完成：只生成已有结果的报告，增量文件保留供续跑
+        reviewer.generate_report(results)
+        print(f"  ⚠️  部分完成（{len(results)}/待审文档数），增量文件已保留，充值后重新运行续跑")
+
+    total = non_compliant = uncertain = verified = corrected = 0
+    typo_chunks = typo_issues = rep_chunks = 0
+    for doc_results in results.values():
+        for r in doc_results:
+            total += 1
+            review = r.get('review_result', {})
+            s = review.get('compliance_status', '')
+            if '不合规' in s:
+                non_compliant += 1
+            elif '不确定' in s:
+                uncertain += 1
+            if review.get('verified'):
+                verified += 1
+                if len(review.get('issues', [])) < review.get('draft_issue_count', 0):
+                    corrected += 1
+            typo = r.get('typo_result', {})
+            if typo.get('has_issues'):
+                typo_chunks += 1
+                typo_issues += len(typo.get('issues', []))
+            if r.get('repetition_result', {}).get('has_duplicates'):
+                rep_chunks += 1
+
+    print("\n" + "=" * 70)
+    print("[OK] 审核完成！")
+    print(f"  总计审核: {total} 个chunks")
+    print(f"  合规审查 → 不合规: {non_compliant} | 不确定: {uncertain} | 经验证: {verified} | 纠正误判: {corrected}")
+    print(f"  错别字检查 → 含问题chunks: {typo_chunks} | 总计错误: {typo_issues} 处")
+    print(f"  重复性检查 → 含重复chunks: {rep_chunks}")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()

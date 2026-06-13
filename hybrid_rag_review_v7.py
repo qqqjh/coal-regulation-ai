@@ -1,5 +1,5 @@
 """
-混合检索RAG审核系统 v5
+混合检索RAG审核系统 v7
 - v4改进：
   1. 检索立场分类智能体（分类结果仅用于前端展示，不传入审核智能体）
   2. 审核结果增加"不确定"状态（合规/不合规/不确定）
@@ -9,6 +9,17 @@
 - v5改进：
   6. 修复误差/偏差/公差范围方向误判：法规"误差在A~B"表示偏差绝对值范围，
      与待审"±X"（X≤B）等价，不应判为违规
+- v6改进：
+  7. 简化两个审核智能体提示词中"安全触发阈值"（表现C）的判断逻辑，
+     修复传感器报警/断电/复电浓度阈值被误判为违规的问题：
+     - 报警浓度、断电浓度、停工阈值等：待审值 < 法规值 = 更早触发 = 更严格 = 合规
+     - 复电浓度（<X才复电）：待审值 < 法规值 = 要求浓度降得更低才复电 = 更严格 = 合规
+     - 添加明确示例，避免LLM误将"低于法规值"等同于"不满足下限"
+- v7改进：
+  8. 调整执行顺序：合规性审查 -> 结果核验 -> 检索相关性/立场分类。
+     检索相关性仅对最终不合规chunk执行，只用于前端错误展示，不参与合规判断。
+  9. 合规流程、错别字检查、重复性检查三任务并行。
+  10. 提示词增加非突出矿井适用性约束，避免把突出矿井专用条款误用于非突出矿井。
 """
 import json
 import os
@@ -25,10 +36,11 @@ import chromadb
 from rank_bm25 import BM25Okapi
 import jieba
 from openai import OpenAI
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============ 配置 ============
 API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
-BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+BASE_URL = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 dashscope.api_key = API_KEY
 
 QWEN_MODEL = "qwen-plus"
@@ -38,15 +50,22 @@ SIMILARITY_THRESHOLD = 0.1
 TOP_K = 5
 VERIFY_NON_COMPLIANT = True
 DOC_FILTER = []  # 空列表 = 审核全部文档（004、006、066）
+MAX_PENDING_DOCS = 1  # 临时限速：只审核前N个待审文档；设为None或0表示审核全部
 
 KB_CHUNKS_DIR = Path("chunks_visualization")
 PENDING_CHUNKS_DIR = Path("chunks_visualization")
 CHROMA_DB_DIR = Path("data/hybrid_rag_chroma")
 OUTPUT_DIR = Path("review_results")
 
+MINE_APPLICABILITY_NOTE = """【矿井适用性约束】
+本批待审对象按非突出矿井处理。若参考法规片段明确限定为“突出矿井”“煤与瓦斯突出矿井”“突出煤层”“突出危险区域”等突出矿井专用场景：
+- 不得直接作为非突出矿井待审内容的违规依据；
+- 只有待审内容本身明确属于突出矿井/突出煤层/突出危险场景时，才可适用该条款；
+- 若条款既包含突出矿井专用要求又包含通用要求，只能依据其中明确适用于所有矿井或一般场景的部分判断。"""
 
-class HybridRAGReviewerV5:
-    """混合检索RAG审核器 v5（三智能体：分类+初审+验证）"""
+
+class HybridRAGReviewerV7:
+    """混合检索RAG审核器 v7（合规核验后按需分类，并行质量检查）"""
 
     def __init__(self):
         if not API_KEY:
@@ -159,9 +178,17 @@ class HybridRAGReviewerV5:
             marker_file.write_text(current_source, encoding='utf-8')
         self.build_bm25_index()
 
-    def vector_search(self, query: str, k: int = TOP_K) -> List[Tuple[Dict, float]]:
+    def vector_search(self, query: str, k: int = TOP_K,
+                      return_timings: bool = False):
+        embedding_start = time.time()
         query_embedding = self.get_embeddings([query])[0]
+        embedding_elapsed = time.time() - embedding_start
+
+        chroma_start = time.time()
         results = self.collection.query(query_embeddings=[query_embedding], n_results=k)
+        chroma_elapsed = time.time() - chroma_start
+
+        map_start = time.time()
         matched = []
         if results and results['ids'] and results['ids'][0]:
             for i, chunk_id in enumerate(results['ids'][0]):
@@ -170,6 +197,13 @@ class HybridRAGReviewerV5:
                         distance = results['distances'][0][i] if results.get('distances') else 0
                         matched.append((chunk, 1 - distance))
                         break
+        map_elapsed = time.time() - map_start
+        if return_timings:
+            return matched, {
+                'embedding': embedding_elapsed,
+                'chroma': chroma_elapsed,
+                'vector_map': map_elapsed,
+            }
         return matched
 
     def bm25_search(self, query: str, k: int = TOP_K) -> List[Tuple[Dict, float]]:
@@ -184,10 +218,21 @@ class HybridRAGReviewerV5:
 
     def hybrid_search(self, query: str, k: int = TOP_K,
                       vector_weight: float = 0.5,
-                      vector_query: str = None) -> List[Tuple[Dict, float]]:
-        # 向量检索用前500字（避免长文本稀释语义），BM25用全文（覆盖所有关键词）
-        vector_results = self.vector_search(vector_query or query[:500], k=k * 2)
+                      vector_query: str = None,
+                      return_timings: bool = False):
+        # 向量检索和BM25都使用完整chunk，避免长chunk后半段的关键约束漏召回。
+        vector_out = self.vector_search(vector_query or query, k=k * 2, return_timings=return_timings)
+        if return_timings:
+            vector_results, timings = vector_out
+        else:
+            vector_results = vector_out
+            timings = {}
+
+        bm25_start = time.time()
         bm25_results = self.bm25_search(query, k=k * 2)
+        timings['bm25'] = time.time() - bm25_start
+
+        fusion_start = time.time()
         rrf_scores = {}
         similarity_scores = {}
         chunk_map = {}
@@ -202,16 +247,79 @@ class HybridRAGReviewerV5:
             chunk_map[cid] = chunk
             rrf_scores[cid] = rrf_scores.get(cid, 0) + (1 - vector_weight) / (rank + 60)
         sorted_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)[:k]
-        return [(chunk_map[cid], similarity_scores.get(cid, 0.5)) for cid in sorted_ids]
+        fused_results = [(chunk_map[cid], similarity_scores.get(cid, 0.5)) for cid in sorted_ids]
+        timings['fusion'] = time.time() - fusion_start
+        if return_timings:
+            timings['total'] = sum(timings.values())
+            return fused_results, timings
+        return fused_results
 
     def search_relevant(self, query: str, k: int = TOP_K,
-                        threshold: float = SIMILARITY_THRESHOLD) -> List[Dict]:
-        results = self.hybrid_search(query, k=k)
-        return [
+                        threshold: float = SIMILARITY_THRESHOLD,
+                        return_timings: bool = False):
+        search_out = self.hybrid_search(query, k=k, return_timings=return_timings)
+        if return_timings:
+            results, timings = search_out
+        else:
+            results = search_out
+            timings = {}
+        relevant = [
             {'chunk': chunk, 'score': score}
             for chunk, score in results
             if score >= threshold
         ]
+        if return_timings:
+            return relevant, timings
+        return relevant
+
+    @staticmethod
+    def _format_chunk_timings(retrieval_elapsed: float, agent_timings: Dict[str, float]) -> str:
+        def fmt(key: str) -> str:
+            return f"{agent_timings[key]:.1f}s" if key in agent_timings else "-"
+
+        return (
+            f"检索 {retrieval_elapsed:.1f}s / "
+            f"合规初审 {fmt('compliance_review')} / "
+            f"二次验证 {fmt('verification')} / "
+            f"相关性分类 {fmt('kb_classification')} / "
+            f"错别字 {fmt('typo')} / "
+            f"重复性 {fmt('repetition')}"
+        )
+
+    # ============ 文档自检索（重复性检查用）============
+
+    def build_doc_bm25(self, doc_chunks: List[Dict]) -> BM25Okapi:
+        """为单篇待审文档构建BM25索引，供重复性检查使用。"""
+        tokenized = [list(jieba.cut(c['content'])) for c in doc_chunks]
+        return BM25Okapi(tokenized)
+
+    def search_doc_similar(self, query_chunk: Dict, query_idx: int,
+                           doc_bm25: BM25Okapi, doc_chunks: List[Dict],
+                           k: int = 3, min_norm: float = 0.5) -> List[Dict]:
+        """在同一文档内找与 query_chunk 最相似的其他 chunks（排除自身）。
+        只返回归一化得分 >= min_norm 的结果，避免无关内容进入重复性检查。
+        """
+        tokens = list(jieba.cut(query_chunk['content']))
+        scores = doc_bm25.get_scores(tokens)
+        # 排除自身
+        others = [(i, s) for i, s in enumerate(scores) if i != query_idx]
+        if not others:
+            return []
+        max_score = max(s for _, s in others)
+        if max_score <= 0:
+            return []
+        results = []
+        for idx, score in sorted(others, key=lambda x: x[1], reverse=True)[:k]:
+            if score / max_score >= min_norm:
+                c = doc_chunks[idx]
+                results.append({
+                    'chunk_index': idx,
+                    'chapter': c.get('chapter', ''),
+                    'section': c.get('section', ''),
+                    'content': c['content'],
+                    'norm_score': round(score / max_score, 3),
+                })
+        return results
 
     # ============ 构建知识库上下文 ============
 
@@ -253,6 +361,8 @@ class HybridRAGReviewerV5:
 
 【待检索到的法规片段列表】
 {chunk_list_text}
+
+{MINE_APPLICABILITY_NOTE}
 
 请对每条法规片段进行立场分类，分类定义：
 - 支持：该片段表明待审内容符合规定（待审内容不违反此片段要求）
@@ -321,31 +431,42 @@ class HybridRAGReviewerV5:
 
         prompt = f"""你是一位煤矿安全法规审核专家。请根据下方知识库，判断待审内容是否违反法规要求。
 
-【审核流程——按步骤执行】
+【核心判断规则】
 
-第一步：逐条阅读知识库中每条法规，提取其约束类型：
-  - 禁止行为（严禁/不得/禁止）
-  - 数值下限（不得低于/至少/≥）
-  - 数值上限（不得超过/最多/≤）
-  - 数值区间（A~B，同时含上限和下限）
+A. 禁止行为
+  - 待审内容**实施**了被禁止的行为 → 违规
+  - 待审内容**禁止**了该行为（写了"严禁/不得"）→ 合规，不得反向判违规
 
-第二步：判断待审内容是否涉及该约束，注意：
-  - 行为判断：关注待审行为的实质，不受表述措辞影响，若本质相同则适用该条款
-  - 禁止行为：待审内容**实施**了被禁止的行为 → 违规；待审内容**禁止**了该行为（写了"严禁/不得"）→ 合规，不得反向判违规
-  - 数值下限：待审值 < 法规值 → 违规；待审值 ≥ 法规值 → 合规（加严也合规）
-  - 数值上限：待审值 > 法规值 → 违规；待审值 ≤ 法规值 → 合规（加严也合规）
-  - 数值区间：下限和上限分别判断，任一端违规即整体违规
-  - 安全触发阈值（如气体浓度达到X时必须停工/断电/撤人）：本质是上限约束，阈值越低越严。
-    待审阈值 < 法规阈值 → 更早触发 → 更严 → 合规，不得以"低于法规值"为由判违规
-  - 误差/偏差/公差：若法规以"误差在A~B"或"偏差±X"形式规定，表示偏差绝对值范围，
-    不区分正负方向。判断时只需待审偏差绝对值 ≤ 法规上限即合规，不得以"允许负偏差"为由判违规
+B. 普通数值（尺寸、距离、支护参数等）
+  - 数值下限（不得低于/至少/≥X）：待审值 < 法规值 → 违规；待审值 ≥ 法规值 → 合规
+  - 数值上限（不得超过/最多/≤X）：待审值 > 法规值 → 违规；待审值 ≤ 法规值 → 合规
+  - 数值区间（A~B）：下限和上限分别判断
 
-第三步：确定结论
+C. 安全触发阈值（★重要，最常见误判点★）
+  定义：到达某浓度/温度时必须停工、断电、报警、撤人的触发类参数。
+  典型名称：报警浓度、断电浓度、复电浓度、停工阈值、断电阈值。
+  判断逻辑：
+    - 报警浓度≥X、断电浓度≥X、停工阈值≥X：X越小 = 越早触发保护 = 越严格
+      → 待审X < 法规X → 更早触发 → 合规，绝对不得以"低于法规值"判违规
+    - 复电浓度<X（恢复送电的气体浓度上限）：X越小 = 要求浓度降得更低才能复电 = 越严格
+      → 待审X < 法规X → 更严格 → 合规
+  法规表格示例（合规判断）：
+    法规表格"掘进工作面 | 报警≥1.0 | 断电≥1.5 | 复电<1.0"
+    待审设定"报警≥0.8，断电≥1.2，复电<0.8"
+    → 0.8<1.0，1.2<1.5，0.8<1.0 → 三项均更早/更严触发 → 全部合规
+  注意：仅当待审值 > 法规值时（如法规断电≥1.5%，待审断电≥1.8%，更晚断电），才违规。
+  注意：若待审在某地点设定了比法规更严格的触发阈值（如0.8%），不得以"无上位依据"判违规。严于法规即合规。
+
+D. 误差/偏差/公差
+  法规"误差在A~B"或"偏差±X"表示偏差绝对值范围，不区分正负。
+  待审偏差绝对值 ≤ 法规上限 → 合规。
+
+【结论规则】
   - 知识库中无相关条款 → 合规，注明"知识库中无对应条款"
-  - 知识库有条款但关键数值缺失/空白 → 不确定，注明"知识库数据不完整，无法核验"，issues为空
-  - 待审内容违反某条款 → 不合规，issues记录该条款及冲突说明
-  - issues为空 → compliance_status必须为"合规"；issues非空 → "不合规"
-  - 证据不足以确定（双向解读均合理）→ "不确定"
+  - 知识库有条款但关键数值缺失 → 不确定，issues为空
+  - 待审内容违反某条款 → 不合规，issues记录冲突
+  - issues为空 → compliance_status必须为"合规"
+  - 证据不足（双向解读均合理）→ "不确定"
 
 【待审文档信息】
 {pending_meta}
@@ -355,6 +476,8 @@ class HybridRAGReviewerV5:
 
 【参考法规知识库】
 {kb_context}
+
+{MINE_APPLICABILITY_NOTE}
 
 【审核要点】
 1. 禁止行为冲突：待审内容是否实施了法规明确禁止的行为（关注实质，不受措辞限制）
@@ -423,54 +546,57 @@ class HybridRAGReviewerV5:
 【参考法规知识库（唯一允许引用的依据）】
 {kb_context}
 
+{MINE_APPLICABILITY_NOTE}
+
 【初步审核发现的问题（需逐条核查）】
 {initial_issues_text}
 
-请逐条检查，判断是否属于以下5类误判，如是则删除该问题：
+请逐条检查以下误判类型，符合则删除：
 
-误判类型1：严于法规被判违规（含禁止行为方向误判）
-表现A：待审内容的数值要求比法规更严格，但被认定为违规。
-识别方法：必须区分上限和下限的方向性——
-  - 对于上限（不得超过X）：待审上限 < 法规上限 = 更严 = 误判；待审上限 > 法规上限 = 更宽松 = 真实违规，不能删除
-  - 对于下限（不得低于X）：待审下限 > 法规下限 = 更严 = 误判；待审下限 < 法规下限 = 更宽松 = 真实违规，不能删除
-  - 对于区间[A,B]：必须两端分别判断，不能因"包含法规区间"就认为合规
-→ 仅当待审值确实在安全方向上比法规更严格时，删除该问题。
-表现B：待审内容本身是在**禁止**某行为（写有"严禁/不得"），但被误判为"实施了该违规行为"。
-识别方法：检查待审原文——若是用"严禁/不得"修饰该行为，则待审是在约束/禁止，而非实施。
-→ 删除该问题（方向判反了）。
-表现C：**安全触发阈值**（如气体浓度/温度达到X时必须停工、断电、撤人）。
-法规设定阈值是上限，待审阈值更低意味着更早触发应急措施，是更严格的做法。
-识别方法：确认法规是"达到X%必须采取措施"的触发型要求，且待审阈值 < 法规阈值。
-→ 删除该问题（阈值更低 = 更严格 = 合规）。
+━━ 误判类型1：严于法规被错判违规 ━━
 
-误判类型2：引用了知识库外的条款，或将数据缺失误判为冲突
-表现A：问题中引用的条款编号或具体数值，在上方知识库文本中完全没有出现。
-表现B：问题类型被标为"数值冲突"，但法规一栏写的是"知识库数据不完整"——这说明根本没有比较依据，不构成冲突。
-识别方法：在知识库原文中检索该条款/数值，确认不存在；或确认法规内容字段为空/不完整。
-→ 删除该问题（依据不足），整体结果改为"不确定"。
+表现A（普通数值方向误判）
+  - 上限约束：待审上限 < 法规上限 → 更严 → 删除；待审上限 > 法规上限 → 真实违规 → 保留
+  - 下限约束：待审下限 > 法规下限 → 更严 → 删除；待审下限 < 法规下限 → 真实违规 → 保留
 
-误判类型3：并列要求被误读为"任择其一"
-表现：待审内容中有两个并列条件，初审认为"可能只执行其一"或"表述歧义"导致判违规。
-→ 删除该问题。
+表现B（禁止行为方向误判）
+  待审原文写了"严禁/不得"来约束某行为，却被误判为"实施了该违规行为"。
+  → 检查待审原文，若是"严禁/不得"修饰，则删除。
 
-误判类型4：固定数值因"刚性"被判违规
-表现：仅因为企业给出了固定数值（而非动态确定方法）就判违规，但该固定值本身在法规允许范围内。
-识别方法：检查该固定值是否本身违反了法规的数值限制，若未违反则属误判。
-→ 删除该问题。
+表现C（安全触发阈值误判）★最常见错误★
+  适用场景：问题涉及"报警浓度""断电浓度""复电浓度""停工阈值""断电阈值"等传感器/应急触发参数。
+  判断规则：
+    · 报警≥X、断电≥X、停工≥X：X越小=越早触发=越严格。待审X < 法规X → 删除（合规）
+    · 复电<X：X越小=要求浓度降得更低才能复电=越严格。待审X < 法规X → 删除（合规）
+    · 若理由是"无上位依据"但待审值比法规更严（更早触发）→ 也删除（严于法规即合规）
+  关键示例1（法规表格行）：
+    法规表格"掘进工作面 | 报警≥1.0 | 断电≥1.5 | 复电<1.0"
+    待审"T1：报警≥0.8，断电≥1.2，复电<0.8"
+    → 逐项：0.8<1.0 ✓，1.2<1.5 ✓，0.8<1.0 ✓ → 三项全部更早/更严触发 → 全部合规 → 删除
+  关键示例2（回风流断电阈值）：
+    法规§193"风流中甲烷≥1.0%时停止用电作业"
+    待审"回风流≥0.8%时停止工作" → 0.8<1.0，更早停工，严于法规 → 合规 → 删除
+  反例（不删除）：法规"报警≥1.0%"，待审"报警≥1.2%"→ 1.2>1.0，更晚报警，真实违规，保留。
 
-误判类型5：等待后检查被判违反"先检查"原则
-表现：待审内容规定"等待X时间后再检查再恢复操作"，初审认为违反"必须先检查"要求。
-→ 删除该问题。
+━━ 误判类型2：引用知识库外条款或数据缺失 ━━
+  问题引用的条款/数值在知识库原文中不存在，或法规字段为空/"数据不完整"。
+  → 删除，整体结果改为"不确定"。
 
-误判类型6：误差/偏差范围方向误判
-表现：法规规定"误差/偏差在A~B mm"，待审以"±X mm"表示，初审认为"允许负偏差"违规。
-识别方法：确认法规用词含"误差/偏差/公差"，且待审偏差绝对值 ≤ 法规上限B。
-→ 删除该问题（误差范围表示偏差绝对值，不区分正负方向）。
+━━ 误判类型3：并列条件被误读为"任择其一" ━━
+  → 删除。
 
-【重要约束】
-- 真实的数值冲突（待审数值确实宽于法规限制）：保留
-- 真实的规则冲突（待审内容确实违反法规明文禁止事项）：保留
-- 不确定是否误判：保留（宁可保守，不要误删真实问题）
+━━ 误判类型4：固定数值因"刚性"被判违规 ━━
+  固定数值本身在法规允许范围内，仅因为是固定值而被判违规。
+  → 检查该值是否违反法规数值限制，若未违反则删除。
+
+━━ 误判类型5：等待后检查被判违反"先检查"原则 ━━
+  → 删除。
+
+━━ 误判类型6：误差/偏差范围方向误判 ━━
+  法规"误差在A~B"，待审"±X"（X≤B），初审认为"允许负偏差"违规。
+  → 删除（偏差范围不区分正负方向）。
+
+【保留原则】真实数值冲突（待审数值确实比法规更宽松）和真实规则冲突必须保留。不确定是否误判时，保留。
 
 请输出修正后的完整审核结果：
 {{
@@ -508,45 +634,187 @@ class HybridRAGReviewerV5:
 
     # ============ 完整三智能体审核流程 ============
 
-    def review_chunk_complete(self, pending_chunk: Dict,
-                              kb_results: List[Dict]) -> Tuple[Dict, List[Dict]]:
-        """
-        完整审核流程：
-        1. 分类智能体（结果仅用于前端）
-        2. 初审智能体
-        3. 验证智能体（仅对不合规/不确定调用）
-        返回 (审核结果, 分类结果列表)
-        """
-        # Stage 1: 立场分类（独立于审核）
-        classifications = self.classify_kb_chunks(pending_chunk, kb_results)
+    @staticmethod
+    def _is_noncompliant_review(review_result: Dict) -> bool:
+        """Return True only when the final compliance result should be shown as an error."""
+        status = str(review_result.get('compliance_status', ''))
+        return bool(review_result.get('issues')) or ('不合规' in status)
 
-        # Stage 2: 初审
+    def review_chunk_complete(self, pending_chunk: Dict,
+                              kb_results: List[Dict]) -> Tuple[Dict, List[Dict], Dict[str, float]]:
+        """
+        完整合规审核流程：
+        1. 合规性审查智能体
+        2. 结果核验智能体（仅对不合规/不确定调用）
+        3. 检索相关性/立场分类智能体（仅最终不合规时调用，仅用于前端展示）
+        返回 (审核结果, 分类结果列表, 各智能体耗时)
+        """
+        classifications: List[Dict] = []
+        timings: Dict[str, float] = {}
+
+        # Stage 1: 合规性审查
+        review_start = time.time()
         draft = self.review_chunk_with_llm(pending_chunk, kb_results)
+        timings['compliance_review'] = time.time() - review_start
         if draft.get('error') or draft.get('parse_error'):
             draft['verified'] = False
-            return draft, classifications
+            return draft, classifications, timings
 
         has_issues = bool(draft.get('issues'))
         status = draft.get('compliance_status', '')
         needs_verify = VERIFY_NON_COMPLIANT and has_issues and ('不合规' in status or '不确定' in status)
 
-        # Stage 3: 验证
+        # Stage 2: 结果核验
         if needs_verify:
             print("（二次验证）", end=" ", flush=True)
-            verified = self.verify_review_result(pending_chunk, kb_results, draft)
-            verified['verified'] = True
-            verified['draft_issue_count'] = len(draft.get('issues', []))
-            return verified, classifications
+            verify_start = time.time()
+            final_result = self.verify_review_result(pending_chunk, kb_results, draft)
+            timings['verification'] = time.time() - verify_start
+            final_result['verified'] = True
+            final_result['draft_issue_count'] = len(draft.get('issues', []))
+        else:
+            draft['verified'] = False
+            final_result = draft
 
-        draft['verified'] = False
-        return draft, classifications
+        # Stage 3: 检索相关性/立场分类，仅对最终不合规chunk做前端展示
+        if self._is_noncompliant_review(final_result):
+            print("（相关性分类）", end=" ", flush=True)
+            classify_start = time.time()
+            classifications = self.classify_kb_chunks(pending_chunk, kb_results)
+            timings['kb_classification'] = time.time() - classify_start
+
+        return final_result, classifications, timings
+
+    # ============ 智能体4：错别字检查 ============
+
+    def check_typos(self, pending_chunk: Dict) -> Dict:
+        """错别字检查智能体：无需RAG，直接LLM分析原文。"""
+        content = pending_chunk['content']
+        prompt = f"""请检查下方煤矿作业规程文本，找出其中的**汉字错别字**。
+
+只标注汉字的字形相近错误：
+- 例：军→均（"回风顺槽军采用"中"军"应为"均"）
+- 例：黯→暗（字形相近，用错了字）
+- 例：做为→作为（"做"在此处应为"作"）
+
+注意：
+- 如果某个词你不100%确定是错别字，就不要标注
+- 数字、英文字母、单位符号不在检查范围内（m2不是错别字，MPa大小写不是错别字）
+- 矿山专有术语不标注（即使你认为可能写错了）
+- OCR扫描中的空格、断行等格式问题不标注
+
+【待检查文本】
+{content[:800]}
+
+输出JSON：{{
+  "has_issues": true或false,
+  "issues": [{{"original": "原文错误汉字（1-3字）", "suggestion": "正确汉字", "context": "前后各5字"}}],
+  "summary": "一句话说明"
+}}"""
+        default = {"has_issues": False, "issues": [], "summary": "检查失败"}
+        try:
+            resp = self.llm_client.chat.completions.create(
+                model=QWEN_MODEL,
+                messages=[
+                    {"role": "system", "content": "你是专业汉字校对员，只标注**汉字**的字形相近错别字（如军→均、黯→暗、做为→作为）。以下绝对不标注：①单位大小写（m2/m²/MPa/MPA/KN/kN均不标注）②矿山术语（逼帮板/蔽帮板/菠萝盖等不标注，即使你认为写错了）③英文字母/数字/符号。如不100%确定是汉字形近错误，不标注。严格按JSON输出。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.0
+            )
+            m = re.search(r'\{[\s\S]*\}', resp.choices[0].message.content)
+            if not m:
+                return default
+            result = json.loads(m.group())
+            # Post-filter: keep only issues where both original and suggestion contain Chinese
+            def _is_hanzi_error(issue: Dict) -> bool:
+                orig = issue.get('original', '')
+                sugg = issue.get('suggestion', '')
+                return (bool(re.search(r'[\u4e00-\u9fff]', orig)) and
+                        bool(re.search(r'[\u4e00-\u9fff]', sugg)))
+            filtered = [iss for iss in result.get('issues', []) if _is_hanzi_error(iss)]
+            result['issues'] = filtered
+            result['has_issues'] = bool(filtered)
+            return result
+        except Exception as e:
+            return {**default, "summary": f"检查异常: {str(e)[:60]}"}
+
+    # ============ 智能体5：重复性检查 ============
+
+    def check_repetition(self, pending_chunk: Dict, similar_chunks: List[Dict]) -> Dict:
+        """重复性检查智能体：基于文档自身BM25结果，判断是否存在重复段落。"""
+        default = {"has_duplicates": False, "duplicates": [], "summary": "无重复内容"}
+        if not similar_chunks:
+            return default
+        content = pending_chunk['content']
+        similar_text = ""
+        for sc in similar_chunks:
+            loc = f"{sc.get('chapter', '')} / {sc.get('section', '')}"
+            similar_text += f"\n【Chunk#{sc['chunk_index']+1}（{loc}）】\n{sc['content'][:400]}\n"
+        prompt = f"""你是文档质量审查专家，检查作业规程中是否存在重复段落。
+
+【待检查段落】
+{content[:600]}
+
+【文档内相似段落】
+{similar_text}
+
+判断标准：
+- 重复：两段文字高度相似（>60%文字相同）且表述同一项要求 → has_duplicates=true
+- 不重复：内容相似但针对不同设备/位置/工序；前文总述后文细化；规范性引用 → false
+
+输出JSON：{{
+  "has_duplicates": true或false,
+  "duplicates": [{{"chunk_ref": "Chunk#X（位置）", "note": "重复内容简述"}}],
+  "summary": "一句话结论（如'与第X章重复'或'无重复'）"
+}}"""
+        try:
+            resp = self.llm_client.chat.completions.create(
+                model=QWEN_MODEL,
+                messages=[
+                    {"role": "system", "content": "你是文档质量审查专家，只有文字高度相似且内容相同才判为重复。严格按JSON格式输出。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.0
+            )
+            m = re.search(r'\{[\s\S]*\}', resp.choices[0].message.content)
+            return json.loads(m.group()) if m else default
+        except Exception as e:
+            return {**default, "summary": f"检查异常: {str(e)[:60]}"}
+
+    # ============ 并行三任务调度 ============
+
+    @staticmethod
+    def _timed_call(fn, *args):
+        start = time.time()
+        result = fn(*args)
+        return result, time.time() - start
+
+    def review_chunk_all_tasks(self, pending_chunk: Dict, kb_results: List[Dict],
+                               doc_bm25: Optional[BM25Okapi], doc_chunks: List[Dict],
+                               query_idx: int) -> Tuple[Dict, List[Dict], Dict, Dict, Dict[str, float]]:
+        """并行执行三项检查：合规审查链、错别字检查、重复性检查。"""
+        similar_chunks = (
+            self.search_doc_similar(pending_chunk, query_idx, doc_bm25, doc_chunks)
+            if doc_bm25 is not None else []
+        )
+        with ThreadPoolExecutor(max_workers=3) as exe:
+            f_compliance = exe.submit(self.review_chunk_complete, pending_chunk, kb_results)
+            f_typo = exe.submit(self._timed_call, self.check_typos, pending_chunk)
+            f_rep = exe.submit(self._timed_call, self.check_repetition, pending_chunk, similar_chunks)
+            compliance_result, classifications, agent_timings = f_compliance.result()
+            typo_result, typo_elapsed = f_typo.result()
+            rep_result, rep_elapsed = f_rep.result()
+        agent_timings['typo'] = typo_elapsed
+        agent_timings['repetition'] = rep_elapsed
+        return compliance_result, classifications, typo_result, rep_result, agent_timings
 
     # ============ 审核待审文档 ============
 
     def review_pending_document(self, pending_json_path: str = None,
-                                doc_filter: List[str] = None) -> Dict:
+                                doc_filter: List[str] = None,
+                                max_documents: Optional[int] = MAX_PENDING_DOCS) -> Dict:
         if pending_json_path is None:
-            for version in ['v5', 'v4', 'v3', 'v2']:
+            for version in ['v6', 'v5', 'v4', 'v3', 'v2']:
                 files = sorted(PENDING_CHUNKS_DIR.glob(f"pending_doc_chunks_{version}_*.json"), reverse=True)
                 if files:
                     pending_json_path = files[0]
@@ -567,30 +835,90 @@ class HybridRAGReviewerV5:
             }
             print(f"  过滤后文档数: {len(pending_data)} (过滤条件: {doc_filter})")
 
-        all_results = {}
+        if max_documents and max_documents > 0:
+            pending_data = dict(list(pending_data.items())[:max_documents])
+            print(f"  临时限制：仅审核前 {max_documents} 个待审文档: {list(pending_data.keys())}")
+
+        # ---- 断点续跑：加载已有增量结果 ----
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        incremental_suffix = f"_first_{max_documents}" if max_documents and max_documents > 0 else ""
+        incremental_path = OUTPUT_DIR / f"review_result_v7_incremental{incremental_suffix}.json"
+        all_results: Dict = {}
+        if incremental_path.exists():
+            try:
+                with open(incremental_path, 'r', encoding='utf-8') as f:
+                    all_results = json.load(f)
+                print(f"  [续跑] 已加载增量结果，跳过已完成文档: {list(all_results.keys())}")
+            except Exception:
+                all_results = {}
+
         total_chunks = sum(len(c) for c in pending_data.values())
-        processed = 0
+        processed = sum(
+            len(all_results[k]) for k in all_results if k in pending_data
+        )
         doc_timings = {}
         total_start = time.time()
+        api_fatal = False  # 账户欠费等致命错误标志
 
         for doc_name, chunks in pending_data.items():
+            if doc_name in all_results:
+                print(f"\n跳过（已有结果）: {doc_name}")
+                continue
+            if api_fatal:
+                print(f"\n[跳过] API不可用，暂停后续文档: {doc_name}")
+                continue
+
             doc_start = time.time()
             print(f"\n审核文档: {doc_name} ({len(chunks)} chunks)")
             doc_results = []
 
+            # 为本文档构建BM25自检索索引（重复性检查用）
+            doc_bm25 = self.build_doc_bm25(chunks) if len(chunks) > 1 else None
+
             for i, chunk in enumerate(chunks):
+                if api_fatal:
+                    break
                 processed += 1
                 chunk_start = time.time()
                 print(f"  [{processed}/{total_chunks}] chunk {i + 1}/{len(chunks)}...", end=" ", flush=True)
 
                 retrieval_start = time.time()
-                query = chunk['content']
-                kb_results = self.search_relevant(query, k=TOP_K, threshold=SIMILARITY_THRESHOLD)
-                retrieval_elapsed = time.time() - retrieval_start
+                retrieval_elapsed = 0.0
+                agent_timings: Dict[str, float] = {}
+                try:
+                    query = chunk['content']
+                    kb_results = self.search_relevant(query, k=TOP_K, threshold=SIMILARITY_THRESHOLD)
+                    retrieval_elapsed = time.time() - retrieval_start
+                except Exception as e:
+                    retrieval_elapsed = time.time() - retrieval_start
+                    err_str = str(e)
+                    if 'Arrearage' in err_str or 'overdue' in err_str.lower() or 'Access denied' in err_str:
+                        print(f"\n  [致命] API欠费，保存已有结果后退出: {err_str[:80]}")
+                        api_fatal = True
+                        break
+                    print(f"检索失败({err_str[:60]})，跳过")
+                    kb_results = []
 
                 if not kb_results:
+                    print("未找到相关法规，执行错别字/重复性检查...", end=" ", flush=True)
+                    try:
+                        typo_start = time.time()
+                        typo_result = self.check_typos(chunk)
+                        agent_timings['typo'] = time.time() - typo_start
+                        similar = self.search_doc_similar(chunk, i, doc_bm25, chunks) if doc_bm25 else []
+                        rep_start = time.time()
+                        rep_result = self.check_repetition(chunk, similar)
+                        agent_timings['repetition'] = time.time() - rep_start
+                    except Exception as e:
+                        err_str = str(e)
+                        if 'Arrearage' in err_str or 'Access denied' in err_str:
+                            print(f"\n  [致命] API欠费，保存已有结果后退出")
+                            api_fatal = True
+                            break
+                        typo_result = {"has_issues": False, "issues": [], "summary": "检查异常"}
+                        rep_result = {"has_duplicates": False, "duplicates": [], "summary": "检查异常"}
                     chunk_elapsed = time.time() - chunk_start
-                    print(f"未找到相关法规，耗时 {chunk_elapsed:.1f}s（检索 {retrieval_elapsed:.1f}s）")
+                    print(f"耗时 {chunk_elapsed:.1f}s（{self._format_chunk_timings(retrieval_elapsed, agent_timings)}）")
                     doc_results.append({
                         'chunk_index': i,
                         'chunk_content': chunk['content'],
@@ -603,14 +931,30 @@ class HybridRAGReviewerV5:
                         'kb_refs': [],
                         'kb_classifications': [],
                         'review_result': {"compliance_status": "不确定", "summary": "未找到相关法规", "issues": []},
+                        'typo_result': typo_result,
+                        'repetition_result': rep_result,
                     })
                     continue
 
-                print(f"找到 {len(kb_results)} 条相关法规，调用LLM...", end=" ", flush=True)
-                review_result, classifications = self.review_chunk_complete(chunk, kb_results)
+                print(f"找到 {len(kb_results)} 条相关法规，并行三任务...", end=" ", flush=True)
+                try:
+                    review_result, classifications, typo_result, rep_result, agent_timings = \
+                        self.review_chunk_all_tasks(chunk, kb_results, doc_bm25, chunks, i)
+                except Exception as e:
+                    err_str = str(e)
+                    if 'Arrearage' in err_str or 'Access denied' in err_str:
+                        print(f"\n  [致命] API欠费，保存已有结果后退出")
+                        api_fatal = True
+                        break
+                    print(f"LLM调用失败({err_str[:60]})，标记不确定")
+                    review_result = {"compliance_status": "不确定", "summary": f"调用失败: {err_str[:60]}", "issues": []}
+                    classifications = []
+                    typo_result = {"has_issues": False, "issues": [], "summary": "检查异常"}
+                    rep_result = {"has_duplicates": False, "duplicates": [], "summary": "检查异常"}
                 chunk_elapsed = time.time() - chunk_start
-                print(f"耗时 {chunk_elapsed:.1f}s（检索 {retrieval_elapsed:.1f}s）")
+                print(f"耗时 {chunk_elapsed:.1f}s（{self._format_chunk_timings(retrieval_elapsed, agent_timings)}）")
 
+                show_kb_refs = self._is_noncompliant_review(review_result)
                 doc_results.append({
                     'chunk_index': i,
                     'chunk_content': chunk['content'],
@@ -619,7 +963,7 @@ class HybridRAGReviewerV5:
                         'section': chunk.get('section', ''),
                         'page_range': chunk.get('page_range', '')
                     },
-                    'kb_matches': len(kb_results),
+                    'kb_matches': len(kb_results) if show_kb_refs else 0,
                     'kb_refs': [
                         {
                             'doc': r['chunk']['doc_name'],
@@ -630,22 +974,47 @@ class HybridRAGReviewerV5:
                             'content': r['chunk']['content'],
                         }
                         for r in kb_results
-                    ],
-                    'kb_classifications': classifications,
+                    ] if show_kb_refs else [],
+                    'kb_classifications': classifications if show_kb_refs else [],
                     'review_result': review_result,
+                    'typo_result': typo_result,
+                    'repetition_result': rep_result,
                 })
 
             doc_elapsed = time.time() - doc_start
             doc_timings[doc_name] = doc_elapsed
-            print(f"  文档审核完成，耗时 {doc_elapsed:.1f}s")
-            all_results[doc_name] = doc_results
+
+            # 每完成一个文档立即保存增量结果
+            if doc_results:
+                all_results[doc_name] = doc_results
+                self._save_incremental(all_results, incremental_path)
+                print(f"  文档审核完成，耗时 {doc_elapsed:.1f}s  [已增量保存]")
+            else:
+                print(f"  文档无结果（可能因API中断），耗时 {doc_elapsed:.1f}s")
 
         total_elapsed = time.time() - total_start
-        print(f"\n全部文档审核完成，总耗时 {total_elapsed:.1f}s")
+        print(f"\n全部处理完毕，总耗时 {total_elapsed:.1f}s")
         for name, t in doc_timings.items():
             print(f"  {name}: {t:.1f}s")
+        if api_fatal:
+            print("  ⚠️  因API欠费提前终止，请充值后重新运行（将自动续跑）")
 
         return all_results
+
+    def _save_incremental(self, results: Dict, path):
+        """将结果保存到增量文件（不含KB全文）。"""
+        slim = {}
+        for doc_name, doc_results in results.items():
+            slim[doc_name] = []
+            for r in doc_results:
+                r_slim = dict(r)
+                r_slim['kb_refs'] = [
+                    {k: v for k, v in ref.items() if k != 'content'}
+                    for ref in r.get('kb_refs', [])
+                ]
+                slim[doc_name].append(r_slim)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(slim, f, ensure_ascii=False, indent=2)
 
     # ============ 保存与报告 ============
 
@@ -653,7 +1022,7 @@ class HybridRAGReviewerV5:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         if output_path is None:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            output_path = OUTPUT_DIR / f"review_result_v5_{timestamp}.json"
+            output_path = OUTPUT_DIR / f"review_result_v7_{timestamp}.json"
         # 保存时不含kb全文（减小体积）
         slim = {}
         for doc_name, doc_results in results.items():
@@ -671,17 +1040,20 @@ class HybridRAGReviewerV5:
         return output_path
 
     def generate_report(self, results: Dict, output_path: str = None):
-        """生成HTML审核报告 v4（立场分类 + 可点击KB弹窗 + 滚动卡片）"""
+        """生成HTML审核报告 v7（合规链 + 错别字 + 重复性，并行三任务）"""
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         if output_path is None:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            output_path = OUTPUT_DIR / f"review_report_v5_{timestamp}.html"
+            output_path = OUTPUT_DIR / f"review_report_v7_{timestamp}.html"
 
         # ---- 统计 ----
         total_chunks = 0
         status_counts = {'合规': 0, '不合规': 0, '不确定': 0}
         verified_count = 0
         corrected_count = 0
+        typo_chunk_count = 0
+        typo_issue_count = 0
+        rep_chunk_count = 0
 
         for doc_results in results.values():
             for r in doc_results:
@@ -698,6 +1070,12 @@ class HybridRAGReviewerV5:
                     verified_count += 1
                     if len(review.get('issues', [])) < review.get('draft_issue_count', 0):
                         corrected_count += 1
+                typo = r.get('typo_result', {})
+                if typo.get('has_issues'):
+                    typo_chunk_count += 1
+                    typo_issue_count += len(typo.get('issues', []))
+                if r.get('repetition_result', {}).get('has_duplicates'):
+                    rep_chunk_count += 1
 
         # ---- 分类颜色映射 ----
         clf_colors = {
@@ -758,6 +1136,18 @@ body { font-family: 'Microsoft YaHei', Arial, sans-serif; margin: 0; background:
 .badge-uncertain { background: #f39c12; }
 .badge-verified { background: #8e44ad; font-size: 0.75em; padding: 2px 8px; }
 .badge-corrected { background: #e67e22; font-size: 0.75em; padding: 2px 8px; }
+.badge-typo { background: #d35400; font-size: 0.75em; padding: 2px 8px; }
+.badge-rep { background: #16a085; font-size: 0.75em; padding: 2px 8px; }
+.typo-list, .rep-list { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+.typo-item { background: #fef9e7; border: 1px solid #f9ca24; border-radius: 4px;
+  padding: 7px 10px; font-size: 0.85em; }
+.typo-wrong { font-weight: bold; color: #c0392b; }
+.typo-fix { color: #27ae60; }
+.typo-ctx { color: #7f8c8d; font-size: 0.82em; }
+.rep-item { background: #eafaf1; border: 1px solid #82e0aa; border-radius: 4px;
+  padding: 7px 10px; font-size: 0.85em; }
+.rep-ref { font-weight: bold; color: #1a5276; }
+.rep-note { color: #555; }
 .chunk-meta { color: #7f8c8d; font-size: 0.82em; padding: 6px 16px 0 16px; }
 .chunk-body { padding: 12px 16px; max-height: 320px; overflow-y: auto; }
 .content-box { background: #fafafa; border: 1px solid #eee; border-radius: 4px;
@@ -830,15 +1220,15 @@ document.addEventListener('keydown', function(e) {
             "<html lang='zh-CN'><head>",
             "<meta charset='utf-8'>",
             "<meta name='viewport' content='width=device-width, initial-scale=1'>",
-            "<title>煤矿作业规程合规审核报告 v5</title>",
+            "<title>煤矿作业规程合规审核报告 v7</title>",
             f"<style>{style}</style>",
             "</head><body>",
             # 头部
             "<div class='page-header'>",
-            "<h1>煤矿作业规程合规审核报告 v5</h1>",
+            "<h1>煤矿作业规程合规审核报告 v7</h1>",
             f"<div class='meta'>生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
             f"相似度阈值: {SIMILARITY_THRESHOLD} | TopK: {TOP_K} | "
-            f"三智能体模式（分类+初审+验证）</div>",
+            f"三并行模式（合规审查+核验+错误相关性分类 ‖ 错别字 ‖ 重复性）</div>",
             "</div>",
             # 主体
             "<div class='main'>",
@@ -853,20 +1243,41 @@ document.addEventListener('keydown', function(e) {
             f"<div class='stat-card gray'><div class='stat-value'>{status_counts['不确定']}</div><div class='stat-label'>不确定</div></div>",
             f"<div class='stat-card purple'><div class='stat-value'>{verified_count}</div><div class='stat-label'>经二次验证</div></div>",
             f"<div class='stat-card orange'><div class='stat-value'>{corrected_count}</div><div class='stat-label'>验证纠正误判</div></div>",
+            f"<div class='stat-card' style='background:linear-gradient(135deg,#d35400,#e67e22)'>"
+            f"<div class='stat-value'>{typo_chunk_count}</div><div class='stat-label'>含错别字chunks</div></div>",
+            f"<div class='stat-card' style='background:linear-gradient(135deg,#16a085,#1abc9c)'>"
+            f"<div class='stat-value'>{rep_chunk_count}</div><div class='stat-label'>含重复内容chunks</div></div>",
             "</div></div>",
         ]
 
         # ---- 各文档 ----
         for doc_name, doc_results in results.items():
+            visible_results = [
+                r for r in doc_results
+                if self._is_noncompliant_review(r.get('review_result', {}))
+                or r.get('typo_result', {}).get('has_issues')
+                or r.get('repetition_result', {}).get('has_duplicates')
+            ]
+            if not visible_results:
+                continue
             parts.append(f"<div class='doc-header'>📄 {esc(doc_name)}</div>")
 
-            for r in doc_results:
+            for r in visible_results:
                 review = r.get('review_result', {})
                 status = review.get('compliance_status', '不确定')
                 is_verified = review.get('verified', False)
                 draft_count = review.get('draft_issue_count', 0)
                 final_count = len(review.get('issues', []))
                 was_corrected = is_verified and final_count < draft_count
+                typo = r.get('typo_result', {})
+                rep = r.get('repetition_result', {})
+                has_display_issue = (
+                    self._is_noncompliant_review(review)
+                    or typo.get('has_issues')
+                    or rep.get('has_duplicates')
+                )
+                if not has_display_issue:
+                    continue
 
                 if '合规' in status and '不' not in status:
                     badge_cls = 'badge-compliant'
@@ -893,6 +1304,11 @@ document.addEventListener('keydown', function(e) {
                     parts.append("<span class='status-badge badge-verified'>已二次验证</span>")
                 if was_corrected:
                     parts.append(f"<span class='status-badge badge-corrected'>误判纠正 {draft_count}→{final_count}项</span>")
+                if typo.get('has_issues'):
+                    n = len(typo.get('issues', []))
+                    parts.append(f"<span class='status-badge badge-typo'>错别字 {n}处</span>")
+                if rep.get('has_duplicates'):
+                    parts.append("<span class='status-badge badge-rep'>重复内容</span>")
                 parts.append("</div>")
 
                 # 元信息
@@ -972,6 +1388,35 @@ document.addEventListener('keydown', function(e) {
                 if review.get('summary'):
                     parts.append(f"<div class='summary-text'>📝 {esc(review['summary'])}</div>")
 
+                # 错别字结果
+                if typo.get('has_issues') and typo.get('issues'):
+                    parts.append("<div class='section-title'>✏️ 错别字检查</div>")
+                    parts.append("<div class='typo-list'>")
+                    for ti in typo['issues']:
+                        parts.append("<div class='typo-item'>")
+                        parts.append(
+                            f"<span class='typo-wrong'>「{esc(ti.get('original', ''))}」</span>"
+                            f" → <span class='typo-fix'>「{esc(ti.get('suggestion', ''))}」</span>"
+                        )
+                        if ti.get('context'):
+                            parts.append(f"<div class='typo-ctx'>上下文: …{esc(ti['context'])}…</div>")
+                        parts.append("</div>")
+                    parts.append("</div>")
+                elif typo:
+                    parts.append(f"<div class='summary-text' style='color:#7f8c8d;'>✏️ {esc(typo.get('summary', ''))}</div>")
+
+                # 重复性结果
+                if rep.get('has_duplicates') and rep.get('duplicates'):
+                    parts.append("<div class='section-title'>🔁 重复性检查</div>")
+                    parts.append("<div class='rep-list'>")
+                    for ri in rep['duplicates']:
+                        parts.append("<div class='rep-item'>")
+                        parts.append(f"<span class='rep-ref'>{esc(ri.get('chunk_ref', ''))}</span>")
+                        if ri.get('note'):
+                            parts.append(f"<span class='rep-note'>：{esc(ri['note'])}</span>")
+                        parts.append("</div>")
+                    parts.append("</div>")
+
                 parts.append("</div>")  # chunk-body
                 parts.append("</div>")  # chunk-card
 
@@ -1004,20 +1449,50 @@ document.addEventListener('keydown', function(e) {
 
 def main():
     print("=" * 70)
-    print("煤矿作业规程合规审核系统 v5 - 三智能体混合检索RAG")
+    print("煤矿作业规程合规审核系统 v7 - 三并行（合规链+错别字+重复性）")
     print(f"相似度阈值: {SIMILARITY_THRESHOLD} | TopK: {TOP_K}")
     print(f"文档过滤: {DOC_FILTER if DOC_FILTER else '全部'}")
     print(f"二次验证: {'开启' if VERIFY_NON_COMPLIANT else '关闭'}")
     print("=" * 70)
 
-    reviewer = HybridRAGReviewerV5()
+    reviewer = HybridRAGReviewerV7()
     reviewer.load_knowledge_base()
     reviewer.load_or_build_index()
-    results = reviewer.review_pending_document()
-    reviewer.save_results(results)
-    reviewer.generate_report(results)
+    results = reviewer.review_pending_document(max_documents=MAX_PENDING_DOCS)
+
+    # 只有当前审核范围内的文档都完成才保存正式结果并清理增量文件
+    incremental_suffix = f"_first_{MAX_PENDING_DOCS}" if MAX_PENDING_DOCS and MAX_PENDING_DOCS > 0 else ""
+    incremental_path = OUTPUT_DIR / f"review_result_v7_incremental{incremental_suffix}.json"
+    all_done = all(k in results for k in results)  # 总是True，但下面判断文档数
+    pending_json_files = sorted(
+        (OUTPUT_DIR.parent / "chunks_visualization").glob("pending_doc_chunks_v*_*.json"), reverse=True
+    )
+    if pending_json_files:
+        import json as _json
+        with open(pending_json_files[0], 'r', encoding='utf-8') as _f:
+            _pending = _json.load(_f)
+        if DOC_FILTER:
+            _pending = {
+                k: v for k, v in _pending.items()
+                if any(f in k for f in DOC_FILTER)
+            }
+        if MAX_PENDING_DOCS and MAX_PENDING_DOCS > 0:
+            _pending = dict(list(_pending.items())[:MAX_PENDING_DOCS])
+        all_done = all(k in results for k in _pending)
+
+    if all_done:
+        reviewer.save_results(results)
+        reviewer.generate_report(results)
+        if incremental_path.exists():
+            incremental_path.unlink()
+            print("  增量文件已清理")
+    else:
+        # 部分完成：只生成已有结果的报告，增量文件保留供续跑
+        reviewer.generate_report(results)
+        print(f"  ⚠️  部分完成（{len(results)}/待审文档数），增量文件已保留，充值后重新运行续跑")
 
     total = non_compliant = uncertain = verified = corrected = 0
+    typo_chunks = typo_issues = rep_chunks = 0
     for doc_results in results.values():
         for r in doc_results:
             total += 1
@@ -1031,12 +1506,19 @@ def main():
                 verified += 1
                 if len(review.get('issues', [])) < review.get('draft_issue_count', 0):
                     corrected += 1
+            typo = r.get('typo_result', {})
+            if typo.get('has_issues'):
+                typo_chunks += 1
+                typo_issues += len(typo.get('issues', []))
+            if r.get('repetition_result', {}).get('has_duplicates'):
+                rep_chunks += 1
 
     print("\n" + "=" * 70)
     print("[OK] 审核完成！")
     print(f"  总计审核: {total} 个chunks")
-    print(f"  不合规: {non_compliant} 个 | 不确定: {uncertain} 个")
-    print(f"  经二次验证: {verified} 个 | 验证后纠正误判: {corrected} 个")
+    print(f"  合规审查 → 不合规: {non_compliant} | 不确定: {uncertain} | 经验证: {verified} | 纠正误判: {corrected}")
+    print(f"  错别字检查 → 含问题chunks: {typo_chunks} | 总计错误: {typo_issues} 处")
+    print(f"  重复性检查 → 含重复chunks: {rep_chunks}")
     print("=" * 70)
 
 
