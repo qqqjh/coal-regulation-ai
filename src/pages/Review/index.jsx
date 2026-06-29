@@ -1,391 +1,756 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import useUserStore from '../../store/userStore'
 import {
-  Upload, Button, message, Tag, Space, Progress, Input, Tooltip,
-  Empty, Segmented, Badge, Spin, Drawer, Table, Popconfirm
+  Button, Spin, Empty, Radio, Input, message, Progress, Tag, Tooltip,
 } from 'antd'
 import {
-  UploadOutlined, CheckOutlined, CloseOutlined, EditOutlined,
-  DownloadOutlined, RobotOutlined, FileWordOutlined, AimOutlined,
-  ReloadOutlined, DatabaseOutlined, DeleteOutlined
+  DeleteOutlined, FileTextOutlined, CloudUploadOutlined,
+  CheckCircleFilled, CloseCircleFilled, LoadingOutlined,
+  CheckOutlined, CloseOutlined, EditOutlined, DownloadOutlined,
 } from '@ant-design/icons'
+import axios from 'axios'
+import { Document as PdfDocument, Page, pdfjs } from 'react-pdf'
+import 'react-pdf/dist/Page/AnnotationLayer.css'
+import 'react-pdf/dist/Page/TextLayer.css'
 import './index.css'
 
 const { TextArea } = Input
+const V9 = '/api/v9'
+pdfjs.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString()
 
-// 问题类型 → 颜色/标签
-const TYPE_META = {
-  compliance: { color: 'volcano', label: '合规' },
-  numeric: { color: 'geekblue', label: '数值' },
-  typo: { color: 'orange', label: '错别字' },
-  redundancy: { color: 'purple', label: '重复' },
-  escalation: { color: 'magenta', label: '待裁决' }
+// ── v9 issue type metadata ────────────────────────────────────────
+const TYPE_CFG = {
+  compliance:  { label: '合规', color: '#2f54eb', bg: '#e8eeff' },
+  typo:        { label: '错别字', color: '#e53935', bg: '#fce4e4' },
+  redundancy:  { label: '重复', color: '#ff9800', bg: '#fff3e0' },
+  numeric:     { label: '数值', color: '#9c27b0', bg: '#f3e5f5' },
+  escalation:  { label: '升级', color: '#607d8b', bg: '#eceff1' },
 }
-const STATUS_COLOR = { 不合规: '#cf1322', 不确定: '#d48806', 错别字: '#d46b08', 重复: '#531dab' }
+const TYPE_ORDER = ['compliance', 'typo', 'redundancy', 'numeric', 'escalation']
 
-const Review = () => {
-  const [jobId, setJobId] = useState(null)
-  const [docName, setDocName] = useState('')
-  const [mineType, setMineType] = useState('non_outburst')
-  const [blocks, setBlocks] = useState([])
-  const [issues, setIssues] = useState([])
-  const [job, setJob] = useState({ status: 'idle', progress: 0, agent_status: '' })
-  const [selectedId, setSelectedId] = useState(null)
-  const [customFor, setCustomFor] = useState(null)   // 正在写自定义意见的 issue id
-  const [customText, setCustomText] = useState('')
-  const [uploading, setUploading] = useState(false)
-  const [fwOpen, setFwOpen] = useState(false)
-  const [fwData, setFwData] = useState({ counts: {}, items: [] })
-  const [fwLoading, setFwLoading] = useState(false)
+function typeCfg(t) {
+  return TYPE_CFG[t] || { label: t, color: '#666', bg: '#f5f5f5' }
+}
 
-  const esRef = useRef(null)
-  const docRef = useRef(null)
-  const blockRefs = useRef({})
+const JOB_STATUS = {
+  pending:   { label: '排队中',   color: '#faad14' },
+  parsing:   { label: '解析文档', color: '#1890ff' },
+  reviewing: { label: '审查中',   color: '#1890ff' },
+  done:      { label: '审查完成', color: '#52c41a' },
+  failed:    { label: '失败',     color: '#f5222d' },
+  cancelled: { label: '已取消',   color: '#8c8c8c' },
+}
 
-  // ---------- SSE ----------
-  const closeStream = () => {
-    if (esRef.current) { esRef.current.close(); esRef.current = null }
-  }
+const ACTION_LABEL = {
+  pending: { text: '待处理', color: 'default' },
+  accept:  { text: '已采纳', color: 'success' },
+  reject:  { text: '已驳回', color: 'warning' },
+  custom:  { text: '已改写', color: 'processing' },
+}
 
-  const startStream = useCallback((id) => {
-    closeStream()
-    const es = new EventSource(`/api/v9/stream/${id}`)
-    esRef.current = es
-    es.onmessage = (e) => {
-      const msg = JSON.parse(e.data)
-      if (msg.type === 'status') {
-        setJob(j => ({ ...j, ...msg.job }))
-        if (msg.job.paragraphs_ready) fetchDocument(id)
-      } else if (msg.type === 'issue') {
-        setIssues(prev => prev.some(x => x.id === msg.issue.id) ? prev : [...prev, msg.issue])
-      } else if (msg.type === 'end' || msg.type === 'timeout' || msg.type === 'error') {
-        closeStream()
-        fetchDocument(id)
+function normalizeText(text = '') {
+  return String(text).normalize('NFKC').replace(/\s+/g, '')
+}
+
+function escapeHtml(text = '') {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function isMeaningfulPdfFragment(str = '', normStr = normalizeText(str)) {
+  if (normStr.length < 6) return false
+  if (!/[\u4e00-\u9fa5A-Za-z0-9]/.test(normStr)) return false
+  if (/^[\s，。；、：！？,.!?;:()[\]（）【】《》“”"'‘’\-—~·]+$/.test(str)) return false
+  return true
+}
+
+function makePdfTextRenderer(issues, selectedId) {
+  const sortedIssues = [...issues]
+    .map(issue => ({ issue, candidates: issueCandidates(issue) }))
+    .filter(item => item.candidates.length > 0)
+    .sort((a, b) => Math.max(...b.candidates.map(c => c.length)) - Math.max(...a.candidates.map(c => c.length)))
+
+  return ({ str }) => {
+    if (!str) return ''
+    const normStr = normalizeText(str)
+    const exactMatches = []
+
+    for (const { issue, candidates } of sortedIssues) {
+      for (const candidate of candidates) {
+        const normCandidate = normalizeText(candidate)
+        if (!normCandidate) continue
+        const isShortNeedle = candidate.length <= 3
+        if (str.includes(candidate)) {
+          exactMatches.push({ issue, candidate })
+          break
+        }
+        if (!isShortNeedle && isMeaningfulPdfFragment(str, normStr) && normCandidate.includes(normStr)) {
+          return `<mark class="rv-pdf-mark ${issueHighlightClass(issue)} ${issue.id === selectedId ? 'selected' : ''}" data-issue-id="${issue.id}">${escapeHtml(str)}</mark>`
+        }
       }
     }
-    es.onerror = () => { /* 浏览器会自动重连；done 时已主动 close */ }
-  }, [])
 
-  useEffect(() => () => closeStream(), [])
+    if (exactMatches.length === 0) return escapeHtml(str)
+    let html = escapeHtml(str)
+    exactMatches.slice(0, 3).forEach(({ issue, candidate }) => {
+      const safeCandidate = escapeHtml(candidate)
+      if (!safeCandidate) return
+      const cls = `rv-pdf-mark ${issueHighlightClass(issue)} ${issue.id === selectedId ? 'selected' : ''}`
+      html = html.split(safeCandidate).join(`<mark class="${cls}" data-issue-id="${issue.id}">${safeCandidate}</mark>`)
+    })
+    return html
+  }
+}
+function issueHighlightClass(issue) {
+  if (issue.agent_applied === 1) return 'fixed'
+  if (issue.human_action === 'reject' || issue.agent_applied === 2) return 'rejected'
+  if (['accept', 'custom'].includes(issue.human_action) && [0, 3].includes(issue.agent_applied)) return 'applying'
+  return 'error'
+}
 
-  // ---------- 文档段落 ----------
-  const fetchDocument = async (id) => {
-    try {
-      const r = await fetch(`/api/v9/document/${id}`)
-      if (r.ok) {
-        const data = await r.json()
-        if (data.blocks?.length) setBlocks(data.blocks)
-      }
-    } catch (err) { console.error('加载文档失败', err) }
+function issueCandidates(issue) {
+  const values = issue.agent_applied === 1
+    ? [issue.human_text, issue.suggestion, issue.original_text]
+    : [issue.original_text]
+  return values.map(v => (v || '').trim()).filter(Boolean)
+}
+
+function issueLocateCandidates(issue) {
+  return [
+    issue.detail?.context,
+    issue.original_text,
+    issue.human_text,
+    issue.suggestion,
+  ].map(v => (v || '').trim()).filter(Boolean)
+}
+
+function findIssueNeedle(text, issue) {
+  if (!text) return ''
+  return issueCandidates(issue).find(candidate => text.includes(candidate)) || ''
+}
+
+function renderHighlightedText(text = '', blockIssues = [], onSelectIssue) {
+  if (!text || blockIssues.length === 0) return text
+  const ranges = []
+  const occupied = new Array(text.length).fill(false)
+  const sorted = [...blockIssues].sort((a, b) => {
+    const aNeedle = findIssueNeedle(text, a)
+    const bNeedle = findIssueNeedle(text, b)
+    return bNeedle.length - aNeedle.length
+  })
+
+  sorted.forEach(issue => {
+    const needle = findIssueNeedle(text, issue)
+    if (!needle) return
+    const start = text.indexOf(needle)
+    const end = start + needle.length
+    if (start < 0 || occupied.slice(start, end).some(Boolean)) return
+    for (let i = start; i < end; i += 1) occupied[i] = true
+    ranges.push({ start, end, issue })
+  })
+
+  if (ranges.length === 0) return text
+  ranges.sort((a, b) => a.start - b.start)
+  const nodes = []
+  let cursor = 0
+  ranges.forEach(range => {
+    if (range.start > cursor) nodes.push(text.slice(cursor, range.start))
+    nodes.push(
+      <mark
+        key={`${range.issue.id}-${range.start}`}
+        className={`rv-doc-mark ${issueHighlightClass(range.issue)}`}
+        data-issue-id={range.issue.id}
+        title={`#${range.issue.id} ${range.issue.title || range.issue.status || ''}`}
+        onClick={(e) => { e.stopPropagation(); onSelectIssue(range.issue.id) }}
+      >
+        {text.slice(range.start, range.end)}
+      </mark>
+    )
+    cursor = range.end
+  })
+  if (cursor < text.length) nodes.push(text.slice(cursor))
+  return nodes
+}
+
+function AnnotatedDocument({ blocks, loading, issuesByBlock, onSelectIssue }) {
+  if (loading) {
+    return <div className="rv-doc-loading"><Spin /><span>正在加载高亮文档...</span></div>
+  }
+  if (!blocks.length) {
+    return <div className="rv-doc-loading"><Empty description="文档段落模型尚未生成" /></div>
   }
 
-  // ---------- 上传 ----------
-  const handleUpload = async (file) => {
-    setUploading(true)
-    setBlocks([]); setIssues([]); setSelectedId(null)
-    setJob({ status: 'pending', progress: 0, agent_status: '已上传，等待 worker 取走...' })
-    const form = new FormData()
-    form.append('file', file)
+  return (
+    <div className="rv-doc-scroll">
+      <div className="rv-a4-page rv-highlight-page">
+        {blocks.map(block => {
+          const blockIssues = issuesByBlock.get(Number(block.block_index)) || []
+          const issueIds = blockIssues.map(issue => String(issue.id)).join(' ')
+          const fixedWithoutExactMatch = blockIssues.some(issue =>
+            issue.agent_applied === 1 && !findIssueNeedle(block.text || '', issue)
+          )
+          const classes = [
+            'rv-doc-block',
+            block.is_heading ? 'heading' : '',
+            block.kind === 'table' ? 'table' : '',
+            blockIssues.length ? 'has-issues' : '',
+            fixedWithoutExactMatch ? 'fixed-block' : '',
+          ].filter(Boolean).join(' ')
+          return (
+            <div
+              key={block.block_index}
+              className={classes}
+              data-block-index={block.block_index}
+              data-issue-ids={issueIds}
+              onClick={() => blockIssues[0] && onSelectIssue(blockIssues[0].id)}
+            >
+              {renderHighlightedText(block.text || '', blockIssues, onSelectIssue)}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+// ── 主组件 ───────────────────────────────────────────────────────
+export default function Review() {
+  const user = useUserStore(s => s.user)
+  const uid  = user?.id ?? 'guest'
+  const activeJobKey = `review-active-job:${uid}`
+
+  // ── 上传 & 任务状态 ───────────────────────────────────────────
+  const [dragging,   setDragging]   = useState(false)
+  const [uploading,  setUploading]  = useState(false)
+  const [mineType,   setMineType]   = useState('non_outburst')
+  const [jobId,      setJobId]      = useState(null)
+  const [jobInfo,    setJobInfo]    = useState(null)
+  const [docName,    setDocName]    = useState(null)
+  const [pdfUrl,     setPdfUrl]     = useState(null)
+  const [pdfBlobUrl, setPdfBlobUrl] = useState(null)
+  const [pdfLoading, setPdfLoading] = useState(false)
+  const [pdfError,   setPdfError]   = useState("")
+  const [pdfNumPages, setPdfNumPages] = useState(0)
+  const [pdfPage, setPdfPage] = useState(1)
+  const [pdfScale, setPdfScale] = useState(1.35)
+  const [pdfTextIndex, setPdfTextIndex] = useState({})
+  const [previewMode, setPreviewMode] = useState('pdf')
+  const [documentBlocks, setDocumentBlocks] = useState([])
+  const [documentLoading, setDocumentLoading] = useState(false)
+
+  // ── 问题列表 ──────────────────────────────────────────────────
+  const [issues,     setIssues]     = useState([])
+  const [selectedId, setSelectedId] = useState(null)
+  const [filterType, setFilterType] = useState('all')
+
+  // ── 反馈 ──────────────────────────────────────────────────────
+  const [feedbackMap,  setFeedbackMap]  = useState({})
+  const [customText,   setCustomText]   = useState('')
+
+  const sseRef      = useRef(null)
+  const fileInputRef = useRef(null)
+
+  const loadDocument = useCallback(async (jid) => {
+    if (!jid) return
+    setDocumentLoading(true)
     try {
-      const r = await fetch(`/api/v9/upload?mine_type=${mineType}`, { method: 'POST', body: form })
-      if (!r.ok) { message.error('上传失败'); setUploading(false); return false }
-      const data = await r.json()
-      setJobId(data.job_id)
-      setDocName(data.doc_name)
-      message.success('上传成功，审查已排队')
-      startStream(data.job_id)
-      // 等段落就绪
-      const t = setInterval(async () => {
-        const jr = await fetch(`/api/v9/status/${data.job_id}`)
-        if (jr.ok) {
-          const j = await jr.json()
-          if (j.paragraphs_path || j.status !== 'pending') { fetchDocument(data.job_id); clearInterval(t) }
+      const res = await axios.get(`${V9}/document/${jid}`)
+      setDocumentBlocks(res.data.blocks || [])
+    } catch {
+      setDocumentBlocks([])
+    } finally {
+      setDocumentLoading(false)
+    }
+  }, [])
+
+  // ── SSE ───────────────────────────────────────────────────────
+  const connectSSE = useCallback((jid) => {
+    if (sseRef.current) sseRef.current.close()
+    const es = new EventSource(`${V9}/stream/${jid}`)
+    es.onmessage = (e) => {
+      try {
+        const d = JSON.parse(e.data)
+        if (d.type === 'status') {
+          setJobInfo(d.job)
+          if (d.job?.paragraphs_ready) loadDocument(jid)
+        } else if (d.type === 'issue') {
+          setIssues(prev => prev.some(i => i.id === d.issue.id) ? prev : [...prev, d.issue])
+        } else if (d.type === 'end') {
+          loadDocument(jid)
+          es.close()
+        } else if (d.type === 'timeout') {
+          es.close()
+          setJobInfo(prev => {
+            if (prev && !['done', 'failed', 'cancelled'].includes(prev.status)) connectSSE(jid)
+            return prev
+          })
+        } else if (d.type === 'error') {
+          message.error(d.msg || 'SSE 错误')
+          es.close()
         }
-      }, 1500)
+      } catch {
+        // Ignore malformed SSE payloads and wait for the next event.
+      }
+    }
+    es.onerror = () => {}
+    sseRef.current = es
+  }, [loadDocument])
+
+  useEffect(() => () => sseRef.current?.close(), [])
+
+  // 刷新页面后恢复当前审查任务、已有问题与 SSE 连接
+  useEffect(() => {
+    const saved = localStorage.getItem(activeJobKey)
+    if (!saved) return
+    let active = true
+    let task
+    try {
+      task = JSON.parse(saved)
+    } catch {
+      localStorage.removeItem(activeJobKey)
+      return
+    }
+    Promise.all([
+      axios.get(`${V9}/status/${task.jobId}`),
+      axios.get(`${V9}/issues/${task.jobId}`),
+    ]).then(([statusRes, issuesRes]) => {
+      if (!active) return
+      setJobId(task.jobId)
+      setDocName(task.docName || statusRes.data.doc_name)
+      setPdfUrl(`${V9}/preview-pdf/${task.jobId}?t=${Date.now()}`)
+      setPdfLoading(true)
+      setPdfError("")
+      setJobInfo(statusRes.data)
+      setIssues(issuesRes.data.issues || [])
+      loadDocument(task.jobId)
+      if (statusRes.data.status === 'cancelled') {
+        localStorage.removeItem(activeJobKey)
+        return
+      }
+      if (!['done', 'failed', 'cancelled'].includes(statusRes.data.status)) connectSSE(task.jobId)
+    }).catch(() => localStorage.removeItem(activeJobKey))
+    return () => { active = false }
+  }, [activeJobKey, connectSSE, loadDocument])
+
+
+  useEffect(() => {
+    if (!pdfUrl) return
+    let active = true
+    setPdfLoading(true)
+    setPdfError("")
+    setPdfPage(1)
+    setPdfBlobUrl(null)
+    axios.get(pdfUrl, { responseType: 'blob', timeout: 45000 }).then(res => {
+      if (!active) return
+      const contentType = res.headers?.['content-type'] || ''
+      if (!contentType.includes('pdf') && res.data?.type && !res.data.type.includes('pdf')) {
+        throw new Error('后端返回的不是 PDF 文件')
+      }
+      const objectUrl = URL.createObjectURL(res.data)
+      setPdfBlobUrl(objectUrl)
+    }).catch(err => {
+      if (!active) return
+      setPdfLoading(false)
+      setPdfError(`PDF 预览加载失败：${err.response?.data?.detail || err.message || '未知错误'}`)
+    })
+    return () => {
+      active = false
+    }
+  }, [pdfUrl])
+
+  useEffect(() => () => {
+    if (pdfBlobUrl) URL.revokeObjectURL(pdfBlobUrl)
+  }, [pdfBlobUrl])
+
+  useEffect(() => {
+    if (jobId && !pdfUrl) {
+      setPdfUrl(`${V9}/preview-pdf/${jobId}?t=${Date.now()}`)
+      setPdfLoading(true)
+      setPdfError("")
+    }
+  }, [jobId, pdfUrl])
+  function refreshPdfPreview(force = false) {
+    if (!jobId) return
+    setPdfError("")
+    setPdfLoading(true)
+    setPdfPage(1)
+    setPdfTextIndex({})
+    setPdfUrl(`${V9}/preview-pdf/${jobId}?t=${Date.now()}${force ? '&refresh=1' : ''}`)
+  }
+
+  async function handlePdfLoadSuccess(pdf) {
+    setPdfNumPages(pdf.numPages)
+    setPdfLoading(false)
+    setPdfError('')
+    try {
+      const entries = await Promise.all(
+        Array.from({ length: pdf.numPages }, async (_, i) => {
+          const pageNo = i + 1
+          const page = await pdf.getPage(pageNo)
+          const content = await page.getTextContent()
+          return [pageNo, content.items.map(item => item.str || '').join('')]
+        })
+      )
+      setPdfTextIndex(Object.fromEntries(entries))
+    } catch {
+      setPdfTextIndex({})
+    }
+  }
+  // ── 上传 ──────────────────────────────────────────────────────
+  async function handleFile(file) {
+    if (!file) return
+    if (!file.name.match(/\.(docx|doc)$/i)) {
+      message.error('只支持 Word 文档（.docx / .doc）')
+      return
+    }
+    setUploading(true)
+    setIssues([])
+    setSelectedId(null)
+    setFeedbackMap({})
+    setJobInfo(null)
+    setDocName(null)
+    try {
+      const fd = new FormData()
+      fd.append('file', file)
+      const res = await axios.post(`${V9}/upload?mine_type=${mineType}`, fd)
+      setJobId(res.data.job_id)
+      setDocName(res.data.doc_name)
+      localStorage.setItem(activeJobKey, JSON.stringify({
+        jobId: res.data.job_id, docName: res.data.doc_name,
+      }))
+      setJobInfo({ status: 'pending', progress: 0, n_chunks: 0, n_done: 0 })
+      setDocumentBlocks([])
+      setPreviewMode('pdf')
+      connectSSE(res.data.job_id)
+      message.success('文档上传成功，审查任务已创建')
     } catch (err) {
-      message.error('上传出错: ' + err.message)
+      message.error('上传失败：' + (err.response?.data?.detail || err.message))
     } finally {
       setUploading(false)
     }
-    return false
   }
 
-  // ---------- 反馈 ----------
-  const pollFeedback = (issueId) => {
-    const t = setInterval(async () => {
-      const r = await fetch(`/api/v9/feedback-status/${issueId}`)
-      if (r.ok) {
-        const s = await r.json()
-        if (s.agent_applied === 1) { // 已改写
-          clearInterval(t)
-          message.success('主智能体已改写文档：' + (s.agent_note || ''))
-          fetchDocument(jobId)
-          setIssues(prev => prev.map(x => x.id === issueId
-            ? { ...x, _resolved: 'applied', agent_note: s.agent_note } : x))
-        } else if (s.agent_applied === 2 || s.agent_applied === -1) {
-          clearInterval(t)
-          setIssues(prev => prev.map(x => x.id === issueId
-            ? { ...x, _resolved: s.agent_applied === 2 ? 'noop' : 'failed', agent_note: s.agent_note } : x))
+  const onDragOver  = (e) => { e.preventDefault(); setDragging(true) }
+  const onDragLeave = ()  => setDragging(false)
+  const onDrop      = (e) => { e.preventDefault(); setDragging(false); handleFile(e.dataTransfer.files[0]) }
+  const onInputChange = (e) => handleFile(e.target.files[0])
+
+  // ── 清除 ──────────────────────────────────────────────────────
+  async function clearResults() {
+    const currentJobId = jobId
+    sseRef.current?.close()
+    if (currentJobId) {
+      try {
+        await axios.post(`${V9}/cancel/${currentJobId}`)
+      } catch {
+        // Cancellation is best-effort; local UI state should still reset.
+      }
+    }
+    localStorage.removeItem(activeJobKey)
+    setJobId(null); setJobInfo(null); setDocName(null); setPdfUrl(null); setPdfBlobUrl(null); setPdfLoading(false); setPdfError("")
+    setDocumentBlocks([]); setPreviewMode('pdf')
+    setIssues([]); setSelectedId(null)
+    setFeedbackMap({}); setCustomText('')
+    setFilterType('all')
+  }
+
+  // ── 下载 ──────────────────────────────────────────────────────
+  async function handleDownload() {
+    try {
+      const res = await axios.get(`${V9}/download/${jobId}`, { responseType: 'blob' })
+      const url = URL.createObjectURL(res.data)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `审查后_${docName || jobId}.docx`
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch { message.error('下载失败') }
+  }
+
+  // ── 反馈 ──────────────────────────────────────────────────────
+  async function submitFeedback(issueId, action, text = '') {
+    setFeedbackMap(prev => ({ ...prev, [issueId]: { loading: true } }))
+    try {
+      await axios.post(`${V9}/feedback`, { issue_id: issueId, action, text })
+      const nextApplied = action === 'reject' ? 2 : 3
+      setIssues(prev => prev.map(i =>
+        i.id === issueId ? { ...i, human_action: action, human_text: text, agent_applied: nextApplied } : i
+      ))
+      setCustomText('')
+      if (action === 'reject') {
+        setFeedbackMap(prev => ({ ...prev, [issueId]: { loading: false, done: true, action } }))
+        message.success('已驳回，原文保留')
+      } else {
+        message.success('反馈已提交，正在改写文档')
+        pollFeedbackResult(issueId)
+      }
+    } catch (err) {
+      message.error('提交失败：' + (err.response?.data?.detail || err.message))
+      setFeedbackMap(prev => ({ ...prev, [issueId]: { loading: false } }))
+    }
+  }
+
+  async function pollFeedbackResult(issueId) {
+    for (let i = 0; i < 80; i += 1) {
+      await new Promise(resolve => setTimeout(resolve, 1500))
+      try {
+        const res = await axios.get(`${V9}/feedback-status/${issueId}`)
+        const data = res.data
+        setIssues(prev => prev.map(item =>
+          item.id === issueId
+            ? { ...item, human_action: data.human_action, agent_applied: data.agent_applied, agent_note: data.agent_note }
+            : item
+        ))
+        if (![0, 3].includes(data.agent_applied)) {
+          setFeedbackMap(prev => ({ ...prev, [issueId]: { loading: false, done: true, action: data.human_action } }))
+          if (data.agent_applied === 1) {
+            message.success('文档已改写，高亮已刷新')
+            loadDocument(jobId)
+            refreshPdfPreview(true)
+          } else if (data.agent_applied === -1) {
+            message.error(`改写失败：${data.agent_note || '未能定位原文'}`)
+          }
+          return
+        }
+      } catch {
+        // Feedback polling is best-effort; timeout below reports the unresolved state.
+      }
+    }
+    setFeedbackMap(prev => ({ ...prev, [issueId]: { loading: false } }))
+    message.warning('改写仍在处理中，请稍后刷新查看')
+  }
+
+  // ── 派生状态 ──────────────────────────────────────────────────
+  const selectedIssue = issues.find(i => i.id === selectedId) || null
+  const isRunning = jobInfo && ['pending', 'parsing', 'reviewing'].includes(jobInfo.status)
+  const isDone    = jobInfo?.status === 'done'
+  const isFailed  = jobInfo?.status === 'failed'
+
+  const countByType = issues.reduce((acc, i) => {
+    acc[i.issue_type] = (acc[i.issue_type] || 0) + 1; return acc
+  }, {})
+
+  const filteredIssues = filterType === 'all'
+    ? issues
+    : issues.filter(i => i.issue_type === filterType)
+
+  const issuesByBlock = useMemo(() => {
+    const map = new Map()
+    issues.forEach(issue => {
+      (issue.block_indices || []).forEach(bi => {
+        const key = Number(bi)
+        if (!map.has(key)) map.set(key, [])
+        map.get(key).push(issue)
+      })
+    })
+    return map
+  }, [issues])
+
+  const issuePageMap = useMemo(() => {
+    const pages = Object.keys(pdfTextIndex).map(Number).sort((a, b) => a - b)
+    if (!pages.length) return {}
+    const map = {}
+    const normalizedPages = Object.fromEntries(
+      pages.map(page => [page, normalizeText(pdfTextIndex[page] || '')])
+    )
+    issues.forEach(issue => {
+      for (const candidate of issueLocateCandidates(issue)) {
+        const normalized = normalizeText(candidate)
+        if (normalized.length < 4) continue
+        for (const page of pages) {
+          if (normalizedPages[page].includes(normalized)) {
+            map[issue.id] = page
+            return
+          }
+        }
+        for (let len = Math.min(normalized.length, 30); len >= 10; len -= 5) {
+          const prefix = normalized.slice(0, len)
+          for (const page of pages) {
+            if (normalizedPages[page].includes(prefix)) {
+              map[issue.id] = page
+              return
+            }
+          }
         }
       }
-    }, 1500)
-  }
+    })
+    return map
+  }, [issues, pdfTextIndex])
 
-  const sendFeedback = async (issue, action, text = '') => {
-    try {
-      const r = await fetch('/api/v9/feedback', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ issue_id: issue.id, action, text })
-      })
-      if (!r.ok) { message.error('反馈失败'); return }
-      if (action === 'reject') {
-        message.success('已驳回，记入数据飞轮（人工层）')
-        setIssues(prev => prev.map(x => x.id === issue.id ? { ...x, _resolved: 'rejected' } : x))
-      } else {
-        message.loading({ content: '已提交，主智能体改写中...', key: `fb${issue.id}` })
-        setIssues(prev => prev.map(x => x.id === issue.id ? { ...x, _resolved: 'processing' } : x))
-        pollFeedback(issue.id)
-      }
-      setCustomFor(null); setCustomText('')
-    } catch (err) { message.error('反馈出错: ' + err.message) }
-  }
+  const visiblePdfIssues = useMemo(() => {
+    const hasIndex = Object.keys(pdfTextIndex).length > 0
+    if (!hasIndex) return issues
+    return issues.filter(issue => issuePageMap[issue.id] === pdfPage)
+  }, [issues, issuePageMap, pdfPage, pdfTextIndex])
 
-  // ---------- 数据飞轮 ----------
-  const openFlywheel = async () => {
-    setFwOpen(true)
-    setFwLoading(true)
-    try {
-      const r = await fetch('/api/v9/flywheel?limit=300')
-      if (r.ok) setFwData(await r.json())
-    } catch (err) { message.error('加载飞轮失败: ' + err.message) }
-    finally { setFwLoading(false) }
-  }
-  const deleteFlywheel = async (id) => {
-    try {
-      const r = await fetch(`/api/v9/flywheel/${id}`, { method: 'DELETE' })
-      if (r.ok) {
-        message.success('已删除')
-        setFwData(d => ({ ...d, items: d.items.filter(x => x.id !== id) }))
-      } else message.error('删除失败')
-    } catch (err) { message.error('删除出错: ' + err.message) }
-  }
-
-  // ---------- 定位 ----------
-  const locateIssue = (issue) => {
-    setSelectedId(issue.id)
-    const bi = (issue.block_indices || [])[0]
-    if (bi != null && blockRefs.current[bi]) {
-      blockRefs.current[bi].scrollIntoView({ behavior: 'smooth', block: 'center' })
-    }
-  }
-
-  // 当前选中问题对应的高亮 block 集合 + 原文片段
-  const selected = issues.find(x => x.id === selectedId)
-  const hlBlocks = new Set(selected?.block_indices || [])
-  const hlText = selected?.original_text || ''
-
-  const renderParagraph = (b) => {
-    const isHl = hlBlocks.has(b.block_index)
-    let content = b.text || ' '
-    if (isHl && hlText && b.text?.includes(hlText)) {
-      const i = b.text.indexOf(hlText)
-      content = (<>
-        {b.text.slice(0, i)}
-        <mark className="hl-text">{hlText}</mark>
-        {b.text.slice(i + hlText.length)}
-      </>)
-    }
-    return (
-      <p
-        key={b.block_index}
-        ref={el => (blockRefs.current[b.block_index] = el)}
-        className={`doc-para ${isHl ? 'doc-para-hl' : ''} ${b.is_heading ? 'doc-heading' : ''}`}
-      >
-        {content}
-      </p>
-    )
-  }
-
-  const renderTable = (b) => (
-    <table key={b.block_index} ref={el => (blockRefs.current[b.block_index] = el)}
-      className={`doc-table ${hlBlocks.has(b.block_index) ? 'doc-para-hl' : ''}`}>
-      <tbody>
-        {(b.rows || []).map((row, ri) => (
-          <tr key={ri}>{row.map((c, ci) => <td key={ci}>{c}</td>)}</tr>
-        ))}
-      </tbody>
-    </table>
+  const pdfTextRenderer = useMemo(
+    () => makePdfTextRenderer(visiblePdfIssues, selectedId),
+    [visiblePdfIssues, selectedId]
   )
 
-  const activeIssues = issues.filter(x => !x._resolved)
-  const isRunning = ['pending', 'parsing', 'reviewing'].includes(job.status)
+  useEffect(() => {
+    if (!selectedId) return
+    const mappedPage = issuePageMap[selectedId]
+    if (previewMode === 'pdf' && mappedPage && mappedPage !== pdfPage) {
+      setPdfPage(mappedPage)
+      return
+    }
+    const timer = setTimeout(() => {
+      const selector = previewMode === 'pdf'
+        ? `.rv-pdf-mark[data-issue-id="${selectedId}"]`
+        : `.rv-doc-mark[data-issue-id="${selectedId}"], .rv-doc-block[data-issue-ids~="${selectedId}"]`
+      const target = document.querySelector(selector)
+      target?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    }, 120)
+    return () => clearTimeout(timer)
+  }, [selectedId, previewMode, documentBlocks, issues, pdfPage, issuePageMap])
 
+  useEffect(() => {
+    const handler = (event) => {
+      const mark = event.target.closest?.('.rv-pdf-mark[data-issue-id]')
+      if (mark?.dataset?.issueId) setSelectedId(Number(mark.dataset.issueId))
+    }
+    document.addEventListener('click', handler)
+    return () => document.removeEventListener('click', handler)
+  }, [])
+
+  const st = JOB_STATUS[jobInfo?.status] || { label: jobInfo?.status || '', color: '#666' }
+
+  // ── render ────────────────────────────────────────────────────
   return (
-    <div className="v9-review">
-      {/* ===== 顶部：上传 + 主智能体状态 ===== */}
-      <div className="v9-topbar">
-        <div className="v9-topbar-left">
-          <Upload accept=".docx,.doc" beforeUpload={handleUpload} showUploadList={false}
-            disabled={uploading || isRunning}>
-            <Button type="primary" icon={<UploadOutlined />} loading={uploading} disabled={isRunning}>
-              上传待审 Word
-            </Button>
-          </Upload>
-          <Segmented
-            value={mineType}
-            onChange={setMineType}
-            disabled={isRunning}
-            options={[
-              { label: '非突出矿井', value: 'non_outburst' },
-              { label: '突出矿井', value: 'outburst' }
-            ]}
-          />
-          {docName && <span className="v9-docname"><FileWordOutlined /> {docName}</span>}
-        </div>
-        <div className="v9-topbar-right">
-          <Button icon={<DatabaseOutlined />} onClick={openFlywheel}>
-            数据飞轮
-          </Button>
-          <Button icon={<DownloadOutlined />} disabled={!jobId}
-            onClick={() => window.open(`/api/v9/download/${jobId}`, '_blank')}>
-            下载改写后文档
-          </Button>
-        </div>
-      </div>
+    <div className="rv-root">
+      {/* ── 顶栏 ── */}
+      <div className="rv-topbar">
+        <span className="rv-title">规程合规审查</span>
 
-      {/* 主智能体状态条 */}
-      <div className="v9-agentbar">
-        <div className="v9-agent-head">
-          <RobotOutlined className="v9-agent-icon" />
-          <span className="v9-agent-label">主智能体</span>
-          {isRunning && <Spin size="small" />}
-          <span className={`v9-agent-state-tag ${isRunning ? 'running' : job.status === 'failed' ? 'failed' : ''}`}>
-            {job.status === 'idle' ? '待命' : isRunning ? '工作中' : job.status === 'done' ? '已完成' : job.status === 'failed' ? '失败' : job.status}
-          </span>
-          {job.n_chunks > 0 && (
-            <span className="v9-agent-count">已审 {job.n_done}/{job.n_chunks} 块</span>
-          )}
-          <span className="v9-agent-issues">发现 {issues.length} 处问题</span>
-          <span className="v9-agent-progress">{job.progress || 0}%</span>
-        </div>
-        <div className="v9-agent-statusline">
-          {job.agent_status || (job.status === 'idle' ? '等待上传文档…审查将自动开始，问题会实时出现在左侧。' : job.status)}
-        </div>
-        <Progress percent={job.progress || 0} size="small" showInfo={false}
-          status={job.status === 'failed' ? 'exception' : isRunning ? 'active' : 'normal'} />
-      </div>
+        {/* 无任务时：矿井类型选择 */}
+        {!jobId && (
+          <Radio.Group value={mineType} onChange={e => setMineType(e.target.value)} size="small">
+            <Radio.Button value="non_outburst">非突出矿井</Radio.Button>
+            <Radio.Button value="outburst">突出矿井</Radio.Button>
+          </Radio.Group>
+        )}
 
-      {/* 数据飞轮抽屉 */}
-      <Drawer title={<span><DatabaseOutlined /> 数据飞轮（人工/主智能体裁决沉淀）</span>}
-        open={fwOpen} onClose={() => setFwOpen(false)} width={920}>
-        <Space style={{ marginBottom: 12 }} wrap>
-          <Tag color="red">人工 {fwData.counts?.human || 0}</Tag>
-          <Tag color="blue">主智能体 {fwData.counts?.agent || 0}</Tag>
-          <Button size="small" icon={<ReloadOutlined />} onClick={openFlywheel}>刷新</Button>
-          <span style={{ color: '#999', fontSize: 12 }}>人工裁决为最高层，用于扩充评估集 / 后续动态判例参考</span>
-        </Space>
-        <Table
-          rowKey="id" size="small" loading={fwLoading} dataSource={fwData.items}
-          pagination={{ pageSize: 12 }}
-          columns={[
-            { title: '来源', dataIndex: 'source', width: 80,
-              render: s => <Tag color={s === 'human' ? 'red' : 'blue'}>{s === 'human' ? '人工' : '主智能体'}</Tag> },
-            { title: '裁决', dataIndex: 'final_verdict', width: 110,
-              render: (v, r) => <span><span style={{ color: '#999' }}>{r.model_verdict || '?'}→</span><b>{v}</b></span> },
-            { title: '文档/块', width: 140, render: (_, r) => <span style={{ fontSize: 12 }}>{(r.doc_name || '').slice(0, 12)}<br />ck{r.chunk_index}</span> },
-            { title: '原文', dataIndex: 'pending_content', ellipsis: true,
-              render: t => <Tooltip title={t}><span style={{ fontSize: 12 }}>{(t || '').slice(0, 40)}</span></Tooltip> },
-            { title: '理由', dataIndex: 'reason', ellipsis: true,
-              render: t => <Tooltip title={t}><span style={{ fontSize: 12, color: '#666' }}>{(t || '').slice(0, 40)}</span></Tooltip> },
-            { title: '操作', width: 70, render: (_, r) => (
-              <Popconfirm title="删除这条飞轮记录？" onConfirm={() => deleteFlywheel(r.id)} okText="删除" cancelText="保留">
-                <Button size="small" danger type="text" icon={<DeleteOutlined />} />
-              </Popconfirm>
-            ) }
-          ]}
-        />
-      </Drawer>
-
-      {/* ===== 主体：左问题 + 中文档 ===== */}
-      <div className="v9-body">
-        {/* 左侧：实时问题 */}
-        <div className="v9-issues">
-          <div className="v9-issues-head">
-            <span>发现问题</span>
-            <Badge count={activeIssues.length} showZero color="#cf1322" />
-            <Tooltip title="点击问题可在右侧文档定位">
-              <AimOutlined style={{ color: '#999', marginLeft: 'auto' }} />
-            </Tooltip>
-          </div>
-          <div className="v9-issues-list">
-            {issues.length === 0 && (
-              <Empty description={isRunning ? '审查中，问题将实时出现…' : '暂无问题'}
-                image={Empty.PRESENTED_IMAGE_SIMPLE} style={{ marginTop: 40 }} />
+        {/* 有任务时：状态 + 进度 */}
+        {jobId && (
+          <>
+            <Tag color={st.color} style={{ fontWeight: 600 }}>{st.label}</Tag>
+            {jobInfo?.agent_status && (
+              <span style={{ fontSize: 12, color: 'rgba(255,255,255,.7)', maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {jobInfo.agent_status}
+              </span>
             )}
-            {issues.map(issue => {
-              const meta = TYPE_META[issue.issue_type] || { color: 'default', label: issue.issue_type }
+            {isRunning && jobInfo?.n_chunks > 0 && (
+              <span className="rv-stats">
+                {jobInfo.n_done}/{jobInfo.n_chunks} 段
+              </span>
+            )}
+          </>
+        )}
+
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
+          {isDone && (
+            <Button icon={<DownloadOutlined />} onClick={handleDownload}
+              style={{ background: 'rgba(46,160,67,.85)', borderColor: 'rgba(46,160,67,.6)', color: '#fff', fontWeight: 600 }}>
+              下载审查后文档
+            </Button>
+          )}
+          {jobId && (
+            <Button icon={<DeleteOutlined />} onClick={clearResults}
+              style={{ background: 'rgba(255,255,255,.15)', borderColor: 'rgba(255,255,255,.35)', color: '#fff' }}>
+              清除
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {/* 进度条（审查中）*/}
+      {isRunning && jobInfo?.n_chunks > 0 && (
+        <div style={{ padding: '0 0 2px 0', background: '#1a1a2e' }}>
+          <Progress
+            percent={Math.round((jobInfo.n_done / jobInfo.n_chunks) * 100)}
+            status="active"
+            strokeColor={{ '0%': '#2f54eb', '100%': '#52c41a' }}
+            showInfo={false}
+            style={{ margin: 0 }}
+          />
+        </div>
+      )}
+
+      <div className="rv-body">
+        {/* ── 左栏：问题列表 ── */}
+        <div className="rv-left">
+          <div className="rv-tab-bar">
+            {/* 全部 tab */}
+            <button
+              className={`rv-tab-btn ${filterType === 'all' ? 'active' : ''}`}
+              onClick={() => setFilterType('all')}
+            >
+              全部
+              {issues.length > 0 && <span className="rv-filter-count">{issues.length}</span>}
+              {isRunning && issues.length === 0 && (
+                <LoadingOutlined style={{ marginLeft: 4, fontSize: 11, color: '#2f54eb' }} />
+              )}
+            </button>
+            {/* 按类型 tabs */}
+            {TYPE_ORDER.filter(t => countByType[t]).map(t => {
+              const cfg = typeCfg(t)
               return (
-                <div key={issue.id}
-                  className={`v9-issue ${selectedId === issue.id ? 'v9-issue-sel' : ''} ${issue._resolved ? 'v9-issue-done' : ''}`}
-                  onClick={() => locateIssue(issue)}>
-                  <div className="v9-issue-top">
-                    <Tag color={meta.color}>{meta.label}</Tag>
-                    {issue.status && (
-                      <span className="v9-issue-status" style={{ color: STATUS_COLOR[issue.status] || '#555' }}>
-                        {issue.status}
-                      </span>
-                    )}
-                    {issue.escalation_type && <Tag>{issue.escalation_type}</Tag>}
-                    {issue._resolved && (
-                      <Tag color={issue._resolved === 'applied' ? 'green'
-                        : issue._resolved === 'rejected' ? 'default'
-                          : issue._resolved === 'processing' ? 'processing' : 'red'}>
-                        {{ applied: '已改写', rejected: '已驳回', processing: '改写中',
-                          noop: '未改', failed: '改写失败' }[issue._resolved]}
-                      </Tag>
-                    )}
+                <button
+                  key={t}
+                  className={`rv-tab-btn ${filterType === t ? 'active' : ''}`}
+                  style={filterType === t ? { color: cfg.color, borderBottomColor: cfg.color } : {}}
+                  onClick={() => setFilterType(t)}
+                >
+                  {cfg.label}
+                  <span className="rv-filter-count">{countByType[t]}</span>
+                </button>
+              )
+            })}
+          </div>
+
+          <div className="rv-issue-list">
+            {isRunning && filteredIssues.length === 0 && (
+              <div style={{ padding: '16px 0', textAlign: 'center' }}>
+                <Spin size="small" />
+                <span style={{ marginLeft: 8, fontSize: '.82em', color: '#aaa' }}>审查中…</span>
+              </div>
+            )}
+            {!isRunning && !jobId && (
+              <Empty description="上传文档后开始审查" style={{ marginTop: 48 }} />
+            )}
+            {!isRunning && jobId && filteredIssues.length === 0 && (
+              <Empty description="暂无问题" style={{ marginTop: 48 }} />
+            )}
+
+            {filteredIssues.map(issue => {
+              const cfg = typeCfg(issue.issue_type)
+              const isSelected = issue.id === selectedId
+              return (
+                <div
+                  key={issue.id}
+                  className={`rv-issue-item ${isSelected ? 'selected' : ''}`}
+                  style={{ borderLeft: `4px solid ${cfg.color}` }}
+                  onClick={() => { setSelectedId(issue.id); setCustomText('') }}
+                >
+                  <div className="rv-issue-item-header">
+                    <span className="rv-dec-dot">
+                      {issue.human_action === 'accept' && <CheckCircleFilled style={{ color: '#52c41a', fontSize: 14 }} />}
+                      {issue.human_action === 'reject' && <CloseCircleFilled style={{ color: '#f44336', fontSize: 14 }} />}
+                      {issue.human_action === 'custom' && <CheckCircleFilled style={{ color: '#1890ff', fontSize: 14 }} />}
+                      {issue.human_action === 'pending' && <span className="rv-dec-empty" />}
+                    </span>
+                    <span className="rv-badge" style={{ background: cfg.color }}>{cfg.label}</span>
+                    <span className="rv-issue-type">{issue.title || issue.status}</span>
+                    <span className="rv-issue-no">#{issue.id}</span>
                   </div>
-
                   {issue.original_text && (
-                    <div className="v9-issue-orig" title={issue.original_text}>
-                      原文：{issue.original_text}
+                    <div className="rv-issue-orig">
+                      「{issue.original_text.slice(0, 40)}{issue.original_text.length > 40 ? '…' : ''}」
                     </div>
-                  )}
-                  {issue.suggestion && (
-                    <div className="v9-issue-sug">建议：{issue.suggestion}</div>
-                  )}
-                  {issue.reason && <div className="v9-issue-reason">{issue.reason}</div>}
-                  {issue.regulation && <div className="v9-issue-reg">依据：{issue.regulation}</div>}
-                  {(issue.detail?.numeric?.length > 0) && (
-                    <div className="v9-issue-numeric">
-                      {issue.detail.numeric.map((n, i) => (
-                        <div key={i}>🧮 [{n.verdict}] {n.explanation}</div>
-                      ))}
-                    </div>
-                  )}
-
-                  {!issue._resolved && (
-                    <div className="v9-issue-actions" onClick={e => e.stopPropagation()}>
-                      <Button size="small" type="primary" icon={<CheckOutlined />}
-                        onClick={() => sendFeedback(issue, 'accept')}>接受</Button>
-                      <Button size="small" icon={<CloseOutlined />}
-                        onClick={() => sendFeedback(issue, 'reject')}>驳回</Button>
-                      <Button size="small" icon={<EditOutlined />}
-                        onClick={() => { setCustomFor(issue.id); setCustomText('') }}>改写</Button>
-                    </div>
-                  )}
-                  {customFor === issue.id && (
-                    <div className="v9-issue-custom" onClick={e => e.stopPropagation()}>
-                      <TextArea rows={2} value={customText} placeholder="写下你的修改意见，主智能体将据此改写原文…"
-                        onChange={e => setCustomText(e.target.value)} />
-                      <Space style={{ marginTop: 6 }}>
-                        <Button size="small" type="primary" disabled={!customText.trim()}
-                          onClick={() => sendFeedback(issue, 'custom', customText)}>提交给主智能体</Button>
-                        <Button size="small" onClick={() => setCustomFor(null)}>取消</Button>
-                      </Space>
-                    </div>
-                  )}
-                  {issue.agent_note && issue._resolved && (
-                    <div className="v9-issue-agentnote">🤖 {issue.agent_note}</div>
                   )}
                 </div>
               )
@@ -393,25 +758,309 @@ const Review = () => {
           </div>
         </div>
 
-        {/* 中间：Word 文档 */}
-        <div className="v9-doc" ref={docRef}>
-          <div className="v9-doc-head">
-            <FileWordOutlined /> {docName || '文档预览'}
-            {jobId && <Button size="small" type="text" icon={<ReloadOutlined />}
-              onClick={() => fetchDocument(jobId)}>刷新</Button>}
-          </div>
-          <div className="v9-doc-paper">
-            {blocks.length === 0 ? (
-              <Empty description={isRunning ? '正在解析文档…' : '上传 Word 文档后在此显示'}
-                style={{ marginTop: 80 }} />
-            ) : (
-              blocks.map(b => b.kind === 'table' ? renderTable(b) : renderParagraph(b))
-            )}
-          </div>
+        {/* ── 中栏：上传区 / 进度面板 ── */}
+        <div className="rv-doc-viewer">
+          {!jobId ? (
+            /* 上传区 */
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', gap: 20, padding: '0 40px' }}>
+              <div
+                style={{
+                  width: '100%', maxWidth: 480, height: 200,
+                  border: `2px dashed ${dragging ? '#2f54eb' : '#adb5bd'}`,
+                  borderRadius: 12,
+                  display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+                  cursor: 'pointer', transition: 'all .2s',
+                  background: dragging ? '#e8eeff' : 'var(--bg-primary, #fff)',
+                  gap: 8,
+                }}
+                onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                {uploading
+                  ? <Spin indicator={<LoadingOutlined style={{ fontSize: 36 }} spin />} />
+                  : <>
+                    <CloudUploadOutlined style={{ fontSize: 40, color: '#2f54eb' }} />
+                    <div style={{ fontSize: 15, fontWeight: 500, color: '#444' }}>拖拽 Word 文档到此，或点击上传</div>
+                    <div style={{ fontSize: 12, color: '#aaa' }}>.docx / .doc</div>
+                  </>
+                }
+              </div>
+              <input ref={fileInputRef} type="file" accept=".docx,.doc" hidden onChange={onInputChange} />
+              <Radio.Group value={mineType} onChange={e => setMineType(e.target.value)}>
+                <Radio value="non_outburst">非突出矿井</Radio>
+                <Radio value="outburst">突出矿井</Radio>
+              </Radio.Group>
+            </div>
+          ) : (
+            <div className="rv-pdf-panel">
+              <div className="rv-pdf-toolbar">
+                <FileTextOutlined style={{ color: '#2f54eb' }} />
+                <span className="rv-pdf-doc-name">{docName}</span>
+                <Tag color={st.color}>{st.label}</Tag>
+                <Radio.Group
+                  size="small"
+                  value={previewMode}
+                  onChange={e => setPreviewMode(e.target.value)}
+                  className="rv-preview-switch"
+                >
+                  <Radio.Button value="pdf">PDF 高亮</Radio.Button>
+                  <Radio.Button value="annotated">文本视图</Radio.Button>
+                </Radio.Group>
+                {(isRunning || isDone) && (
+                  <span className="rv-pdf-progress-text">
+                    {isDone ? `共发现 ${issues.length} 个问题` : `已审 ${jobInfo?.n_done ?? 0} / ${jobInfo?.n_chunks ?? 0} 段`}
+                  </span>
+                )}
+              </div>
+              {(isRunning || isDone) && (
+                <Progress
+                  percent={isDone ? 100 : (jobInfo?.n_chunks > 0 ? Math.round((jobInfo.n_done / jobInfo.n_chunks) * 100) : 0)}
+                  status={isFailed ? 'exception' : isDone ? 'success' : 'active'}
+                  strokeColor={{ '0%': '#2f54eb', '100%': '#52c41a' }}
+                  showInfo={false}
+                  size="small"
+                />
+              )}
+              {isFailed && (
+                <div className="rv-pdf-error">审查失败：{jobInfo?.error || '未知错误'}</div>
+              )}
+              {jobInfo?.agent_status && (
+                <div className="rv-pdf-status">{jobInfo.agent_status}</div>
+              )}
+              <div className="rv-pdf-frame-wrap">
+                {previewMode === 'annotated' ? (
+                  <AnnotatedDocument
+                    blocks={documentBlocks}
+                    loading={documentLoading}
+                    issuesByBlock={issuesByBlock}
+                    onSelectIssue={setSelectedId}
+                  />
+                ) : (
+                  <>
+                    {pdfLoading && !pdfError && (
+                      <div className="rv-pdf-loading">
+                        <Spin />
+                        <span>正在加载 PDF 预览...</span>
+                      </div>
+                    )}
+                    {pdfError && (
+                      <div className="rv-pdf-loading">
+                        <span>{pdfError}</span>
+                        <Button size="small" onClick={() => refreshPdfPreview(true)}>重试预览</Button>
+                      </div>
+                    )}
+                    {!pdfUrl && !pdfError && (
+                      <div className="rv-pdf-loading">
+                        <Spin />
+                        <span>正在准备 PDF 预览...</span>
+                      </div>
+                    )}
+                    {pdfBlobUrl && !pdfError && (
+                      <div className="rv-pdf-doc-scroll">
+                        <div className="rv-pdf-page-controls">
+                          <Button size="small" disabled={pdfPage <= 1} onClick={() => setPdfPage(p => Math.max(1, p - 1))}>上一页</Button>
+                          <span>{pdfPage} / {pdfNumPages || '-'}</span>
+                          <Button size="small" disabled={!pdfNumPages || pdfPage >= pdfNumPages} onClick={() => setPdfPage(p => Math.min(pdfNumPages, p + 1))}>下一页</Button>
+                          <Button size="small" onClick={() => setPdfScale(s => Math.max(0.9, +(s - 0.1).toFixed(2)))}>-</Button>
+                          <span>{Math.round(pdfScale * 100)}%</span>
+                          <Button size="small" onClick={() => setPdfScale(s => Math.min(2.4, +(s + 0.1).toFixed(2)))}>+</Button>
+                        </div>
+                        <PdfDocument
+                          key={pdfBlobUrl}
+                          file={pdfBlobUrl}
+                          loading={null}
+                          onLoadSuccess={handlePdfLoadSuccess}
+                          onLoadError={(err) => { setPdfLoading(false); setPdfError(`PDF 预览加载失败：${err?.message || '未知错误'}`) }}
+                        >
+                          <Page
+                            className="rv-pdf-page"
+                            pageNumber={pdfPage}
+                            scale={pdfScale}
+                            renderAnnotationLayer={false}
+                            renderTextLayer={true}
+                            customTextRenderer={pdfTextRenderer}
+                          />
+                        </PdfDocument>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* ── 右栏：问题详情 + 反馈 ── */}
+        <div className="rv-right">
+          {selectedIssue ? (
+            <IssueDetail
+              issue={selectedIssue}
+              feedbackState={feedbackMap[selectedIssue.id] || {}}
+              customText={customText}
+              onCustomTextChange={setCustomText}
+              onFeedback={submitFeedback}
+            />
+          ) : (
+            <div className="rv-center" style={{ height: '100%', flexDirection: 'column', gap: 12 }}>
+              <Empty description={jobId ? '点击左侧问题查看详情' : '上传文档开始审查'} />
+            </div>
+          )}
         </div>
       </div>
     </div>
   )
 }
 
-export default Review
+// ── 问题详情面板 ──────────────────────────────────────────────────
+function IssueDetail({ issue, feedbackState, customText, onCustomTextChange, onFeedback }) {
+  const cfg = typeCfg(issue.issue_type)
+  const alreadyFed = issue.human_action !== 'pending'
+  const { loading } = feedbackState
+
+  return (
+    <div className="rv-detail">
+      {/* 标题行 */}
+      <div className="rv-detail-header" style={{ borderBottom: `3px solid ${cfg.color}` }}>
+        <span className="rv-badge" style={{ background: cfg.color }}>{cfg.label}</span>
+        <span className="rv-detail-type">{issue.status}</span>
+        <span className="rv-issue-no">#{issue.id}</span>
+      </div>
+
+      {issue.title && (
+        <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 12, lineHeight: 1.5, color: 'var(--text-primary, #1a1a2e)' }}>
+          {issue.title}
+        </div>
+      )}
+
+      {/* 原文片段 */}
+      {issue.original_text && (
+        <div className="rv-detail-block">
+          <div className="rv-detail-label">原文片段</div>
+          <div className="rv-detail-orig" style={{ borderLeft: '3px solid #ffc107', background: '#fff8e1', padding: '8px 12px', borderRadius: 4 }}>
+            {issue.original_text}
+          </div>
+        </div>
+      )}
+
+      {/* 修改建议 */}
+      {issue.suggestion && (
+        <div className="rv-detail-block">
+          <div className="rv-detail-label">修改建议</div>
+          <div style={{ background: '#e8f5e9', borderLeft: '3px solid #4caf50', padding: '8px 12px', borderRadius: 4, fontSize: 13, color: '#1b5e20', lineHeight: 1.7 }}>
+            {issue.suggestion}
+          </div>
+        </div>
+      )}
+
+      {/* 法规依据 */}
+      {issue.regulation && (
+        <div className="rv-detail-block">
+          <div className="rv-detail-label">法规依据</div>
+          <div style={{ background: '#e3f2fd', padding: '6px 10px', borderRadius: 4, fontSize: 13, color: '#1565c0' }}>
+            {issue.regulation}
+          </div>
+        </div>
+      )}
+
+      {/* 分析说明 */}
+      {issue.reason && (
+        <div className="rv-detail-block">
+          <div className="rv-detail-label">分析说明</div>
+          <div className="rv-detail-text" style={{ fontSize: 13, lineHeight: 1.7, color: '#555' }}>{issue.reason}</div>
+        </div>
+      )}
+
+      {/* 数值核验明细 */}
+      {issue.issue_type === 'numeric' && issue.detail && Object.keys(issue.detail).length > 0 && (
+        <div className="rv-detail-block">
+          <div className="rv-detail-label">数值核验</div>
+          <pre style={{ fontSize: 11, background: '#1a1a2e', color: '#a8d8b9', padding: '8px 12px', borderRadius: 6, overflow: 'auto', fontFamily: 'Cascadia Code, Consolas, monospace' }}>
+            {JSON.stringify(issue.detail, null, 2)}
+          </pre>
+        </div>
+      )}
+
+      {/* worker 改写状态 */}
+      {issue.agent_applied === 1 && (
+        <div style={{ background: '#f6ffed', border: '1px solid #b7eb8f', borderRadius: 6, padding: '8px 12px', fontSize: 13, color: '#389e0d', marginBottom: 8 }}>
+          ✓ 主智能体已改写文档{issue.agent_note ? `：${issue.agent_note}` : ''}
+        </div>
+      )}
+      {issue.agent_applied === -1 && (
+        <div style={{ background: '#fff2f0', border: '1px solid #ffa39e', borderRadius: 6, padding: '8px 12px', fontSize: 13, color: '#cf1322', marginBottom: 8 }}>
+          ✗ 改写失败{issue.agent_note ? `：${issue.agent_note}` : ''}
+        </div>
+      )}
+
+      {/* ── 人工裁决 ── */}
+      <div className="rv-detail-block rv-hitl-block">
+        <div className="rv-detail-label">人工裁决</div>
+
+        {alreadyFed ? (
+          <div>
+            <Tag color={ACTION_LABEL[issue.human_action]?.color || 'default'} style={{ fontSize: 13 }}>
+              {ACTION_LABEL[issue.human_action]?.text}
+            </Tag>
+            {issue.human_text && (
+              <div style={{ fontSize: 13, color: '#555', background: '#f5f5f5', padding: '6px 10px', borderRadius: 4, marginTop: 6 }}>
+                {issue.human_text}
+              </div>
+            )}
+          </div>
+        ) : (
+          <>
+            <div className="rv-hitl-btns">
+              <Tooltip title="确认问题属实，采纳系统建议（主智能体将改写文档）">
+                <Button
+                  icon={<CheckOutlined />}
+                  className="rv-hitl-accept"
+                  loading={loading}
+                  onClick={() => onFeedback(issue.id, 'accept')}
+                >采纳</Button>
+              </Tooltip>
+              <Tooltip title="驳回：系统误报，原文合规">
+                <Button
+                  icon={<CloseOutlined />}
+                  className="rv-hitl-reject"
+                  loading={loading}
+                  onClick={() => onFeedback(issue.id, 'reject')}
+                >驳回</Button>
+              </Tooltip>
+            </div>
+            <div style={{ marginTop: 10 }}>
+              <TextArea
+                placeholder="输入自定义修改意见（可选），然后点击「按此改写」…"
+                value={customText}
+                onChange={e => onCustomTextChange(e.target.value)}
+                rows={3}
+              />
+              <Button
+                icon={<EditOutlined />}
+                style={{ marginTop: 6 }}
+                disabled={!customText.trim()}
+                loading={loading}
+                onClick={() => onFeedback(issue.id, 'custom', customText)}
+              >按此意见改写</Button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

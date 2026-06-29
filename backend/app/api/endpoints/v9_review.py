@@ -56,6 +56,18 @@ async def status(job_id: str):
     return job
 
 
+@router.post("/cancel/{job_id}")
+async def cancel(job_id: str):
+    """取消审查任务。pending 任务直接退出队列；运行中任务由 worker 协作停止。"""
+    job = _queue.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "任务不存在")
+    if job["status"] in ("done", "failed", "cancelled"):
+        return {"ok": True, "job_id": job_id, "status": job["status"]}
+    ok = _queue.cancel_job(job_id)
+    return {"ok": ok, "job_id": job_id, "status": "cancelled"}
+
+
 @router.get("/document/{job_id}")
 async def document(job_id: str):
     """返回段落模型（中间面板渲染；主智能体改写后会刷新此文件）。"""
@@ -90,13 +102,16 @@ async def stream(job_id: str):
                 yield f"data: {json.dumps({'type': 'error', 'msg': '任务不存在'})}\n\n"
                 return
             sig = (job["status"], job["progress"], job.get("agent_status"))
-            if sig != last_sig:
+            status_changed = sig != last_sig
+            if status_changed:
                 last_sig = sig
                 payload = {"type": "status", "job": {
+                    "job_id": job["job_id"], "doc_name": job["doc_name"],
                     "status": job["status"], "progress": job["progress"],
                     "n_chunks": job["n_chunks"], "n_done": job["n_done"],
                     "agent_status": job.get("agent_status"),
                     "paragraphs_ready": bool(job.get("paragraphs_path")),
+                    "error": job.get("error"),
                 }}
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -105,11 +120,11 @@ async def stream(job_id: str):
                 last_issue_id = max(last_issue_id, it["id"])
                 yield f"data: {json.dumps({'type': 'issue', 'issue': it}, ensure_ascii=False)}\n\n"
 
-            if job["status"] in ("done", "failed") and not new_issues:
+            if job["status"] in ("done", "failed", "cancelled") and not new_issues:
                 yield f"data: {json.dumps({'type': 'end', 'status': job['status']}, ensure_ascii=False)}\n\n"
                 return
 
-            idle = idle + 1 if not new_issues and sig == last_sig else 0
+            idle = idle + 1 if not new_issues and not status_changed else 0
             await asyncio.sleep(1.0)
             if idle > 600:  # 10 分钟无变化，断开（前端可重连）
                 yield f"data: {json.dumps({'type': 'timeout'})}\n\n"
@@ -193,6 +208,85 @@ async def flywheel_delete(ann_id: int):
     if not ok:
         raise HTTPException(404, "记录不存在")
     return {"ok": True, "deleted": ann_id}
+
+
+@router.get("/preview-pdf/{job_id}")
+async def preview_pdf(job_id: str, refresh: int = 0):
+    """返回待审/工作副本的 PDF 预览，用于审查页面中栏展示。转换结果会落盘缓存。"""
+    job = _queue.get_job(job_id)
+    if not job:
+        raise HTTPException(404, "任务不存在")
+
+    work = _WORK_DIR / f"{job_id}_working.docx"
+    source = work if work.exists() else Path(job["docx_path"])
+    if not source.exists():
+        raise HTTPException(404, "文档不存在")
+
+    cache_pdf = _WORK_DIR / f"{job_id}_preview.pdf"
+    if (not refresh and cache_pdf.exists()
+            and cache_pdf.stat().st_size > 0
+            and cache_pdf.stat().st_mtime >= source.stat().st_mtime):
+        return FileResponse(
+            path=str(cache_pdf),
+            media_type="application/pdf",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    def _convert_to_cache() -> None:
+        import importlib.util
+        import tempfile
+        import pythoncom
+        import win32com.client
+
+        wm_spec = importlib.util.spec_from_file_location(
+            "word_modifier", settings.PROJECT_ROOT / "word_modifier.py"
+        )
+        wm = importlib.util.module_from_spec(wm_spec)
+        wm_spec.loader.exec_module(wm)
+
+        docx_path = source
+        if source.suffix.lower() == ".doc":
+            temp_docx = Path(tempfile.mktemp(suffix=".docx"))
+            pythoncom.CoInitialize()
+            word = None
+            doc = None
+            try:
+                word = win32com.client.Dispatch("Word.Application")
+                word.Visible = False
+                word.DisplayAlerts = 0
+                doc = word.Documents.Open(str(source.resolve()))
+                doc.SaveAs2(str(temp_docx.resolve()), FileFormat=16)
+                doc.Close(False)
+                doc = None
+            finally:
+                if doc is not None:
+                    try:
+                        doc.Close(False)
+                    except Exception:
+                        pass
+                if word is not None:
+                    try:
+                        word.Quit()
+                    except Exception:
+                        pass
+                pythoncom.CoUninitialize()
+            docx_path = temp_docx
+
+        pdf_bytes = wm.docx_to_pdf_bytes(docx_path)
+        tmp_pdf = cache_pdf.with_suffix(".tmp.pdf")
+        tmp_pdf.write_bytes(pdf_bytes)
+        tmp_pdf.replace(cache_pdf)
+
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, _convert_to_cache)
+    except Exception as exc:
+        raise HTTPException(500, f"文档 PDF 预览生成失败：{exc}")
+
+    return FileResponse(
+        path=str(cache_pdf),
+        media_type="application/pdf",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @router.get("/download/{job_id}")

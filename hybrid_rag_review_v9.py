@@ -1,4 +1,4 @@
-"""混合检索RAG审核系统 v9
+﻿"""混合检索RAG审核系统 v9
 - v8能力全部保留：三并行主链（合规链 ‖ 错别字链 ‖ 文档级重复性链）、
   二次核验、立场分类、断点续跑、HTML报告。
 - v9改进：
@@ -60,6 +60,7 @@ QWEN_MODEL = "qwen-plus"
 BGE_M3_DIR = PROJECT_ROOT / "models" / "bge-m3"
 BGE_RERANKER_DIR = PROJECT_ROOT / "models" / "bge-reranker-v2-m3"
 KB_CACHE_DIR = PROJECT_ROOT / "data" / "bge_kb_cache"
+PENDING_CACHE_DIR = PROJECT_ROOT / "data" / "bge_pending_cache"
 
 TOP_K = 5                        # 重排后进入审查的法规条数
 RERANK_POOL_PER_CHANNEL = 10     # 整块query：dense/sparse/RRF 各路召回数（取并集重排）
@@ -274,11 +275,9 @@ class LocalBGERetriever:
             return
         if not self.embedding_dir.is_dir():
             raise FileNotFoundError(f"BGE-M3 模型目录不存在: {self.embedding_dir}")
-        if not self.reranker_dir.is_dir():
-            raise FileNotFoundError(f"BGE reranker 模型目录不存在: {self.reranker_dir}")
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-        from FlagEmbedding import BGEM3FlagModel, FlagReranker
+        from FlagEmbedding import BGEM3FlagModel
         import torch
         device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
         use_fp16 = device.startswith("cuda")
@@ -287,16 +286,15 @@ class LocalBGERetriever:
             str(self.embedding_dir.resolve()),
             normalize_embeddings=True,
             use_fp16=use_fp16,
-            devices=device,
-            batch_size=self.batch_size,
-            passage_max_length=self.max_length,
-            query_max_length=self.max_length,
-            return_dense=True,
-            return_sparse=True,
-            return_colbert_vecs=False,
+            device=device,
         )
-        print(f"加载本地reranker: {self.reranker_dir}")
-        self._reranker = FlagReranker(str(self.reranker_dir.resolve()), use_fp16=use_fp16)
+        if self.reranker_dir.is_dir():
+            from FlagEmbedding import FlagReranker
+            print(f"加载本地reranker: {self.reranker_dir}")
+            self._reranker = FlagReranker(str(self.reranker_dir.resolve()), use_fp16=use_fp16)
+        else:
+            print(f"[警告] reranker 目录不存在，跳过重排（使用 RRF 分数）: {self.reranker_dir}")
+            self._reranker = None
 
     def encode(self, texts: List[str]) -> Tuple[np.ndarray, List[Dict[str, float]]]:
         self._ensure_models()
@@ -312,18 +310,21 @@ class LocalBGERetriever:
         lexical = encoded["lexical_weights"]
         return dense, lexical
 
-    def encode_corpus_cached(self, texts: List[str], cache_key: str) -> Tuple[np.ndarray, List[Dict[str, float]]]:
-        KB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        dense_path = KB_CACHE_DIR / f"{cache_key}_dense.npy"
-        lex_path = KB_CACHE_DIR / f"{cache_key}_lex.pkl"
+    def encode_corpus_cached(self, texts: List[str], cache_key: str,
+                             cache_dir: Path = KB_CACHE_DIR,
+                             cache_label: str = "KB") -> Tuple[np.ndarray, List[Dict[str, float]]]:
+        """按内容哈希缓存 dense+sparse 编码，可用于知识库与待审文档。"""
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        dense_path = cache_dir / f"{cache_key}_dense.npy"
+        lex_path = cache_dir / f"{cache_key}_lex.pkl"
         if dense_path.exists() and lex_path.exists():
             dense = np.load(dense_path)
             with lex_path.open("rb") as handle:
                 lexical = pickle.load(handle)
             if dense.shape[0] == len(texts) and len(lexical) == len(texts):
-                print(f"  命中KB编码缓存: {dense_path.name} ({dense.shape[0]}条)")
+                print(f"  命中{cache_label}编码缓存: {dense_path.name} ({dense.shape[0]}条)")
                 return dense, lexical
-        print(f"  编码知识库 {len(texts)} 条（首次较慢，结果将缓存）...")
+        print(f"  编码{cache_label} {len(texts)} 条（首次较慢，结果将缓存）...")
         dense, lexical = self.encode(texts)
         np.save(dense_path, dense)
         with lex_path.open("wb") as handle:
@@ -332,6 +333,9 @@ class LocalBGERetriever:
 
     def rerank_pairs(self, pairs: List[List[str]]) -> List[float]:
         self._ensure_models()
+        if self._reranker is None:
+            # 无 reranker：返回高于阈值的常量分，保持 RRF 召回顺序
+            return [0.5] * len(pairs)
         with self._rerank_lock:  # GPU重排串行，避免多线程争用
             scores = self._reranker.compute_score(
                 pairs, batch_size=self.batch_size,
@@ -511,9 +515,9 @@ class HybridRAGReviewerV9:
             if score >= RERANK_SCORE_THRESHOLD
         ]
 
-    def prepare_retrieval(self, chunks: List[Dict]) -> Tuple[List[List[Dict]], np.ndarray]:
-        """对整篇文档批量编码+多查询检索（GPU串行，无LLM调用）。
-        返回 (每chunk的kb_results, 待审chunk整块dense向量[供重复性检查复用])。"""
+    @staticmethod
+    def _pending_encoding_inputs(chunks: List[Dict]) -> Tuple[List[str], List[List[str]], List[str], List[Tuple[int, int]], str]:
+        """构建待审文档多查询编码输入，并生成与文件名无关的内容哈希。"""
         texts = [c["content"] for c in chunks]
         segments_per_chunk = [split_chunk_segments(t) for t in texts]
         flat: List[str] = list(texts)
@@ -522,9 +526,25 @@ class HybridRAGReviewerV9:
             start = len(flat)
             flat.extend(segments)
             seg_slices.append((start, len(flat)))
+        payload = json.dumps({"version": "pending-v1", "max_length": BGE_MAX_LENGTH, "texts": flat},
+                             ensure_ascii=False, separators=(",", ":"))
+        cache_key = f"pending_{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:20]}"
+        return texts, segments_per_chunk, flat, seg_slices, cache_key
+
+    def has_pending_encoding_cache(self, chunks: List[Dict]) -> bool:
+        """供 Worker 在状态栏中区分首次编码与缓存复用。"""
+        _texts, _segments, _flat, _slices, cache_key = self._pending_encoding_inputs(chunks)
+        return ((PENDING_CACHE_DIR / f"{cache_key}_dense.npy").exists()
+                and (PENDING_CACHE_DIR / f"{cache_key}_lex.pkl").exists())
+
+    def prepare_retrieval(self, chunks: List[Dict]) -> Tuple[List[List[Dict]], np.ndarray]:
+        """批量编码并多查询检索；相同内容再次上传时复用 dense+sparse 编码缓存。"""
+        texts, segments_per_chunk, flat, seg_slices, cache_key = self._pending_encoding_inputs(chunks)
         n_segments = len(flat) - len(texts)
-        print(f"  [Phase A] 批量编码 {len(texts)} 个chunk + {n_segments} 个检索片段...")
-        all_dense, all_lex = self.retriever.encode(flat)
+        print(f"  [Phase A] 准备 {len(texts)} 个chunk + {n_segments} 个检索片段...")
+        all_dense, all_lex = self.retriever.encode_corpus_cached(
+            flat, cache_key, cache_dir=PENDING_CACHE_DIR, cache_label="待审文档"
+        )
         q_dense = all_dense[:len(texts)]
 
         kb_results_all: List[List[Dict]] = []
@@ -538,6 +558,28 @@ class HybridRAGReviewerV9:
             if (i + 1) % 20 == 0:
                 print(f"    检索+重排 {i + 1}/{len(chunks)}")
         print(f"  [Phase A] 多查询检索完成，耗时 {time.time() - retrieve_start:.1f}s")
+        return kb_results_all, q_dense
+
+    def prepare_dense_retrieval(self, chunks: List[Dict]) -> Tuple[List[List[Dict]], np.ndarray]:
+        """Demo 快速检索：只做 chunk 级 dense top-k 召回，不做多片段检索和 reranker 重排。"""
+        texts = [c["content"] for c in chunks]
+        payload = json.dumps({"version": "pending-dense-demo-v1", "max_length": BGE_MAX_LENGTH, "texts": texts},
+                             ensure_ascii=False, separators=(",", ":"))
+        cache_key = f"pending_dense_{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:20]}"
+        q_dense, _ = self.retriever.encode_corpus_cached(
+            texts, cache_key, cache_dir=PENDING_CACHE_DIR, cache_label="待审文档"
+        )
+        kb_results_all: List[List[Dict]] = []
+        started = time.time()
+        for i, vec in enumerate(q_dense):
+            ranked = _dense_search(vec, self.kb_dense, TOP_K)
+            kb_results_all.append([
+                {"chunk": self.kb_chunks[idx], "score": round(float(score), 4)}
+                for idx, score in ranked
+            ])
+            if (i + 1) % 50 == 0:
+                print(f"    dense召回 {i + 1}/{len(chunks)}")
+        print(f"  [Phase A] dense快速召回完成，耗时 {time.time() - started:.1f}s")
         return kb_results_all, q_dense
 
     # ============ 构建知识库上下文 ============
@@ -2018,3 +2060,4 @@ def main(argv: Optional[List[str]] = None):
 
 if __name__ == "__main__":
     main()
+

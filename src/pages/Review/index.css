@@ -1,114 +1,583 @@
-.v9-review {
+/* ── 根容器 ── */
+.rv-root {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 64px);
+  height: 100%;
   background: #f0f2f5;
   overflow: hidden;
 }
 
-/* ===== 顶部栏 ===== */
-.v9-topbar {
+/* ── 顶栏 ── */
+.rv-topbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 12px 20px;
-  background: #fff;
-  border-bottom: 1px solid #eef0f3;
+  gap: 16px;
+  padding: 10px 20px;
+  background: #1a237e;
+  color: #fff;
+  flex-shrink: 0;
 }
-.v9-topbar-left { display: flex; align-items: center; gap: 12px; }
-.v9-docname { color: #555; font-size: 13px; }
+.rv-title { font-size: 1.1em; font-weight: 600; white-space: nowrap; }
+.rv-stats  { font-size: .88em; opacity: .9; white-space: nowrap; }
+.rv-topbar .ant-select-selector         { background: rgba(255,255,255,.15) !important; border-color: rgba(255,255,255,.35) !important; color: #fff !important; }
+.rv-topbar .ant-select-selection-placeholder { color: rgba(255,255,255,.65) !important; }
+.rv-topbar .ant-select-arrow,
+.rv-topbar .ant-select-clear            { color: rgba(255,255,255,.8) !important; }
+.rv-topbar .ant-select-selection-item   { color: #fff !important; background: rgba(255,255,255,.2) !important; border-color: rgba(255,255,255,.3) !important; }
 
-/* 主智能体状态条（加高，三行：头部信息 / 状态文本 / 进度条） */
-.v9-agentbar {
+/* ── 三栏主体 ── */
+.rv-body { display: flex; flex: 1; overflow: hidden; }
+
+/* ── 左栏 ── */
+.rv-left {
+  width: 280px; flex-shrink: 0;
+  background: #fff; border-right: 1px solid #e8e8e8;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.rv-left-header { display: flex; gap: 4px; padding: 10px 12px; border-bottom: 1px solid #f0f0f0; flex-wrap: wrap; }
+.rv-filter-btn  { padding: 3px 10px; border: 1px solid #d9d9d9; border-radius: 4px; background: #fff; cursor: pointer; font-size: .82em; color: #555; transition: all .15s; }
+.rv-filter-btn.active { background: #f5f5f5; font-weight: 600; }
+.rv-filter-count { margin-left: 4px; font-size: .78em; color: #888; }
+.rv-issue-list  { flex: 1; overflow-y: auto; padding: 8px; }
+.rv-issue-item  { padding: 10px 12px; margin-bottom: 8px; border-radius: 4px; background: #fafafa; border-left: 4px solid #ddd; cursor: pointer; transition: background .15s, box-shadow .15s; }
+.rv-issue-item:hover   { background: #f0f5ff; }
+.rv-issue-item.selected { background: #e8f0fe; box-shadow: 0 1px 4px rgba(0,0,0,.12); }
+.rv-issue-item-header { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+.rv-badge       { color: #fff; padding: 1px 7px; border-radius: 3px; font-size: .75em; font-weight: 600; white-space: nowrap; }
+.rv-issue-type  { font-size: .78em; color: #666; }
+.rv-issue-no    { margin-left: auto; font-size: .75em; color: #bbb; }
+.rv-issue-desc  { font-size: .84em; color: #333; line-height: 1.5; }
+.rv-issue-orig  { font-size: .78em; color: #888; margin-top: 4px; font-style: italic; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rv-issue-doc   { font-size: .74em; color: #1a237e; background: #e8eaf6; border-radius: 3px; padding: 1px 5px; margin: 2px 0 3px; display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── 中栏：进度面板 / 上传区 ── */
+.rv-doc-viewer {
+  flex: 1;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 14px 24px;
-  background: linear-gradient(90deg, #1f2a44, #2c3e50);
-  color: #e8eef7;
+  overflow: hidden;
+  background: #f8f9fc;
+  position: relative;
 }
-.v9-agent-head { display: flex; align-items: center; gap: 12px; font-size: 14px; }
-.v9-agent-icon { font-size: 22px; color: #6cb2ff; }
-.v9-agent-label { font-weight: 700; font-size: 15px; }
-.v9-agent-state-tag {
-  font-size: 12px; padding: 1px 10px; border-radius: 10px;
-  background: rgba(255,255,255,0.12); color: #cfe0f5;
-}
-.v9-agent-state-tag.running { background: #1668dc; color: #fff; }
-.v9-agent-state-tag.failed { background: #a8071a; color: #fff; }
-.v9-agent-count { color: #9fd0ff; font-size: 13px; }
-.v9-agent-issues { color: #ffc069; font-size: 13px; }
-.v9-agent-progress { margin-left: auto; font-size: 16px; font-weight: 700; color: #fff; }
-.v9-agent-statusline { font-size: 13px; opacity: 0.9; line-height: 1.5; min-height: 20px; }
-.v9-agentbar .ant-progress { line-height: 1; }
-.v9-agentbar .ant-progress-bg { height: 6px !important; }
 
-/* ===== 主体两栏 ===== */
-.v9-body { flex: 1; display: flex; min-height: 0; }
-
-/* 左侧问题列表 */
-.v9-issues {
-  width: 380px;
-  min-width: 320px;
+/* PDF 刷新全覆盖遮罩 */
+.rv-pdf-reload-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  background: rgba(30, 30, 30, 0.82);
   display: flex;
   flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  backdrop-filter: blur(2px);
+}
+.rv-pdf-reload-overlay .rv-reload-icon {
+  font-size: 48px;
+  animation: rv-spin 1.2s linear infinite;
+  color: #fff;
+  opacity: 0.9;
+}
+.rv-pdf-reload-overlay .rv-reload-title {
+  font-size: 1.2em;
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: .04em;
+}
+.rv-pdf-reload-overlay .rv-reload-sub {
+  font-size: .82em;
+  color: rgba(255,255,255,.6);
+}
+@keyframes rv-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+/* 文档标签栏（多文档时显示） */
+.rv-doc-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 12px;
+  background: #1e1e1e;
+  border-bottom: 1px solid #111;
+  flex-shrink: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.rv-doc-tabs::-webkit-scrollbar { display: none; }
+.rv-doc-tab {
+  padding: 6px 14px;
+  font-size: .78em;
+  color: rgba(255,255,255,.45);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: color .15s, border-color .15s;
+  flex-shrink: 0;
+}
+.rv-doc-tab:hover  { color: rgba(255,255,255,.75); }
+.rv-doc-tab.active { color: #fff; border-bottom-color: #5c7cfa; font-weight: 600; }
+
+/* 顶部导航栏（深色，仿截图） */
+.rv-doc-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 16px;
+  background: #2a2a2a;
+  border-bottom: 1px solid #111;
+  flex-shrink: 0;
+  min-height: 38px;
+}
+.rv-page-btn {
+  background: rgba(255,255,255,.1);
+  border: 1px solid rgba(255,255,255,.2);
+  border-radius: 4px;
+  color: #ddd;
+  cursor: pointer;
+  padding: 4px 14px;
+  font-size: .9em;
+  transition: all .15s;
+  display: flex; align-items: center; justify-content: center;
+}
+.rv-page-btn:hover:not(:disabled) { background: rgba(255,255,255,.22); color: #fff; }
+.rv-page-btn:disabled { opacity: .3; cursor: default; }
+.rv-page-counter {
+  font-size: .88em;
+  color: #ccc;
+  min-width: 72px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.rv-doc-toolbar-name { font-size: .82em; color: rgba(255,255,255,.55); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 400px; }
+.rv-doc-toolbar-tip  { font-size: .78em; color: rgba(255,255,255,.3); margin-left: auto; white-space: nowrap; }
+
+/* 可滚动文档区域 */
+.rv-doc-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: auto;
+  padding: 28px 0 40px;
+  background: #404040;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* PDF 页面包裹 */
+.rv-pdf-wrap {
+  box-shadow: 0 4px 24px rgba(0,0,0,.55);
+  line-height: 0;
+}
+.rv-pdf-wrap .react-pdf__Page { display: block; }
+
+/* PDF text layer 中的高亮 mark */
+.rv-pdf-wrap .react-pdf__Page__textContent mark,
+.rv-doc-scroll mark[data-issue-id] {
+  background: rgba(255, 230, 0, 0.55);
+  cursor: pointer;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+/* A4 降级 / 占位 */
+.rv-a4-page {
   background: #fff;
-  border-right: 1px solid #eef0f3;
+  width: 750px;
+  min-height: 200px;
+  padding: 60px 80px;
+  box-shadow: 0 4px 20px rgba(0,0,0,.45);
+  box-sizing: border-box;
 }
-.v9-issues-head {
-  display: flex; align-items: center; gap: 8px;
-  padding: 12px 16px; font-weight: 600; color: #2c3e50;
-  border-bottom: 1px solid #f0f0f0;
+.rv-a4-loading {
+  width: 750px;
+  background: #fff;
+  box-shadow: 0 4px 20px rgba(0,0,0,.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
-.v9-issues-list { flex: 1; overflow-y: auto; padding: 10px; }
 
-.v9-issue {
-  border: 1px solid #eee; border-left: 3px solid #cf1322;
-  border-radius: 6px; padding: 10px 12px; margin-bottom: 10px;
-  cursor: pointer; transition: all .15s; background: #fff;
-}
-.v9-issue:hover { box-shadow: 0 2px 10px rgba(0,0,0,0.08); }
-.v9-issue-sel { background: #fff7e6; border-left-color: #fa8c16; box-shadow: 0 2px 12px rgba(250,140,22,.2); }
-.v9-issue-done { opacity: .6; border-left-color: #bbb; }
-.v9-issue-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
-.v9-issue-status { font-weight: 600; font-size: 12px; }
-.v9-issue-orig {
-  font-size: 12.5px; color: #cf1322; background: #fff1f0;
-  padding: 6px 8px; border-radius: 4px; margin: 4px 0;
-  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
-}
-.v9-issue-sug { font-size: 12.5px; color: #389e0d; background: #f6ffed; padding: 6px 8px; border-radius: 4px; margin: 4px 0; }
-.v9-issue-reason { font-size: 12px; color: #666; margin: 4px 0; }
-.v9-issue-reg { font-size: 11.5px; color: #1890ff; margin-top: 2px; }
-.v9-issue-numeric { font-size: 11.5px; color: #1d39c4; background: #f0f5ff; border-radius: 4px; padding: 4px 8px; margin-top: 4px; }
-.v9-issue-actions { display: flex; gap: 6px; margin-top: 8px; }
-.v9-issue-custom { margin-top: 8px; }
-.v9-issue-agentnote { font-size: 11.5px; color: #555; margin-top: 6px; font-style: italic; }
+/* chunk 降级样式 */
+.rv-page-title      { font-size: 1em; font-weight: 700; color: #1a237e; text-align: center; margin-bottom: 28px; padding-bottom: 10px; border-bottom: 2px solid #1a237e; }
+.rv-chapter-heading { font-size: .95em; font-weight: 700; color: #222; margin: 20px 0 4px; }
+.rv-section-heading { font-size: .88em; font-weight: 600; color: #444; margin: 10px 0 2px; }
+.rv-doc-para        { font-size: .9em; line-height: 1.9; color: #222; margin: 0 0 6px; white-space: pre-wrap; word-break: break-all; text-indent: 2em; }
 
-/* 中间文档 */
-.v9-doc { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-.v9-doc-head {
-  display: flex; align-items: center; gap: 8px;
-  padding: 10px 16px; color: #2c3e50; font-weight: 600;
-  background: #fafbfc; border-bottom: 1px solid #f0f0f0;
+/* ── 右栏：详情 ── */
+.rv-right { width: 300px; flex-shrink: 0; background: #fff; border-left: 1px solid #e8e8e8; overflow-y: auto; }
+.rv-detail { padding: 0 0 24px; }
+.rv-detail-header { display: flex; align-items: center; gap: 8px; padding: 14px 16px 12px; }
+.rv-detail-type   { font-size: .84em; color: #555; }
+.rv-detail-block  { padding: 10px 16px; border-bottom: 1px solid #f5f5f5; }
+.rv-detail-label  { font-size: .76em; font-weight: 700; color: #888; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px; }
+.rv-detail-text   { font-size: .88em; color: #333; line-height: 1.6; }
+.rv-detail-orig   { font-size: .85em; color: #666; font-style: italic; background: #fafafa; padding: 6px 8px; border-radius: 4px; border-left: 3px solid #ddd; }
+.rv-detail-ref    { font-size: .85em; color: #1a237e; font-weight: 500; }
+.rv-detail-fix    { background: #f1f8e9; }
+.rv-detail-fix-text { font-size: .88em; color: #2e7d32; line-height: 1.6; font-weight: 500; }
+.rv-reg-chunk     { background: #f9f9f9; border: 1px solid #eee; border-radius: 4px; padding: 8px 10px; margin-top: 6px; }
+.rv-reg-source    { font-size: .76em; color: #888; margin-bottom: 4px; font-weight: 600; }
+.rv-reg-content   { font-size: .82em; color: #444; line-height: 1.6; max-height: 120px; overflow-y: auto; }
+.rv-center        { display: flex; align-items: center; justify-content: center; height: 100%; }
+
+/* ── 左栏决策圆圈 ── */
+.rv-dec-dot   { display: flex; align-items: center; justify-content: center; width: 16px; flex-shrink: 0; }
+.rv-dec-empty { display: block; width: 12px; height: 12px; border-radius: 50%; border: 1.5px solid #ccc; }
+
+/* ── 右栏 HITL 区域 ── */
+.rv-hitl-block { background: #fafafa; }
+.rv-hitl-btns  { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.rv-hitl-btn   { padding: 4px 10px; border-radius: 4px; border: 1px solid #d9d9d9; background: #fff;
+                 cursor: pointer; font-size: .8em; color: #555; transition: all .15s; }
+.rv-hitl-btn:hover:not(:disabled) { opacity: .85; }
+.rv-hitl-btn:disabled { opacity: .4; cursor: default; }
+.rv-hitl-btn-accept { background: #f6ffed; border-color: #52c41a; color: #389e0d; font-weight: 600; }
+.rv-hitl-btn-reject { background: #fff1f0; border-color: #f44336; color: #cf1322; font-weight: 600; }
+.rv-hitl-btn-review { background: #e6f4ff; border-color: #1890ff; color: #0958d9; font-weight: 600; }
+.rv-hitl-result { display: flex; align-items: center; gap: 6px; font-size: .85em; font-weight: 600; margin-top: 4px; }
+.rv-hitl-accept { color: #52c41a; }
+.rv-hitl-reject { color: #f44336; }
+.rv-hitl-reason { font-size: .82em; color: #666; margin: 4px 0 2px; padding: 4px 8px; background: #f5f5f5; border-radius: 4px; border-left: 3px solid #d9d9d9; }
+.rv-hitl-ok     { font-size: .83em; color: #52c41a; font-weight: 600; margin-top: 4px; }
+.rv-hitl-undo   { display: inline-block; margin-top: 5px; padding: 0; border: none; background: none;
+                  cursor: pointer; font-size: .76em; color: #aaa; text-decoration: underline; }
+.rv-hitl-undo:hover { color: #555; }
+.rv-hitl-input-area { margin-top: 8px; }
+.rv-hitl-input-area .ant-input { font-size: .85em; }
+.rv-hitl-input-actions { display: flex; gap: 6px; margin-top: 6px; }
+
+/* ── 文档修改块 ── */
+.rv-doc-edit-block { background: #f0faf4; border-left: 3px solid #2ea043; }
+.rv-doc-edit-btn {
+  margin-top: 6px; padding: 5px 14px;
+  background: #2ea043; color: #fff; border: none;
+  border-radius: 4px; cursor: pointer; font-size: .83em; font-weight: 600;
+  transition: background .15s;
 }
-.v9-doc-paper {
-  flex: 1; overflow-y: auto; padding: 32px 48px;
-  background: #f5f6f8;
+.rv-doc-edit-btn:hover { background: #238a3a; }
+.rv-doc-edit-status { font-size: .83em; margin-top: 5px; color: #888; }
+.rv-doc-edit-ok     { color: #2ea043; font-weight: 600; }
+.rv-doc-edit-diff {
+  display: flex; align-items: flex-start; gap: 6px;
+  margin: 6px 0 4px; font-size: .8em; flex-wrap: wrap;
 }
-.v9-doc-paper > * {
-  max-width: 820px; margin-left: auto; margin-right: auto;
+.rv-diff-before { color: #c62828; text-decoration: line-through; word-break: break-all; }
+.rv-diff-arrow  { color: #888; flex-shrink: 0; }
+.rv-diff-after  { color: #2e7d32; font-weight: 600; word-break: break-all; }
+.rv-doc-edit-undo {
+  display: inline-block; margin-top: 5px; padding: 0;
+  border: none; background: none; cursor: pointer;
+  font-size: .76em; color: #aaa; text-decoration: underline;
 }
-.doc-para {
-  background: transparent; line-height: 1.9; font-size: 15px; color: #222;
-  margin: 0 0 4px 0; padding: 2px 8px; border-radius: 4px;
-  white-space: pre-wrap; word-break: break-word; scroll-margin-top: 80px;
+.rv-doc-edit-undo:hover { color: #f44336; }
+.rv-doc-edit-textarea {
+  width: 100%; margin-top: 4px;
+  padding: 7px 9px; border: 1px solid #b7eb8f; border-radius: 4px;
+  font-size: .82em; line-height: 1.6; color: #222;
+  background: #f6ffed; resize: vertical;
+  font-family: inherit;
 }
-.doc-heading { font-weight: 700; font-size: 16px; color: #1f2a44; margin-top: 14px; }
-.doc-para-hl { background: #fff3cd; outline: 2px solid #ffc53d; }
-.hl-text { background: #ffd666; color: #613400; padding: 0 2px; border-radius: 2px; }
-.doc-table {
-  border-collapse: collapse; width: 100%; max-width: 820px;
-  margin: 10px auto; background: #fff; font-size: 13px;
+.rv-doc-edit-textarea:focus { outline: none; border-color: #52c41a; box-shadow: 0 0 0 2px #52c41a22; }
+.rv-doc-edit-textarea-original {
+  background: #f0f5ff; border-color: #adc6ff; color: #555;
 }
-.doc-table td { border: 1px solid #d9d9d9; padding: 6px 10px; }
+.rv-doc-edit-textarea-original:focus { border-color: #4096ff; box-shadow: 0 0 0 2px #4096ff22; }
+.rv-doc-edit-actions { display: flex; align-items: center; margin-top: 6px; }
+.rv-doc-edit-cancel {
+  padding: 4px 10px; border-radius: 4px; border: 1px solid #d9d9d9;
+  background: #fff; cursor: pointer; font-size: .82em; color: #666;
+}
+.rv-doc-edit-cancel:hover { border-color: #aaa; color: #333; }
+
+/* ── 智能体流程悬浮面板 ── */
+.rv-pipeline-overlay .ant-popover-inner { padding: 0; border-radius: 12px; overflow: hidden; box-shadow: 0 8px 32px rgba(0,0,0,.18); }
+.rv-pipeline-overlay .ant-popover-inner-content { padding: 0; }
+
+.rv-pipeline-popup { width: 480px; background: #fff; font-family: inherit; }
+
+.rv-pipeline-header { display: flex; align-items: center; gap: 10px; padding: 14px 18px 10px;
+                       background: linear-gradient(135deg, #1a237e 0%, #283593 100%); color: #fff; }
+.rv-pipeline-title  { font-size: .95em; font-weight: 700; letter-spacing: .04em; flex: 1; }
+.rv-pipeline-done-badge    { font-size: .75em; background: rgba(82,196,26,.25); border: 1px solid rgba(82,196,26,.5); color: #b7eb8f; border-radius: 20px; padding: 2px 10px; }
+.rv-pipeline-running-badge { font-size: .75em; background: rgba(24,144,255,.25); border: 1px solid rgba(24,144,255,.5); color: #91d5ff; border-radius: 20px; padding: 2px 10px; }
+.rv-pipeline-idle-badge    { font-size: .75em; background: rgba(255,255,255,.15); border: 1px solid rgba(255,255,255,.3); color: rgba(255,255,255,.7); border-radius: 20px; padding: 2px 10px; }
+
+/* 并行三列布局 */
+.rv-pipeline-parallel-cols { display: flex; padding: 10px 14px 14px; gap: 0; }
+.rv-pipeline-col { flex: 1; display: flex; flex-direction: column; gap: 6px; padding: 0 8px;
+                   border-right: 1px solid #f0f0f0; }
+.rv-pipeline-col:last-child { border-right: none; }
+.rv-pipeline-col-title { font-size: .70em; color: #888; font-weight: 700; text-align: center;
+                          padding: 0 0 6px; letter-spacing: .06em; text-transform: uppercase; }
+.rv-pipeline-down-arrow { text-align: center; color: #bbb; font-size: .9em; line-height: 1; padding: 1px 0; }
+
+/* 智能体卡片 */
+.rv-agent-card { display: flex; align-items: center; gap: 8px; flex: 1; padding: 8px 10px;
+                 border: 1.5px solid #e8e8e8; border-radius: 8px; background: #fafafa;
+                 transition: border-color .2s, background .2s; min-width: 0; }
+.rv-agent-card.rv-agent-running { border-color: var(--agent-color); background: color-mix(in srgb, var(--agent-color) 6%, #fff); }
+.rv-agent-card.rv-agent-done    { border-color: #52c41a; background: #f6ffed; }
+.rv-agent-card.rv-agent-error   { border-color: #f44336; background: #fff1f0; }
+
+.rv-agent-icon { font-size: 1.2em; flex-shrink: 0; line-height: 1; }
+.rv-agent-body { flex: 1; min-width: 0; }
+.rv-agent-name { font-size: .8em; font-weight: 600; color: #333; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rv-agent-sub  { font-size: .72em; color: #999; margin-top: 1px; }
+.rv-agent-done-text { color: #52c41a; font-weight: 600; }
+.rv-agent-err-text  { color: #f44336; font-weight: 600; }
+
+.rv-agent-bar  { height: 3px; background: #e8e8e8; border-radius: 2px; margin-top: 4px; overflow: hidden; }
+.rv-agent-fill { height: 100%; background: var(--agent-color); border-radius: 2px;
+                 transition: width .4s ease; min-width: 4px; }
+
+/* 状态指示点 */
+.rv-agent-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.rv-agent-dot-idle    { background: #d9d9d9; }
+.rv-agent-dot-running { background: var(--agent-color); animation: rv-pulse 1.2s ease-in-out infinite; }
+.rv-agent-dot-done    { background: #52c41a; }
+.rv-agent-dot-error   { background: #f44336; }
+@keyframes rv-pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .4; transform: scale(.7); } }
+
+/* ── 左栏标签切换 ── */
+.rv-tab-bar { display: flex; border-bottom: 1px solid #e8e8e8; flex-shrink: 0; }
+.rv-tab-btn { flex: 1; padding: 8px 4px; border: none; background: none; cursor: pointer;
+              font-size: .82em; color: #666; border-bottom: 2px solid transparent;
+              transition: all .15s; }
+.rv-tab-btn.active { color: #1a237e; font-weight: 600; border-bottom-color: #1a237e; }
+.rv-tab-btn:hover:not(.active) { color: #333; background: #fafafa; }
+
+/* ── 重复检验详情 ── */
+.rv-redun-loc     { font-size: .76em; color: #888; margin-bottom: 4px; }
+.rv-redun-content { font-size: .82em; color: #444; line-height: 1.6; max-height: 160px; overflow-y: auto;
+                    background: #f9f9f9; border: 1px solid #eee; border-radius: 4px; padding: 6px 8px; margin-top: 4px; }
+.rv-chunk-nav-btn { margin-left: 8px; padding: 1px 6px; border: 1px solid #1890ff; border-radius: 3px;
+                    background: #e6f4ff; color: #0958d9; font-size: .72em; cursor: pointer; }
+.rv-chunk-nav-btn:hover { background: #bae0ff; }
+
+/* 中栏 PDF 预览 */
+.rv-pdf-panel {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: #f2f3f7;
+  overflow: hidden;
+}
+.rv-pdf-toolbar {
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: #fff;
+  border-bottom: 1px solid #e8e8e8;
+}
+.rv-pdf-doc-name {
+  font-weight: 700;
+  font-size: 14px;
+  color: #1f1f1f;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rv-pdf-progress-text {
+  margin-left: auto;
+  font-size: 12px;
+  color: #666;
+  white-space: nowrap;
+}
+.rv-pdf-status {
+  font-size: 12px;
+  color: #2f54eb;
+  background: #e8eeff;
+  padding: 7px 14px;
+  border-bottom: 1px solid #d8e1ff;
+}
+.rv-pdf-error {
+  color: #f5222d;
+  background: #fff2f0;
+  padding: 8px 14px;
+  border-bottom: 1px solid #ffccc7;
+}
+.rv-pdf-frame-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  background: #3f3f3f;
+}
+.rv-pdf-frame {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #3f3f3f;
+}
+.rv-pdf-doc-scroll {
+  height: 100%;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 0 32px;
+  background: #3f3f3f;
+}
+.rv-pdf-page-controls {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: rgba(255,255,255,.94);
+  box-shadow: 0 2px 10px rgba(0,0,0,.16);
+}
+.rv-pdf-page {
+  box-shadow: 0 4px 24px rgba(0,0,0,.55);
+  line-height: 0;
+}
+.rv-pdf-page canvas {
+  display: block;
+}
+.rv-pdf-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: #ddd;
+  background: #3f3f3f;
+}
+
+
+/* ── 高亮文档视图 ── */
+.rv-preview-switch {
+  flex-shrink: 0;
+}
+.rv-highlight-page {
+  width: min(900px, calc(100% - 40px));
+  min-height: calc(100% - 56px);
+  padding: 44px 54px;
+  line-height: 1.9;
+}
+.rv-doc-loading {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: #ddd;
+  background: #404040;
+}
+.rv-doc-block {
+  position: relative;
+  margin: 0 0 7px;
+  color: #222;
+  font-size: 14px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  cursor: default;
+}
+.rv-doc-block.heading {
+  margin: 20px 0 12px;
+  font-size: 17px;
+  font-weight: 700;
+  color: #1a237e;
+  text-align: center;
+}
+.rv-doc-block.table {
+  margin: 12px 0;
+  padding: 10px 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 4px;
+  background: #fafafa;
+  font-family: Consolas, 'Microsoft YaHei', monospace;
+  font-size: 12px;
+  line-height: 1.65;
+  overflow-x: auto;
+}
+.rv-doc-block.has-issues {
+  cursor: pointer;
+}
+.rv-doc-block.fixed-block {
+  border-left: 4px solid #22c55e;
+  padding-left: 10px;
+  background: #ecfdf3;
+}
+.rv-doc-mark {
+  border-radius: 3px;
+  padding: 1px 3px;
+  cursor: pointer;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+.rv-doc-mark.error {
+  color: #a8071a;
+  background: #ffd6d9;
+  outline: 1px solid #ff7875;
+}
+.rv-doc-mark.applying {
+  color: #874d00;
+  background: #fff1b8;
+  outline: 1px solid #ffc53d;
+}
+.rv-doc-mark.fixed {
+  color: #135200;
+  background: #b7eb8f;
+  outline: 1px solid #52c41a;
+}
+.rv-doc-mark.rejected {
+  color: #595959;
+  background: #f0f0f0;
+  outline: 1px solid #bfbfbf;
+}
+.rv-doc-mark:hover {
+  filter: brightness(.96);
+}
+
+/* ── 真实 PDF text layer 高亮 ── */
+.rv-pdf-page .react-pdf__Page__textContent {
+  pointer-events: auto;
+}
+.rv-pdf-mark {
+  border-radius: 2px;
+  padding: 0 1px;
+  cursor: pointer;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+.rv-pdf-mark.error {
+  color: transparent;
+  background: rgba(255, 77, 79, .38);
+  outline: 1px solid rgba(245, 34, 45, .55);
+}
+.rv-pdf-mark.applying {
+  color: transparent;
+  background: rgba(250, 173, 20, .34);
+  outline: 1px solid rgba(250, 173, 20, .58);
+}
+.rv-pdf-mark.fixed {
+  color: transparent;
+  background: rgba(82, 196, 26, .36);
+  outline: 1px solid rgba(82, 196, 26, .62);
+}
+.rv-pdf-mark.rejected {
+  color: transparent;
+  background: rgba(140, 140, 140, .22);
+  outline: 1px solid rgba(140, 140, 140, .42);
+}
+.rv-pdf-mark.selected {
+  outline-width: 2px;
+  box-shadow: 0 0 0 2px rgba(24, 144, 255, .32);
+}

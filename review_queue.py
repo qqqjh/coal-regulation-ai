@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     docx_path TEXT NOT NULL,
     paragraphs_path TEXT,          -- 段落模型 JSON 落盘路径（前端中间面板用）
     mine_type TEXT NOT NULL DEFAULT 'non_outburst',
-    status TEXT NOT NULL DEFAULT 'pending',  -- pending/parsing/reviewing/done/failed
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending/parsing/reviewing/done/failed/cancelled
     progress INTEGER NOT NULL DEFAULT 0,
     n_chunks INTEGER DEFAULT 0,
     n_done INTEGER DEFAULT 0,
@@ -389,6 +389,18 @@ class ReviewQueue:
                 "SELECT * FROM jobs WHERE job_id=?", (job_id,)
             ).fetchone()
         return dict(row) if row else None
+
+    def cancel_job(self, job_id: str, reason: str = "用户取消任务") -> bool:
+        """取消未完成任务。pending 任务不会再被 worker 领取；运行中任务由 worker 协作停止。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE jobs SET status='cancelled', progress=0, agent_status=?, "
+                "error=?, updated_at=? "
+                "WHERE job_id=? AND status NOT IN ('done','failed','cancelled')",
+                (reason, reason, _now(), job_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
     # ============ 问题（issues）：边审边写 / SSE 流式读 / 人工反馈回流 ============
 

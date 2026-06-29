@@ -1,4 +1,4 @@
-"""v9 常驻 worker —— 前后端与 v9 引擎之间的桥
+﻿"""v9 常驻 worker —— 前后端与 v9 引擎之间的桥
 
 必须在 langchain0.3 环境运行（BGE + torch CUDA）：
     D:\\Anaconda\\envs\\langchain0.3\\python.exe v9_worker.py
@@ -32,6 +32,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 QUEUE_DB = PROJECT_ROOT / "data" / "review_queue_v9.db"
 WORK_DIR = PROJECT_ROOT / "data" / "v9_web_work"      # 段落模型 / 工作副本 docx
 WORK_DIR.mkdir(parents=True, exist_ok=True)
+DEMO_SKIP_RETRIEVAL = os.getenv("V9_DEMO_SKIP_RETRIEVAL", "0") == "1"
 
 
 def _load_env_fallback():
@@ -118,6 +119,16 @@ class V9Worker:
 
     # ---------- 审查任务 ----------
 
+    def _is_cancelled(self, job_id: str) -> bool:
+        job = self.queue.get_job(job_id)
+        return bool(job and job.get("status") == "cancelled")
+
+    def _stop_if_cancelled(self, job_id: str, stage: str) -> bool:
+        if self._is_cancelled(job_id):
+            log(f"任务 {job_id} 已取消，停止于 {stage}")
+            return True
+        return False
+
     def process_job(self, job: Dict[str, Any]):
         job_id = job["job_id"]
         docx_path = job["docx_path"]
@@ -128,31 +139,71 @@ class V9Worker:
             if docx_path != job["docx_path"]:
                 self.queue.update_job(job_id, docx_path=docx_path)
             parsed, chunks = docx_adapter.adapt(docx_path)
+            if self._stop_if_cancelled(job_id, "文档解析后"):
+                return
             para_path = self._save_paragraphs(job_id, parsed)
             self._working_docx(job_id, docx_path)  # 预建工作副本
+            if self._stop_if_cancelled(job_id, "工作副本创建后"):
+                return
             self.queue.update_job(job_id, status="reviewing", n_chunks=len(chunks),
                                   paragraphs_path=para_path, progress=2,
                                   agent_status="主智能体已派发审查子任务，三链并行审查中")
 
             engine = self.engine
             engine.mine_type = mine_type  # 适用性过滤按本任务矿井类型
-            kb_results_all, q_dense = engine.prepare_retrieval(chunks)
-            self.queue.update_job(job_id, progress=15,
-                                  agent_status="检索完成，逐块合规/错别字/数值核验中")
+            if DEMO_SKIP_RETRIEVAL:
+                self.queue.update_job(
+                    job_id, progress=3,
+                    agent_status=f"已命中本地向量缓存（共 {len(chunks)} 段），正在法规召回…",
+                )
+                kb_results_all, q_dense = engine.prepare_dense_retrieval(chunks)
+                if self._stop_if_cancelled(job_id, "法规召回后"):
+                    return
+                self.queue.update_job(
+                    job_id, progress=15,
+                    agent_status="主智能体已派发审查子任务，逐块合规/错别字/数值核验中",
+                )
+            else:
+                encoding_cache_hit = engine.has_pending_encoding_cache(chunks)
+                if encoding_cache_hit:
+                    encoding_status = f"已命中本地向量缓存（共 {len(chunks)} 段），正在法规召回与重排…"
+                else:
+                    encoding_status = f"BGE-M3 首次编码中（共 {len(chunks)} 段），完成后将保存本地缓存…"
+                self.queue.update_job(job_id, progress=3, agent_status=encoding_status)
+                kb_results_all, q_dense = engine.prepare_retrieval(chunks)
+                if self._stop_if_cancelled(job_id, "法规召回与重排后"):
+                    return
+                self.queue.update_job(
+                    job_id, progress=15,
+                    agent_status=("已复用本地向量缓存，逐块合规/错别字/数值核验中"
+                                  if encoding_cache_hit else
+                                  "向量编码与检索完成，逐块合规/错别字/数值核验中"),
+                )
 
             n_issues = 0
             for i, chunk in enumerate(chunks):
+                if self._stop_if_cancelled(job_id, f"chunk#{i + 1} 前"):
+                    return
                 kb_results = kb_results_all[i]
                 source_blocks = chunk.get("source_blocks", [])
                 n_issues += self._review_one_chunk(
-                    job_id, i, chunk, kb_results, parsed, source_blocks
+                    job_id, job["doc_name"], i, chunk, kb_results, parsed, source_blocks
                 )
+                if self._stop_if_cancelled(job_id, f"chunk#{i + 1} 后"):
+                    return
                 progress = 15 + int((i + 1) / max(1, len(chunks)) * 80)
                 self.queue.update_job(job_id, progress=progress, n_done=i + 1)
 
             # 文档级重复性（一次性，复用 Phase A 向量）
             try:
+                if DEMO_SKIP_RETRIEVAL or q_dense is None:
+                    log("Demo 快速模式：跳过文档级重复性检查")
+                    raise RuntimeError("Demo 快速模式跳过重复性检查")
+                if self._stop_if_cancelled(job_id, "重复性检查前"):
+                    return
                 rep_by_chunk, _ = engine.check_document_repetition(job["doc_name"], chunks, q_dense)
+                if self._stop_if_cancelled(job_id, "重复性检查后"):
+                    return
                 for ci, rep in rep_by_chunk.items():
                     if rep.get("has_duplicates"):
                         dup = rep["duplicates"][0]
@@ -169,28 +220,36 @@ class V9Worker:
             except Exception as exc:
                 log(f"重复性检查异常（忽略）: {exc}")
 
-            self.queue.update_job(job_id, status="done", progress=100,
-                                  agent_status=f"审查完成，共发现 {n_issues} 处问题，等待人工裁决")
+            if not self._is_cancelled(job_id):
+                self.queue.update_job(job_id, status="done", progress=100,
+                                      agent_status=f"审查完成，共发现 {n_issues} 处问题，等待人工裁决")
             log(f"任务 {job_id} 完成，问题 {n_issues} 条")
         except Exception as exc:
+            if self._is_cancelled(job_id):
+                log(f"任务 {job_id} 已取消，忽略异常: {exc}")
+                return
             import traceback
             traceback.print_exc()
             self.queue.update_job(job_id, status="failed", error=str(exc)[:500],
                                   agent_status=f"审查失败: {str(exc)[:80]}")
 
-    def _review_one_chunk(self, job_id: str, idx: int, chunk: Dict,
+    def _review_one_chunk(self, job_id: str, doc_name: str, idx: int, chunk: Dict,
                           kb_results: List[Dict], parsed: Dict, source_blocks: List[int]) -> int:
         """单块：合规链 + 错别字，产出 issues。返回新增问题数。"""
         engine = self.engine
         count = 0
 
-        # 合规链（含数值正/反向核验、二次核验、升级判定）
+        # 复用引擎的合规链与错别字并行处理，并自动写入升级队列
         try:
-            review, _clf, numeric_checks, escalations, _timings = \
-                engine.review_chunk_complete(chunk, kb_results)
+            result = engine._process_single_chunk(doc_name, idx, chunk, kb_results)
+            review = result["review_result"]
+            numeric_checks = result["numeric_checks"]
+            escalations = result["escalations"]
+            typo = result["typo_result"]
         except Exception as exc:
-            log(f"  chunk#{idx+1} 合规链异常: {exc}")
-            review, numeric_checks, escalations = {"compliance_status": "不确定", "issues": []}, [], []
+            log(f"  chunk#{idx+1} 并行审查异常: {exc}")
+            review, numeric_checks, escalations = {"compliance_status": "不确定", "issues": []}, [], ["error"]
+            typo = {"issues": []}
 
         status = str(review.get("compliance_status", ""))
         numeric_detail = [
@@ -217,37 +276,32 @@ class V9Worker:
 
         # 有升级但没有具体 issue（如"不确定"/反向核验）时，也产出一条供人工裁决
         if not review.get("issues") and escalations:
-            esc = escalations[0]
             self.queue.add_issue(
                 job_id, idx, "escalation", status or "不确定",
                 block_indices=source_blocks,
                 title="需人工裁决",
                 original_text=chunk["content"][:120],
-                reason=esc.get("reason", ""),
+                reason="审查链已将该项加入主智能体升级队列",
                 detail={"numeric": numeric_detail, "summary": review.get("summary", "")},
-                escalation_type=esc.get("type", ""),
+                escalation_type=escalations[0],
             )
             count += 1
 
-        # 错别字
-        try:
-            typo = engine.check_typos(chunk)
-            for t in typo.get("issues", []):
-                wrong = t.get("original") or t.get("wrong_char", "")
-                blocks = docx_adapter.locate_text_blocks(parsed, wrong, source_blocks)
-                self.queue.add_issue(
-                    job_id, idx, "typo", "错别字",
-                    block_indices=blocks or source_blocks,
-                    title="错别字",
-                    original_text=wrong,
-                    suggestion=t.get("suggestion") or t.get("correct_char", ""),
-                    reason=t.get("reason", ""),
-                    detail={"confidence": t.get("confidence", ""),
-                            "context": t.get("context", "")},
-                )
-                count += 1
-        except Exception as exc:
-            log(f"  chunk#{idx+1} 错别字异常: {exc}")
+        # 错别字结果已由引擎与合规链并行产出
+        for t in typo.get("issues", []):
+            wrong = t.get("original") or t.get("wrong_char", "")
+            blocks = docx_adapter.locate_text_blocks(parsed, wrong, source_blocks)
+            self.queue.add_issue(
+                job_id, idx, "typo", "错别字",
+                block_indices=blocks or source_blocks,
+                title="错别字",
+                original_text=wrong,
+                suggestion=t.get("suggestion") or t.get("correct_char", ""),
+                reason=t.get("reason", ""),
+                detail={"confidence": t.get("confidence", ""),
+                        "context": t.get("context", "")},
+            )
+            count += 1
 
         return count
 
@@ -295,6 +349,10 @@ class V9Worker:
 
         if applied:
             doc.save(str(work))
+            try:
+                (WORK_DIR / f"{job_id}_preview.pdf").unlink(missing_ok=True)
+            except Exception:
+                pass
             # 刷新段落模型，前端重新拉取即见改动
             self._save_paragraphs(job_id, docx_adapter.parse_docx(work))
             self.queue.finish_feedback(
@@ -353,12 +411,25 @@ class V9Worker:
                 traceback.print_exc()
                 time.sleep(POLL_INTERVAL)
 
+    def _escalation_loop(self):
+        """持续调用主智能体处理审查链写入的升级队列。"""
+        from main_agent_v9 import MainAgent
+        agent = MainAgent()
+        while True:
+            try:
+                stats = agent.process_queue(max_items=1)
+                if not stats.get("resolved") and not stats.get("failed"):
+                    time.sleep(POLL_INTERVAL * 2)
+            except Exception as exc:
+                log(f"主智能体升级队列处理异常: {exc}")
+                time.sleep(POLL_INTERVAL * 2)
     def run(self):
         import threading
         import traceback
         # 反馈处理放独立守护线程：审查长任务进行中也能实时改 Word
         threading.Thread(target=self._feedback_loop, daemon=True).start()
-        log("反馈处理线程已启动（审查中也可接受/驳回/改写）")
+        threading.Thread(target=self._escalation_loop, daemon=True).start()
+        log("反馈处理与主智能体升级队列线程已启动")
         while True:
             try:
                 job = self.queue.fetch_pending_job()
@@ -376,3 +447,11 @@ class V9Worker:
 
 if __name__ == "__main__":
     V9Worker().run()
+
+
+
+
+
+
+
+
