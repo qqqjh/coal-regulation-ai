@@ -12,6 +12,7 @@
 """
 import asyncio
 import json
+import shutil
 import sys
 import uuid
 from datetime import datetime
@@ -32,20 +33,195 @@ router = APIRouter()
 
 _queue = ReviewQueue(settings.V9_QUEUE_DB)
 _WORK_DIR = settings.PROJECT_ROOT / "data" / "v9_web_work"
+_PREPROCESS_DIR = _WORK_DIR / "preprocess"
+_PREPROCESS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _preprocess_meta_path(preprocess_id: str) -> Path:
+    if not preprocess_id or not preprocess_id.isalnum():
+        raise HTTPException(400, "预处理ID无效")
+    return _PREPROCESS_DIR / f"{preprocess_id}.json"
+
+
+def _load_preprocess_meta(preprocess_id: str) -> dict:
+    meta_path = _preprocess_meta_path(preprocess_id)
+    if not meta_path.exists():
+        raise HTTPException(404, "预处理结果不存在或已清理")
+    with meta_path.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_preprocess_meta(meta: dict) -> None:
+    meta_path = _preprocess_meta_path(meta["preprocess_id"])
+    with meta_path.open("w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+
+def _convert_doc_to_docx(source: Path, target: Path) -> None:
+    import pythoncom
+    import win32com.client
+
+    pythoncom.CoInitialize()
+    word = None
+    doc = None
+    try:
+        word = win32com.client.DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0
+        doc = word.Documents.Open(str(source.resolve()), ReadOnly=True, AddToRecentFiles=False)
+        try:
+            doc.SaveAs2(str(target.resolve()), FileFormat=16)
+        except Exception as exc:
+            if target.exists() and target.stat().st_size > 0:
+                print(f"Word SaveAs2 返回异常但 .docx 已生成，继续处理: {exc}")
+            else:
+                raise RuntimeError(
+                    f"Word COM 转换 .doc 失败，请先手动另存为 .docx 后再上传：{exc}"
+                ) from exc
+        if not target.exists() or target.stat().st_size == 0:
+            raise RuntimeError("Word COM 转换 .doc 失败：未生成有效 .docx 文件")
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(False)
+            except Exception:
+                pass
+        if word is not None:
+            try:
+                word.Quit()
+            except Exception:
+                pass
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+
+def _try_build_pdf(docx_path: Path, pdf_path: Path) -> str:
+    """生成 PDF 预览缓存。返回空字符串表示成功，非空为可展示错误。"""
+    try:
+        import importlib.util
+
+        wm_spec = importlib.util.spec_from_file_location(
+            "word_modifier", settings.PROJECT_ROOT / "word_modifier.py"
+        )
+        wm = importlib.util.module_from_spec(wm_spec)
+        wm_spec.loader.exec_module(wm)
+        pdf_bytes = wm.docx_to_pdf_bytes(docx_path)
+        pdf_path.write_bytes(pdf_bytes)
+        if not pdf_path.exists() or pdf_path.stat().st_size == 0:
+            return "PDF 预览生成失败：未生成有效 PDF 文件"
+        return ""
+    except Exception as exc:
+        return f"PDF 预览生成失败：{str(exc)[:500]}"
+
+
+async def _preprocess_upload_file(file: UploadFile) -> dict:
+    if not file.filename.lower().endswith((".docx", ".doc")):
+        raise HTTPException(400, "只支持 Word 文档（.docx/.doc）")
+
+    preprocess_id = uuid.uuid4().hex[:12]
+    original_suffix = Path(file.filename).suffix.lower()
+    original_path = _PREPROCESS_DIR / f"{preprocess_id}_original{original_suffix}"
+    docx_path = _PREPROCESS_DIR / f"{preprocess_id}.docx"
+    pdf_path = _PREPROCESS_DIR / f"{preprocess_id}.pdf"
+
+    content = await file.read()
+    original_path.write_bytes(content)
+    if not original_path.exists() or original_path.stat().st_size == 0:
+        raise HTTPException(400, "上传文件为空或保存失败")
+
+    steps = []
+    if original_suffix == ".docx":
+        shutil.copy2(original_path, docx_path)
+        steps.append({"name": "normalize_docx", "status": "done", "message": "已保存为标准审查副本"})
+    else:
+        try:
+            _convert_doc_to_docx(original_path, docx_path)
+            steps.append({"name": "convert_doc_to_docx", "status": "done", "message": ".doc 已转换为 .docx"})
+        except Exception as exc:
+            meta = {
+                "preprocess_id": preprocess_id,
+                "doc_name": file.filename,
+                "original_path": str(original_path),
+                "docx_path": "",
+                "pdf_path": "",
+                "docx_ready": False,
+                "pdf_ready": False,
+                "pdf_error": "",
+                "status": "failed",
+                "error": str(exc),
+                "steps": steps + [{"name": "convert_doc_to_docx", "status": "failed", "message": str(exc)}],
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            _save_preprocess_meta(meta)
+            raise HTTPException(500, str(exc)) from exc
+
+    pdf_error = _try_build_pdf(docx_path, pdf_path)
+    steps.append({
+        "name": "build_pdf_preview",
+        "status": "warning" if pdf_error else "done",
+        "message": pdf_error or "PDF 预览已生成",
+    })
+    meta = {
+        "preprocess_id": preprocess_id,
+        "doc_name": file.filename,
+        "original_path": str(original_path),
+        "docx_path": str(docx_path),
+        "pdf_path": str(pdf_path) if pdf_path.exists() and pdf_path.stat().st_size > 0 else "",
+        "docx_ready": True,
+        "pdf_ready": bool(pdf_path.exists() and pdf_path.stat().st_size > 0),
+        "pdf_error": pdf_error,
+        "status": "ready",
+        "error": "",
+        "steps": steps,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _save_preprocess_meta(meta)
+    return meta
+
+
+def _create_job_from_preprocess(preprocess_id: str, mine_type: str = "non_outburst") -> dict:
+    meta = _load_preprocess_meta(preprocess_id)
+    if not meta.get("docx_ready") or not meta.get("docx_path"):
+        raise HTTPException(400, "预处理未完成，不能启动审查")
+    docx_path = Path(meta["docx_path"])
+    if not docx_path.exists():
+        raise HTTPException(404, "预处理后的 .docx 文件不存在")
+
+    job_id = uuid.uuid4().hex[:12]
+    _queue.create_job(job_id, doc_name=meta["doc_name"], docx_path=str(docx_path),
+                      mine_type=mine_type)
+
+    pdf_path = Path(meta["pdf_path"]) if meta.get("pdf_path") else None
+    if pdf_path and pdf_path.exists() and pdf_path.stat().st_size > 0:
+        shutil.copy2(pdf_path, _WORK_DIR / f"{job_id}_preview.pdf")
+
+    return {
+        "job_id": job_id,
+        "doc_name": meta["doc_name"],
+        "status": "pending",
+        "preprocess": meta,
+    }
+
+
+@router.post("/preprocess")
+async def preprocess(file: UploadFile = File(...)):
+    """上传 Word 并完成审查前预处理：保存原件、统一为 .docx、尽量生成 PDF 预览。"""
+    return await _preprocess_upload_file(file)
+
+
+@router.post("/start/{preprocess_id}")
+async def start_preprocessed(preprocess_id: str, mine_type: str = "non_outburst"):
+    """基于预处理结果创建审查任务。"""
+    return _create_job_from_preprocess(preprocess_id, mine_type=mine_type)
 
 
 @router.post("/upload")
 async def upload(file: UploadFile = File(...), mine_type: str = "non_outburst"):
-    """上传 Word 待审文档，创建审查任务（worker 异步执行）。"""
-    if not file.filename.lower().endswith((".docx", ".doc")):
-        raise HTTPException(400, "只支持 Word 文档（.docx/.doc）")
-    job_id = uuid.uuid4().hex[:12]
-    dest = settings.UPLOAD_DIR / f"v9_{job_id}_{file.filename}"
-    content = await file.read()
-    dest.write_bytes(content)
-    _queue.create_job(job_id, doc_name=file.filename, docx_path=str(dest),
-                      mine_type=mine_type)
-    return {"job_id": job_id, "doc_name": file.filename, "status": "pending"}
+    """兼容旧调用：上传后先预处理，再创建审查任务。新前端应使用 /preprocess + /start。"""
+    meta = await _preprocess_upload_file(file)
+    return _create_job_from_preprocess(meta["preprocess_id"], mine_type=mine_type)
 
 
 @router.get("/status/{job_id}")
@@ -53,6 +229,11 @@ async def status(job_id: str):
     job = _queue.get_job(job_id)
     if not job:
         raise HTTPException(404, "任务不存在")
+    if isinstance(job.get("timings"), str):
+        try:
+            job["timings"] = json.loads(job.get("timings") or "{}")
+        except json.JSONDecodeError:
+            job["timings"] = {}
     return job
 
 
@@ -101,14 +282,26 @@ async def stream(job_id: str):
             if not job:
                 yield f"data: {json.dumps({'type': 'error', 'msg': '任务不存在'})}\n\n"
                 return
-            sig = (job["status"], job["progress"], job.get("agent_status"))
+            sig = (
+                job["status"], job["progress"], job.get("agent_status"),
+                job.get("agent_stage"), job.get("phase_done"), job.get("phase_total"),
+                job.get("timings"),
+            )
             status_changed = sig != last_sig
             if status_changed:
                 last_sig = sig
+                try:
+                    timings = json.loads(job.get("timings") or "{}")
+                except json.JSONDecodeError:
+                    timings = {}
                 payload = {"type": "status", "job": {
                     "job_id": job["job_id"], "doc_name": job["doc_name"],
                     "status": job["status"], "progress": job["progress"],
                     "n_chunks": job["n_chunks"], "n_done": job["n_done"],
+                    "agent_stage": job.get("agent_stage"),
+                    "phase_done": job.get("phase_done"),
+                    "phase_total": job.get("phase_total"),
+                    "timings": timings,
                     "agent_status": job.get("agent_status"),
                     "paragraphs_ready": bool(job.get("paragraphs_path")),
                     "error": job.get("error"),
@@ -251,13 +444,21 @@ async def preview_pdf(job_id: str, refresh: int = 0):
             word = None
             doc = None
             try:
-                word = win32com.client.Dispatch("Word.Application")
+                word = win32com.client.DispatchEx("Word.Application")
                 word.Visible = False
                 word.DisplayAlerts = 0
-                doc = word.Documents.Open(str(source.resolve()))
-                doc.SaveAs2(str(temp_docx.resolve()), FileFormat=16)
-                doc.Close(False)
-                doc = None
+                doc = word.Documents.Open(str(source.resolve()), ReadOnly=True, AddToRecentFiles=False)
+                try:
+                    doc.SaveAs2(str(temp_docx.resolve()), FileFormat=16)
+                except Exception as exc:
+                    if temp_docx.exists() and temp_docx.stat().st_size > 0:
+                        print(f"Word SaveAs2 返回异常但 .docx 已生成，继续生成 PDF: {exc}")
+                    else:
+                        raise RuntimeError(
+                            f"Word COM 转换 .doc 失败，请先手动另存为 .docx 后再上传：{exc}"
+                        ) from exc
+                if not temp_docx.exists() or temp_docx.stat().st_size == 0:
+                    raise RuntimeError("Word COM 转换 .doc 失败：未生成有效 .docx 文件")
             finally:
                 if doc is not None:
                     try:

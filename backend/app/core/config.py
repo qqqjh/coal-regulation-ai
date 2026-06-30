@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     # v9 集成：与 worker 共享的队列/任务库（位于仓库根 data/ 下）
     V9_QUEUE_DB: Path = PROJECT_ROOT / "data" / "review_queue_v9.db"
 
+    # MinerU：规则文档上传时推荐连接本机常驻 mineru-api
+    MINERU_API_URL: str = "http://127.0.0.1:51071"
+
     # 数据库
     SQLITE_URL: str = f"sqlite+aiosqlite:///{(BACKEND_DIR / 'data' / 'app.db')}"
 

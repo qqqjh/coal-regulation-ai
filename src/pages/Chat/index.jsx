@@ -43,17 +43,15 @@ const Chat = () => {
   const [editingName, setEditingName] = useState('')
   const [knowledgeBases, setKnowledgeBases] = useState([])
   const [selectedKbId, setSelectedKbId] = useState(null)
-  const [selectedModel, setSelectedModel] = useState('gpt-3.5-turbo')
+  const [selectedModel, setSelectedModel] = useState('qwen-plus')
   const messagesEndRef = useRef(null)
-  const streamingRef = useRef(null)
 
   // 可用的模型列表
   const availableModels = [
-    { value: 'gpt-3.5-turbo', label: 'GPT-3.5 Turbo (快速)' },
-    { value: 'gpt-4', label: 'GPT-4 (强大)' },
-    { value: 'gpt-4-turbo', label: 'GPT-4 Turbo (平衡)' },
-    { value: 'gpt-4o', label: 'GPT-4o (最新)' },
-    { value: 'gpt-4o-mini', label: 'GPT-4o Mini (经济)' },
+    { value: 'qwen-plus', label: 'Qwen Plus (默认)' },
+    { value: 'qwen-turbo', label: 'Qwen Turbo (快速)' },
+    { value: 'qwen-max', label: 'Qwen Max (强推理)' },
+    { value: 'qwen-long', label: 'Qwen Long (长上下文)' },
   ]
 
   const currentSession = sessions.find(s => s.id === currentSessionId)
@@ -76,7 +74,7 @@ const Chat = () => {
       }
     }
     fetchKnowledgeBases()
-  }, [])
+  }, [selectedKbId])
 
   // 保存会话到 localStorage
   useEffect(() => {
@@ -224,9 +222,13 @@ const Chat = () => {
       const decoder = new TextDecoder()
       let fullResponse = ''
 
-      while (true) {
+      let streamDone = false
+      while (!streamDone) {
         const { done, value } = await reader.read()
-        if (done) break
+        if (done) {
+          streamDone = true
+          continue
+        }
 
         const chunk = decoder.decode(value, { stream: true })
         fullResponse += chunk
@@ -260,15 +262,6 @@ const Chat = () => {
       setStreamingContent('')
     }
   }
-
-  // 清理流式输出定时器
-  useEffect(() => {
-    return () => {
-      if (streamingRef.current) {
-        clearInterval(streamingRef.current)
-      }
-    }
-  }, [])
 
   // 回车发送
   const handleKeyPress = (e) => {

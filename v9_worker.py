@@ -33,6 +33,7 @@ QUEUE_DB = PROJECT_ROOT / "data" / "review_queue_v9.db"
 WORK_DIR = PROJECT_ROOT / "data" / "v9_web_work"      # 段落模型 / 工作副本 docx
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 DEMO_SKIP_RETRIEVAL = os.getenv("V9_DEMO_SKIP_RETRIEVAL", "0") == "1"
+DISABLE_ESCALATION_LOOP = os.getenv("V9_DISABLE_ESCALATION_LOOP", "0") == "1"
 
 
 def _load_env_fallback():
@@ -59,6 +60,13 @@ POLL_INTERVAL = 1.5
 
 def log(msg: str):
     print(f"[worker] {msg}", flush=True)
+
+
+def _timings_json(timings: Dict[str, float]) -> str:
+    return json.dumps(
+        {key: round(float(value), 2) for key, value in timings.items()},
+        ensure_ascii=False,
+    )
 
 
 class V9Worker:
@@ -97,18 +105,39 @@ class V9Worker:
         import win32com.client
         pythoncom.CoInitialize()
         word = None
+        doc = None
         try:
-            word = win32com.client.Dispatch("Word.Application")
+            word = win32com.client.DispatchEx("Word.Application")
             word.Visible = False
             word.DisplayAlerts = 0
-            doc = word.Documents.Open(str(p.resolve()))
-            doc.SaveAs2(str(out.resolve()), FileFormat=16)  # 16 = wdFormatXMLDocument(.docx)
-            doc.Close(False)
+            doc = word.Documents.Open(str(p.resolve()), ReadOnly=True, AddToRecentFiles=False)
+            try:
+                doc.SaveAs2(str(out.resolve()), FileFormat=16)  # 16 = wdFormatXMLDocument(.docx)
+            except Exception as exc:
+                if out.exists() and out.stat().st_size > 0:
+                    log(f"Word SaveAs2 返回异常但 .docx 已生成，继续处理: {exc}")
+                else:
+                    raise RuntimeError(
+                        f"Word COM 转换 .doc 失败，请先手动另存为 .docx 后再上传：{exc}"
+                    ) from exc
+            if not out.exists() or out.stat().st_size == 0:
+                raise RuntimeError("Word COM 转换 .doc 失败：未生成有效 .docx 文件")
             return str(out)
         finally:
+            if doc is not None:
+                try:
+                    doc.Close(False)
+                except Exception as exc:
+                    log(f"Word 文档关闭失败（已忽略）: {exc}")
             if word is not None:
-                word.Quit()
-            pythoncom.CoUninitialize()
+                try:
+                    word.Quit()
+                except Exception as exc:
+                    log(f"Word 退出失败（已忽略）: {exc}")
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
 
     def _working_docx(self, job_id: str, original: str) -> Path:
         """每个任务一份可被主智能体改写的工作副本。"""
@@ -134,11 +163,23 @@ class V9Worker:
         docx_path = job["docx_path"]
         mine_type = job.get("mine_type", "non_outburst")
         log(f"开始审查任务 {job_id}: {job['doc_name']}")
+        timings: Dict[str, float] = {}
+        job_started = time.perf_counter()
         try:
+            parse_started = time.perf_counter()
+            self.queue.update_job(
+                job_id,
+                agent_stage="parsing",
+                phase_done=0,
+                phase_total=0,
+                agent_status="正在解析文档并生成待审块…",
+                timings=_timings_json(timings),
+            )
             docx_path = self._ensure_docx(docx_path)   # .doc → .docx 自动转换
             if docx_path != job["docx_path"]:
                 self.queue.update_job(job_id, docx_path=docx_path)
             parsed, chunks = docx_adapter.adapt(docx_path)
+            timings["parse"] = time.perf_counter() - parse_started
             if self._stop_if_cancelled(job_id, "文档解析后"):
                 return
             para_path = self._save_paragraphs(job_id, parsed)
@@ -147,40 +188,148 @@ class V9Worker:
                 return
             self.queue.update_job(job_id, status="reviewing", n_chunks=len(chunks),
                                   paragraphs_path=para_path, progress=2,
-                                  agent_status="主智能体已派发审查子任务，三链并行审查中")
+                                  n_done=0, phase_done=0, phase_total=len(chunks),
+                                  agent_stage="retrieval_rerank",
+                                  agent_status="文档解析完成，准备法规召回与重排…",
+                                  timings=_timings_json(timings))
 
             engine = self.engine
             engine.mine_type = mine_type  # 适用性过滤按本任务矿井类型
             if DEMO_SKIP_RETRIEVAL:
+                retrieval_started = time.perf_counter()
                 self.queue.update_job(
                     job_id, progress=3,
+                    agent_stage="retrieval_rerank",
+                    phase_done=0,
+                    phase_total=len(chunks),
                     agent_status=f"已命中本地向量缓存（共 {len(chunks)} 段），正在法规召回…",
+                    timings=_timings_json(timings),
                 )
                 kb_results_all, q_dense = engine.prepare_dense_retrieval(chunks)
+                timings["retrieval_rerank"] = time.perf_counter() - retrieval_started
                 if self._stop_if_cancelled(job_id, "法规召回后"):
                     return
                 self.queue.update_job(
                     job_id, progress=15,
+                    agent_stage="reviewing",
+                    phase_done=0,
+                    phase_total=len(chunks),
                     agent_status="主智能体已派发审查子任务，逐块合规/错别字/数值核验中",
+                    timings=_timings_json(timings),
                 )
             else:
                 encoding_cache_hit = engine.has_pending_encoding_cache(chunks)
+                vector_started = None
                 if encoding_cache_hit:
                     encoding_status = f"已命中本地向量缓存（共 {len(chunks)} 段），正在法规召回与重排…"
+                    stage = "retrieval_rerank"
                 else:
                     encoding_status = f"BGE-M3 首次编码中（共 {len(chunks)} 段），完成后将保存本地缓存…"
-                self.queue.update_job(job_id, progress=3, agent_status=encoding_status)
-                kb_results_all, q_dense = engine.prepare_retrieval(chunks)
+                    stage = "vectorizing"
+                    vector_started = time.perf_counter()
+                self.queue.update_job(
+                    job_id,
+                    progress=3,
+                    n_done=0,
+                    agent_stage=stage,
+                    phase_done=0,
+                    phase_total=len(chunks),
+                    agent_status=encoding_status,
+                    timings=_timings_json(timings),
+                )
+                last_encoding_chunk_done = -1
+
+                def _encoding_progress(done: int, total: int) -> None:
+                    nonlocal last_encoding_chunk_done
+                    if total <= 0:
+                        return
+                    chunk_done = min(len(chunks), int(done / total * len(chunks)))
+                    if chunk_done == last_encoding_chunk_done and done < total:
+                        return
+                    last_encoding_chunk_done = chunk_done
+                    percent = 3 + int(done / total * 10)
+                    self.queue.update_job(
+                        job_id,
+                        progress=percent,
+                        n_done=0,
+                        n_chunks=len(chunks),
+                        agent_stage="vectorizing",
+                        phase_done=chunk_done,
+                        phase_total=len(chunks),
+                        agent_status=(
+                            f"BGE-M3 向量化中：已编码 {chunk_done}/{len(chunks)} 段"
+                            if done < total else
+                            f"BGE-M3 向量化完成（{len(chunks)}/{len(chunks)} 段），正在法规召回与重排…"
+                        ),
+                        timings=_timings_json(timings),
+                    )
+
+                retrieval_started = None
+                last_retrieval_done = -1
+
+                def _retrieval_progress(done: int, total: int) -> None:
+                    nonlocal last_retrieval_done, retrieval_started
+                    if total <= 0:
+                        return
+                    if done <= 0:
+                        retrieval_started = time.perf_counter()
+                        if vector_started is not None:
+                            timings["vectorize"] = retrieval_started - vector_started
+                        self.queue.update_job(
+                            job_id,
+                            progress=13,
+                            n_done=0,
+                            n_chunks=len(chunks),
+                            agent_stage="retrieval_rerank",
+                            phase_done=0,
+                            phase_total=total,
+                            agent_status=f"BGE-M3 向量化完成，开始法规召回与重排（共 {total} 段）",
+                            timings=_timings_json(timings),
+                        )
+                        return
+                    if done == last_retrieval_done and done < total:
+                        return
+                    last_retrieval_done = done
+                    self.queue.update_job(
+                        job_id,
+                        progress=min(15, 13 + int(done / total * 2)),
+                        n_done=0,
+                        n_chunks=len(chunks),
+                        agent_stage="retrieval_rerank",
+                        phase_done=done,
+                        phase_total=total,
+                        agent_status=f"BGE-M3 向量化完成，法规召回与重排中：{done}/{total} 段",
+                        timings=_timings_json(timings),
+                    )
+
+                kb_results_all, q_dense = engine.prepare_retrieval(
+                    chunks,
+                    encoding_progress_cb=None if encoding_cache_hit else _encoding_progress,
+                    retrieval_progress_cb=_retrieval_progress,
+                )
+                if retrieval_started is None:
+                    retrieval_started = time.perf_counter()
+                    if vector_started is not None:
+                        timings["vectorize"] = retrieval_started - vector_started
+                timings["retrieval_rerank"] = time.perf_counter() - retrieval_started
+                log(f"任务 {job_id} Phase A 完成: "
+                    f"向量化 {timings.get('vectorize', 0.0):.1f}s, "
+                    f"检索重排 {timings.get('retrieval_rerank', 0.0):.1f}s")
                 if self._stop_if_cancelled(job_id, "法规召回与重排后"):
                     return
                 self.queue.update_job(
-                    job_id, progress=15,
+                    job_id, progress=15, n_done=0, n_chunks=len(chunks),
+                    agent_stage="reviewing",
+                    phase_done=0,
+                    phase_total=len(chunks),
                     agent_status=("已复用本地向量缓存，逐块合规/错别字/数值核验中"
                                   if encoding_cache_hit else
                                   "向量编码与检索完成，逐块合规/错别字/数值核验中"),
+                    timings=_timings_json(timings),
                 )
 
             n_issues = 0
+            review_started = time.perf_counter()
             for i, chunk in enumerate(chunks):
                 if self._stop_if_cancelled(job_id, f"chunk#{i + 1} 前"):
                     return
@@ -192,16 +341,38 @@ class V9Worker:
                 if self._stop_if_cancelled(job_id, f"chunk#{i + 1} 后"):
                     return
                 progress = 15 + int((i + 1) / max(1, len(chunks)) * 80)
-                self.queue.update_job(job_id, progress=progress, n_done=i + 1)
+                timings["review"] = time.perf_counter() - review_started
+                self.queue.update_job(
+                    job_id,
+                    progress=progress,
+                    n_done=i + 1,
+                    n_chunks=len(chunks),
+                    agent_stage="reviewing",
+                    phase_done=i + 1,
+                    phase_total=len(chunks),
+                    agent_status=f"合规/错别字/数值核验中：已审查 {i + 1}/{len(chunks)} 段",
+                    timings=_timings_json(timings),
+                )
 
             # 文档级重复性（一次性，复用 Phase A 向量）
             try:
+                repetition_started = time.perf_counter()
                 if DEMO_SKIP_RETRIEVAL or q_dense is None:
                     log("Demo 快速模式：跳过文档级重复性检查")
                     raise RuntimeError("Demo 快速模式跳过重复性检查")
                 if self._stop_if_cancelled(job_id, "重复性检查前"):
                     return
+                self.queue.update_job(
+                    job_id,
+                    progress=96,
+                    agent_stage="repetition",
+                    phase_done=0,
+                    phase_total=len(chunks),
+                    agent_status="正在做文档级重复性检查…",
+                    timings=_timings_json(timings),
+                )
                 rep_by_chunk, _ = engine.check_document_repetition(job["doc_name"], chunks, q_dense)
+                timings["repetition"] = time.perf_counter() - repetition_started
                 if self._stop_if_cancelled(job_id, "重复性检查后"):
                     return
                 for ci, rep in rep_by_chunk.items():
@@ -221,9 +392,19 @@ class V9Worker:
                 log(f"重复性检查异常（忽略）: {exc}")
 
             if not self._is_cancelled(job_id):
+                timings["total"] = time.perf_counter() - job_started
                 self.queue.update_job(job_id, status="done", progress=100,
+                                      agent_stage="done",
+                                      phase_done=len(chunks),
+                                      phase_total=len(chunks),
+                                      timings=_timings_json(timings),
                                       agent_status=f"审查完成，共发现 {n_issues} 处问题，等待人工裁决")
-            log(f"任务 {job_id} 完成，问题 {n_issues} 条")
+            log(f"任务 {job_id} 完成，问题 {n_issues} 条，耗时: "
+                f"解析 {timings.get('parse', 0.0):.1f}s / "
+                f"向量化 {timings.get('vectorize', 0.0):.1f}s / "
+                f"检索重排 {timings.get('retrieval_rerank', 0.0):.1f}s / "
+                f"审查 {timings.get('review', 0.0):.1f}s / "
+                f"总计 {timings.get('total', 0.0):.1f}s")
         except Exception as exc:
             if self._is_cancelled(job_id):
                 log(f"任务 {job_id} 已取消，忽略异常: {exc}")
@@ -231,6 +412,8 @@ class V9Worker:
             import traceback
             traceback.print_exc()
             self.queue.update_job(job_id, status="failed", error=str(exc)[:500],
+                                  agent_stage="failed",
+                                  timings=_timings_json(timings),
                                   agent_status=f"审查失败: {str(exc)[:80]}")
 
     def _review_one_chunk(self, job_id: str, doc_name: str, idx: int, chunk: Dict,
@@ -415,8 +598,18 @@ class V9Worker:
         """持续调用主智能体处理审查链写入的升级队列。"""
         from main_agent_v9 import MainAgent
         agent = MainAgent()
+        dead_logged = False
         while True:
             try:
+                queue_stats = self.queue.stats()
+                pending_total = sum(queue_stats.get("pending_by_type", {}).values())
+                if pending_total <= 0:
+                    if queue_stats.get("dead") and not dead_logged:
+                        log(f"升级队列暂无待处理项；dead-letter {queue_stats['dead']} 项需人工处理")
+                        dead_logged = True
+                    time.sleep(POLL_INTERVAL * 2)
+                    continue
+                dead_logged = False
                 stats = agent.process_queue(max_items=1)
                 if not stats.get("resolved") and not stats.get("failed"):
                     time.sleep(POLL_INTERVAL * 2)
@@ -428,8 +621,11 @@ class V9Worker:
         import traceback
         # 反馈处理放独立守护线程：审查长任务进行中也能实时改 Word
         threading.Thread(target=self._feedback_loop, daemon=True).start()
-        threading.Thread(target=self._escalation_loop, daemon=True).start()
-        log("反馈处理与主智能体升级队列线程已启动")
+        if DISABLE_ESCALATION_LOOP:
+            log("反馈处理线程已启动；主智能体升级队列线程已关闭（V9_DISABLE_ESCALATION_LOOP=1）")
+        else:
+            threading.Thread(target=self._escalation_loop, daemon=True).start()
+            log("反馈处理与主智能体升级队列线程已启动")
         while True:
             try:
                 job = self.queue.fetch_pending_job()

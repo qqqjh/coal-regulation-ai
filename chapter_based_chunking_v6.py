@@ -1275,19 +1275,25 @@ def generate_visualization(all_results: Dict[str, List[Dict]], output_dir: Path)
     print(f'[OK] 稳定 JSON: {latest_path}')
 
 
-def main():
-    print('=' * 70)
-    print('煤矿法规知识库 - 优化版章节分块工具 v6')
-    print('=' * 70)
+def chunk_rule_json_files_v6(
+    json_files: Optional[List[Path]] = None,
+    *,
+    json_dir: Path = Path('new_docs/rule_docs_json'),
+    output_dir: Path = Path('chunks_visualization'),
+) -> Dict[str, List[Dict]]:
+    """处理 MinerU 规则 JSON，生成 v6 chunks 与 latest 文件。
 
-    json_dir = Path('new_docs/rule_docs_json')
-    output_dir = Path('chunks_visualization')
+    json_files 为空时处理 json_dir 下全部 MinerU_*.json；传入列表时仅处理
+    指定文件。返回结构与 chunks_v6_latest.json 一致：{doc_name: chunks}。
+    """
+    if json_files is None:
+        json_files = list(json_dir.glob('MinerU_*.json'))
+    else:
+        json_files = [Path(p) for p in json_files]
 
-    json_files = list(json_dir.glob('MinerU_*.json'))
     print(f'\n找到 {len(json_files)} 个 MinerU JSON 文件')
 
     all_results: Dict[str, List[Dict]] = {}
-
     for json_file in json_files:
         chunker = ImprovedChunkerV6(str(json_file))
         chunks = chunker.process()
@@ -1297,6 +1303,19 @@ def main():
     print('\n' + '=' * 70)
     print('生成可视化报告...')
     generate_visualization(all_results, output_dir)
+
+    return all_results
+
+
+def main():
+    print('=' * 70)
+    print('煤矿法规知识库 - 优化版章节分块工具 v6')
+    print('=' * 70)
+
+    json_dir = Path('new_docs/rule_docs_json')
+    output_dir = Path('chunks_visualization')
+
+    all_results = chunk_rule_json_files_v6(json_dir=json_dir, output_dir=output_dir)
 
     total_tables = sum(
         sum(1 for c in chunks if '【表格】' in c['content'])

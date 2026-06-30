@@ -39,7 +39,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from openai import OpenAI
@@ -312,20 +312,50 @@ class LocalBGERetriever:
 
     def encode_corpus_cached(self, texts: List[str], cache_key: str,
                              cache_dir: Path = KB_CACHE_DIR,
-                             cache_label: str = "KB") -> Tuple[np.ndarray, List[Dict[str, float]]]:
+                             cache_label: str = "KB",
+                             progress_cb: Optional[Callable[[int, int], None]] = None
+                             ) -> Tuple[np.ndarray, List[Dict[str, float]]]:
         """按内容哈希缓存 dense+sparse 编码，可用于知识库与待审文档。"""
         cache_dir.mkdir(parents=True, exist_ok=True)
         dense_path = cache_dir / f"{cache_key}_dense.npy"
         lex_path = cache_dir / f"{cache_key}_lex.pkl"
+        total = len(texts)
         if dense_path.exists() and lex_path.exists():
             dense = np.load(dense_path)
             with lex_path.open("rb") as handle:
                 lexical = pickle.load(handle)
-            if dense.shape[0] == len(texts) and len(lexical) == len(texts):
+            if dense.shape[0] == total and len(lexical) == total:
                 print(f"  命中{cache_label}编码缓存: {dense_path.name} ({dense.shape[0]}条)")
+                if progress_cb:
+                    progress_cb(total, total)
                 return dense, lexical
-        print(f"  编码{cache_label} {len(texts)} 条（首次较慢，结果将缓存）...")
-        dense, lexical = self.encode(texts)
+        print(f"  编码{cache_label} {total} 条（首次较慢，结果将缓存）...")
+        if not texts:
+            dense = np.empty((0, 0), dtype=np.float32)
+            lexical = []
+        elif progress_cb:
+            dense_batches = []
+            lexical = []
+            done = 0
+            self._ensure_models()
+            batch_size = max(1, self.batch_size)
+            for start in range(0, total, batch_size):
+                batch = texts[start:start + batch_size]
+                encoded = self._embedder.encode(
+                    batch,
+                    batch_size=batch_size,
+                    max_length=self.max_length,
+                    return_dense=True,
+                    return_sparse=True,
+                    return_colbert_vecs=False,
+                )
+                dense_batches.append(np.asarray(encoded["dense_vecs"], dtype=np.float32))
+                lexical.extend(encoded["lexical_weights"])
+                done += len(batch)
+                progress_cb(done, total)
+            dense = np.vstack(dense_batches).astype(np.float32)
+        else:
+            dense, lexical = self.encode(texts)
         np.save(dense_path, dense)
         with lex_path.open("wb") as handle:
             pickle.dump(lexical, handle)
@@ -537,18 +567,24 @@ class HybridRAGReviewerV9:
         return ((PENDING_CACHE_DIR / f"{cache_key}_dense.npy").exists()
                 and (PENDING_CACHE_DIR / f"{cache_key}_lex.pkl").exists())
 
-    def prepare_retrieval(self, chunks: List[Dict]) -> Tuple[List[List[Dict]], np.ndarray]:
+    def prepare_retrieval(self, chunks: List[Dict],
+                          encoding_progress_cb: Optional[Callable[[int, int], None]] = None,
+                          retrieval_progress_cb: Optional[Callable[[int, int], None]] = None
+                          ) -> Tuple[List[List[Dict]], np.ndarray]:
         """批量编码并多查询检索；相同内容再次上传时复用 dense+sparse 编码缓存。"""
         texts, segments_per_chunk, flat, seg_slices, cache_key = self._pending_encoding_inputs(chunks)
         n_segments = len(flat) - len(texts)
         print(f"  [Phase A] 准备 {len(texts)} 个chunk + {n_segments} 个检索片段...")
         all_dense, all_lex = self.retriever.encode_corpus_cached(
-            flat, cache_key, cache_dir=PENDING_CACHE_DIR, cache_label="待审文档"
+            flat, cache_key, cache_dir=PENDING_CACHE_DIR, cache_label="待审文档",
+            progress_cb=encoding_progress_cb,
         )
         q_dense = all_dense[:len(texts)]
 
         kb_results_all: List[List[Dict]] = []
         retrieve_start = time.time()
+        if retrieval_progress_cb:
+            retrieval_progress_cb(0, len(chunks))
         for i in range(len(chunks)):
             lo, hi = seg_slices[i]
             kb_results_all.append(self.search_chunk_multi(
@@ -557,6 +593,8 @@ class HybridRAGReviewerV9:
             ))
             if (i + 1) % 20 == 0:
                 print(f"    检索+重排 {i + 1}/{len(chunks)}")
+            if retrieval_progress_cb:
+                retrieval_progress_cb(i + 1, len(chunks))
         print(f"  [Phase A] 多查询检索完成，耗时 {time.time() - retrieve_start:.1f}s")
         return kb_results_all, q_dense
 

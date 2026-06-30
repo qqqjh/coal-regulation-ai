@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple
 from datetime import datetime
 
+from pending_chunk_packing_v9 import pack_pending_chunks_v9
+
 
 # 目标大小：打包结构单元时尽量靠近 1000 字，但不强行按固定长度切。
 TARGET_CHUNK_SIZE = 1000
@@ -917,23 +919,16 @@ class PendingDocChunkerV9:
         # 合并过小的chunk（纯标题）
         small_chunks = [c for c in chunks if c['char_count'] < TINY_CHUNK_SIZE]
         print(f"过小chunk (<{TINY_CHUNK_SIZE}字符): {len(small_chunks)} 个")
-        chunks = self.merge_small_chunks(chunks)
-        print(f"合并后: {len(chunks)} 个")
 
         # 统计大 chunk
         large_chunks = [c for c in chunks if c['char_count'] > MAX_CHUNK_SIZE]
         print(f"大chunk (>{MAX_CHUNK_SIZE}字符): {len(large_chunks)} 个")
 
-        # 结构优先二次切分
-        final_chunks = []
-        split_count = 0
-        for chunk in chunks:
-            sub_chunks = self.split_structured_chunk(chunk)
-            if len(sub_chunks) > 1:
-                split_count += 1
-            final_chunks.extend(sub_chunks)
+        # 小块合并 + 结构优先二次切分：复用通用 packing 规则，保持 docx/MinerU 两条链路一致。
+        final_chunks = pack_pending_chunks_v9(chunks)
+        split_count = sum(1 for c in final_chunks if c.get('is_sub_chunk'))
 
-        print(f"结构化二次切分: {split_count} 个chunk被拆分")
+        print(f"结构化二次切分: {split_count} 个子chunk")
         print(f"最终chunks: {len(final_chunks)} 个")
 
         sizes = [c['char_count'] for c in final_chunks]

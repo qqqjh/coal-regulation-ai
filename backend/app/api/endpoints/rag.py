@@ -12,6 +12,11 @@ from app.core.config import settings
 import time
 
 router = APIRouter()
+QWEN_MODELS = {"qwen-plus", "qwen-turbo", "qwen-max", "qwen-long"}
+
+
+def _normalize_qwen_model(model: str = None) -> str:
+    return model if model in QWEN_MODELS else "qwen-plus"
 
 # 请求模型
 class RetrieveRequest(BaseModel):
@@ -23,7 +28,7 @@ class RetrieveRequest(BaseModel):
 class GenerateRequest(BaseModel):
     query: str
     kb_id: int
-    model: str = "gpt-3.5-turbo"
+    model: str = "qwen-plus"
     temperature: float = 0.7
     top_k: int = 5
 
@@ -45,7 +50,7 @@ async def test_rag(
         llm = ChatOpenAI(
             api_key=settings.OPENAI_API_KEY,
             base_url=settings.OPENAI_BASE_URL,
-            model=config.model_name,
+            model=_normalize_qwen_model(config.model_name),
             temperature=config.temperature
         )
 
@@ -105,12 +110,12 @@ async def get_config(
         # 返回默认配置
         return RAGConfigSchema()
 
-    return {
-        "retrieval_k": config.retrieval_k,
-        "temperature": config.temperature,
-        "similarity_threshold": config.similarity_threshold,
-        "model_name": config.model_name
-    }
+        return {
+            "retrieval_k": config.retrieval_k,
+            "temperature": config.temperature,
+            "similarity_threshold": config.similarity_threshold,
+            "model_name": _normalize_qwen_model(config.model_name)
+        }
 
 @router.post("/config")
 async def save_config(
@@ -132,7 +137,7 @@ async def save_config(
         existing_config.retrieval_k = config.retrieval_k
         existing_config.temperature = config.temperature
         existing_config.similarity_threshold = config.similarity_threshold
-        existing_config.model_name = config.model_name
+        existing_config.model_name = _normalize_qwen_model(config.model_name)
         existing_config.retrieval_method = config.retrieval_method if hasattr(config, 'retrieval_method') else "similarity"
     else:
         # 创建新配置
@@ -141,7 +146,7 @@ async def save_config(
             retrieval_k=config.retrieval_k,
             temperature=config.temperature,
             similarity_threshold=config.similarity_threshold,
-            model_name=config.model_name,
+            model_name=_normalize_qwen_model(config.model_name),
             retrieval_method="similarity",
             is_active=True
         )
@@ -149,6 +154,7 @@ async def save_config(
 
     await db.commit()
 
+    config.model_name = _normalize_qwen_model(config.model_name)
     return {"status": "success", "config": config}
 
 @router.post("/retrieve")
@@ -231,7 +237,7 @@ async def generate_answer(
         llm = ChatOpenAI(
             api_key=settings.OPENAI_API_KEY,
             base_url=settings.OPENAI_BASE_URL,
-            model=request.model,
+            model=_normalize_qwen_model(request.model),
             temperature=request.temperature
         )
 
@@ -260,7 +266,7 @@ async def generate_answer(
             "query": request.query,
             "answer": response.content,
             "retrieved_count": len(docs),
-            "model": request.model,
+            "model": _normalize_qwen_model(request.model),
             "temperature": request.temperature
         }
 

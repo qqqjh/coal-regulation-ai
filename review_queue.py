@@ -76,6 +76,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     progress INTEGER NOT NULL DEFAULT 0,
     n_chunks INTEGER DEFAULT 0,
     n_done INTEGER DEFAULT 0,
+    agent_stage TEXT,              -- parsing/vectorizing/retrieval_rerank/reviewing/repetition/done
+    phase_done INTEGER DEFAULT 0,
+    phase_total INTEGER DEFAULT 0,
+    timings TEXT,                  -- JSON: 各阶段耗时秒数
     agent_status TEXT,             -- 主智能体当前状态文本（前端顶部展示）
     error TEXT
 );
@@ -124,7 +128,21 @@ class ReviewQueue:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(_SCHEMA)
+            self._ensure_job_columns()
             self._conn.commit()
+
+    def _ensure_job_columns(self):
+        rows = self._conn.execute("PRAGMA table_info(jobs)").fetchall()
+        existing = {row["name"] for row in rows}
+        additions = {
+            "agent_stage": "TEXT",
+            "phase_done": "INTEGER DEFAULT 0",
+            "phase_total": "INTEGER DEFAULT 0",
+            "timings": "TEXT",
+        }
+        for name, ddl in additions.items():
+            if name not in existing:
+                self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {ddl}")
 
     def close(self):
         with self._lock:

@@ -20,6 +20,8 @@ from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
+from pending_chunk_packing_v9 import pack_pending_chunks_v9
+
 # 章/节/条/编号标题检测（用于切块边界）
 _HEADING_PATTERNS = [
     re.compile(r"^\s*第[一二三四五六七八九十百零\d]{1,4}章"),
@@ -29,9 +31,8 @@ _HEADING_PATTERNS = [
 ]
 _CHAPTER_RE = re.compile(r"^\s*第[一二三四五六七八九十百零\d]{1,4}章")
 _SECTION_RE = re.compile(r"^\s*(第[一二三四五六七八九十百零\d]{1,4}节|[一二三四五六七八九十]{1,3}、)")
-
-CHUNK_MAX_CHARS = 700      # 超过即在下一个段落边界切块
-CHUNK_MIN_CHARS = 1        # 段落最短（更短的空段仍保留为 block，但不单独成块）
+_FORMAL_SECTION_RE = re.compile(r"^\s*第[一二三四五六七八九十百零\d]{1,4}节")
+_ARTICLE_RE = re.compile(r"^\s*第[一二三四五六七八九十百零\d]{1,5}条")
 
 
 def iter_block_items(document: _DocxDocument):
@@ -54,6 +55,10 @@ def _table_to_rows(table: Table) -> List[List[str]]:
 
 def _is_heading(text: str) -> bool:
     return any(p.match(text) for p in _HEADING_PATTERNS)
+
+
+def _is_structural_heading(text: str) -> bool:
+    return bool(_CHAPTER_RE.match(text) or _FORMAL_SECTION_RE.match(text) or _ARTICLE_RE.match(text))
 
 
 def parse_docx(path: str | Path) -> Dict[str, Any]:
@@ -100,33 +105,41 @@ def parse_docx(path: str | Path) -> Dict[str, Any]:
 def build_chunks(parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
     """段落模型 → v9 审查块。每块带 source_blocks（段落索引列表）。
 
-    切块规则（与 chapter_based 思路一致但更轻，保证段落索引精确）：
-      - 遇标题（章/节/条/编号）或累计长度超阈值 → 切新块
-      - 表格单独成块（oversized_table_chunk 风格）
-      - 跟踪当前 chapter / section 写入块元数据
+    当前只在 Word block 层生成初始结构块，然后复用 pending_doc_chunking_v9
+    抽出的通用 packing 规则：
+      - 遇章/节/条标题 → 切出初始块
+      - 表格单独成块并保留完整
+      - 每个初始块携带 source_units，二次切分后仍能保留 source_blocks
+      - 公共 packing 负责小标题合并、多级编号切分、相邻单元打包和超长兜底
     """
     blocks = parsed["blocks"]
-    chunks: List[Dict[str, Any]] = []
+    initial_chunks: List[Dict[str, Any]] = []
     cur_chapter = ""
     cur_section = ""
+    cur_article = ""
 
     buf_texts: List[str] = []
     buf_indices: List[int] = []
+    buf_units: List[Dict[str, Any]] = []
 
     def flush():
-        nonlocal buf_texts, buf_indices
+        nonlocal buf_texts, buf_indices, buf_units
         content = "\n".join(t for t in buf_texts if t.strip()).strip()
         if content:
-            chunks.append({
+            initial_chunks.append({
                 "content": content,
                 "chapter": cur_chapter,
                 "section": cur_section,
+                "article": cur_article,
                 "page_range": "",
                 "chunk_level": "paragraph",
+                "char_count": len(content),
                 "source_blocks": list(buf_indices),
+                "source_units": list(buf_units),
             })
         buf_texts = []
         buf_indices = []
+        buf_units = []
 
     for block in blocks:
         idx = block["block_index"]
@@ -134,14 +147,18 @@ def build_chunks(parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
 
         if block["kind"] == "table":
             flush()
-            chunks.append({
-                "content": f"【表格】\n{text}",
+            content = f"【表格】\n{text}".strip()
+            initial_chunks.append({
+                "content": content,
                 "chapter": cur_chapter,
                 "section": cur_section,
+                "article": cur_article,
                 "page_range": "",
                 "chunk_level": "table",
+                "char_count": len(content),
                 "oversized_table_chunk": True,
                 "source_blocks": [idx],
+                "source_units": [{"text": content, "source_blocks": [idx], "kind": "table"}],
             })
             continue
 
@@ -149,24 +166,25 @@ def build_chunks(parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
             buf_indices.append(idx)  # 空段也归属当前块，保留索引连续性
             continue
 
+        if _is_structural_heading(text) and buf_texts:
+            flush()
+
         if _CHAPTER_RE.match(text):
             cur_chapter = text.strip()
             cur_section = ""
+            cur_article = ""
         elif _SECTION_RE.match(text):
             cur_section = text.strip()
-
-        # 标题或超长 → 先切再起新块
-        if _is_heading(text) and buf_texts:
-            flush()
+            cur_article = ""
+        elif _ARTICLE_RE.match(text):
+            cur_article = text.strip()
 
         buf_texts.append(text)
         buf_indices.append(idx)
-
-        if sum(len(t) for t in buf_texts) >= CHUNK_MAX_CHARS:
-            flush()
+        buf_units.append({"text": text, "source_blocks": [idx], "kind": block["kind"]})
 
     flush()
-    return chunks
+    return pack_pending_chunks_v9(initial_chunks)
 
 
 def adapt(path: str | Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:

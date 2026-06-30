@@ -217,8 +217,9 @@ async def upload_document(
         # 获取文件大小并更新文档记录
         file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
         doc.file_size = file_size
-        doc.status = "indexed" if result_msg == "Success" else "failed"
-        doc.indexed_time = datetime.utcnow() if result_msg == "Success" else None
+        success = str(result_msg).startswith("Success")
+        doc.status = "indexed" if success else "failed"
+        doc.indexed_time = datetime.utcnow() if success else None
         await db.commit()
         await db.refresh(doc)
 
@@ -440,27 +441,39 @@ async def upload_document_simple(
             await db.commit()
             await db.refresh(kb)
 
-        # 处理文件
+        # 先创建文档记录，确保向量库元数据有 doc_id/kb_id
         file_id = str(uuid.uuid4())
         filename = f"{file_id}_{file.filename}"
-        result_msg = await vector_store_service.process_file(file, filename, original_filename=file.filename)
-
-        # 获取文件大小
         file_path = settings.UPLOAD_DIR / filename
-        file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
-
-        # 创建文档记录
         doc = Document(
             kb_id=kb.id,
             name=file.filename,
             file_path=str(file_path),
             file_type=file.filename.split('.')[-1].lower(),
-            file_size=file_size,
-            status="indexed" if result_msg == "Success" else "failed",
-            upload_time=datetime.utcnow(),
-            indexed_time=datetime.utcnow() if result_msg == "Success" else None
+            file_size=0,
+            status="processing",
+            upload_time=datetime.utcnow()
         )
         db.add(doc)
+        await db.commit()
+        await db.refresh(doc)
+
+        result_msg = await vector_store_service.process_file(
+            file,
+            filename,
+            doc.id,
+            kb.id,
+            original_filename=file.filename,
+        )
+
+        # 获取文件大小
+        file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+
+        # 更新文档记录
+        success = str(result_msg).startswith("Success")
+        doc.file_size = file_size
+        doc.status = "indexed" if success else "failed"
+        doc.indexed_time = datetime.utcnow() if success else None
         await db.commit()
 
         # 记录监控日志

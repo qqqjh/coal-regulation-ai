@@ -1,10 +1,14 @@
 import os
 import shutil
-from typing import List
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
+from langchain.schema import Document as LangChainDocument
 from app.core.config import settings
 
 class VectorStoreService:
@@ -31,7 +35,101 @@ class VectorStoreService:
             )
         return self._collections[collection_name]
 
-    async def process_file(self, file, filename: str, doc_id: int, kb_id: int) -> str:
+    def _ensure_project_root_importable(self) -> None:
+        root = str(settings.PROJECT_ROOT)
+        if root not in sys.path:
+            sys.path.insert(0, root)
+
+    def _add_rule_chunks_to_vector_store(
+        self,
+        chunks_by_doc: Dict[str, List[Dict]],
+        *,
+        filename: str,
+        file_path: Path,
+        doc_id: Optional[int],
+        kb_id: Optional[int],
+        mineru_json_path: str,
+    ) -> int:
+        if kb_id is None:
+            raise ValueError("规则文档向量化需要 kb_id")
+
+        documents: List[LangChainDocument] = []
+        for doc_name, chunks in chunks_by_doc.items():
+            for i, chunk in enumerate(chunks):
+                content = str(chunk.get("retrieval_text") or chunk.get("content") or "").strip()
+                if not content:
+                    continue
+                metadata = {
+                    "doc_id": int(doc_id or 0),
+                    "kb_id": int(kb_id or 0),
+                    "filename": filename,
+                    "doc_name": doc_name,
+                    "chunk_id": i,
+                    "part": chunk.get("part", ""),
+                    "chapter": chunk.get("chapter", ""),
+                    "section": chunk.get("section", ""),
+                    "article": chunk.get("article", ""),
+                    "page_range": chunk.get("page_range", ""),
+                    "chunk_type": chunk.get("chunk_type", chunk.get("chunk_level", "content")),
+                    "semantic_role": chunk.get("semantic_role", ""),
+                    "canonical_rule_id": chunk.get("canonical_rule_id", ""),
+                    "retrievable": bool(chunk.get("retrievable", True)),
+                    "char_count": int(chunk.get("char_count") or len(content)),
+                    "upload_time": str(os.path.getmtime(file_path)),
+                    "mineru_json_path": mineru_json_path,
+                    "chunking_strategy": "mineru_chapter_v6",
+                    "indexed_at": datetime.utcnow().isoformat(),
+                }
+                documents.append(LangChainDocument(page_content=content, metadata=metadata))
+
+        if documents:
+            vector_store = self._get_collection(kb_id)
+            vector_store.add_documents(documents)
+        return len(documents)
+
+    def _process_rule_file_with_mineru(
+        self,
+        file_path: Path,
+        filename: str,
+        doc_id: Optional[int],
+        kb_id: Optional[int],
+    ) -> str:
+        self._ensure_project_root_importable()
+        from mineru_adapter import convert_document_to_mineru_json
+        from chapter_based_chunking_v6 import chunk_rule_json_files_v6
+
+        result = convert_document_to_mineru_json(
+            file_path,
+            doc_kind="rule",
+            api_url=settings.MINERU_API_URL,
+            timeout=7200,
+        )
+        all_rule_chunks = chunk_rule_json_files_v6(
+            json_dir=Path(result.project_json_path).parent,
+            output_dir=settings.PROJECT_ROOT / "chunks_visualization",
+        )
+        doc_name = Path(result.project_json_path).stem.replace("MinerU_", "").split("__")[0]
+        chunks_by_doc = {doc_name: all_rule_chunks.get(doc_name, [])}
+        if not chunks_by_doc[doc_name]:
+            raise ValueError(f"规则文档切分结果为空: {result.project_json_path}")
+        added = self._add_rule_chunks_to_vector_store(
+            chunks_by_doc,
+            filename=filename,
+            file_path=file_path,
+            doc_id=doc_id,
+            kb_id=kb_id,
+            mineru_json_path=result.project_json_path,
+        )
+        return f"Success: MinerU rule chunks indexed ({added})"
+
+    async def process_file(
+        self,
+        file,
+        filename: str,
+        doc_id: Optional[int] = None,
+        kb_id: Optional[int] = None,
+        original_filename: Optional[str] = None,
+    ) -> str:
         """处理文件并存储到向量数据库
 
         Args:
@@ -47,12 +145,10 @@ class VectorStoreService:
 
         # 加载文档
         ext = filename.split('.')[-1].lower()
-        if ext == 'pdf':
-            loader = PyPDFLoader(str(file_path))
-        elif ext == 'txt':
+        if ext in {'pdf', 'docx', 'doc'}:
+            return self._process_rule_file_with_mineru(file_path, filename, doc_id, kb_id)
+        if ext == 'txt':
             loader = TextLoader(str(file_path), encoding='utf-8')
-        elif ext in ['docx', 'doc']:
-            loader = Docx2txtLoader(str(file_path))
         else:
             return "Unsupported file format"
 
@@ -61,12 +157,15 @@ class VectorStoreService:
 
         # 添加元数据 - 使用文档ID作为标识
         for split in splits:
-            split.metadata['doc_id'] = doc_id  # 使用文档ID标识
-            split.metadata['kb_id'] = kb_id   # 添加知识库ID
-            split.metadata['filename'] = filename  # 保存实际文件名
+            split.metadata['doc_id'] = int(doc_id or 0)  # 使用文档ID标识
+            split.metadata['kb_id'] = int(kb_id or 0)   # 添加知识库ID
+            split.metadata['filename'] = original_filename or filename  # 保存实际文件名
             split.metadata['upload_time'] = str(os.path.getmtime(file_path))
+            split.metadata['chunking_strategy'] = "text_recursive"
 
         # 获取该知识库的collection并存入向量数据库
+        if kb_id is None:
+            raise ValueError("文档向量化需要 kb_id")
         vector_store = self._get_collection(kb_id)
         vector_store.add_documents(splits)
         return "Success"

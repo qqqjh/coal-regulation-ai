@@ -225,6 +225,7 @@ export default function Review() {
   // ── 上传 & 任务状态 ───────────────────────────────────────────
   const [dragging,   setDragging]   = useState(false)
   const [uploading,  setUploading]  = useState(false)
+  const [preprocessStage, setPreprocessStage] = useState('')
   const [mineType,   setMineType]   = useState('non_outburst')
   const [jobId,      setJobId]      = useState(null)
   const [jobInfo,    setJobInfo]    = useState(null)
@@ -320,8 +321,15 @@ export default function Review() {
       if (!active) return
       setJobId(task.jobId)
       setDocName(task.docName || statusRes.data.doc_name)
-      setPdfUrl(`${V9}/preview-pdf/${task.jobId}?t=${Date.now()}`)
-      setPdfLoading(true)
+      if (task.pdfReady) {
+        setPdfUrl(`${V9}/preview-pdf/${task.jobId}?t=${Date.now()}`)
+        setPdfLoading(true)
+        setPreviewMode('pdf')
+      } else {
+        setPdfUrl(null)
+        setPdfLoading(false)
+        setPreviewMode('annotated')
+      }
       setPdfError("")
       setJobInfo(statusRes.data)
       setIssues(issuesRes.data.issues || [])
@@ -365,15 +373,9 @@ export default function Review() {
     if (pdfBlobUrl) URL.revokeObjectURL(pdfBlobUrl)
   }, [pdfBlobUrl])
 
-  useEffect(() => {
-    if (jobId && !pdfUrl) {
-      setPdfUrl(`${V9}/preview-pdf/${jobId}?t=${Date.now()}`)
-      setPdfLoading(true)
-      setPdfError("")
-    }
-  }, [jobId, pdfUrl])
   function refreshPdfPreview(force = false) {
     if (!jobId) return
+    setPreviewMode('pdf')
     setPdfError("")
     setPdfLoading(true)
     setPdfPage(1)
@@ -415,20 +417,38 @@ export default function Review() {
     try {
       const fd = new FormData()
       fd.append('file', file)
-      const res = await axios.post(`${V9}/upload?mine_type=${mineType}`, fd)
+      setPreprocessStage('正在预处理文档：保存原件、统一 .docx、准备 PDF 预览')
+      const prepRes = await axios.post(`${V9}/preprocess`, fd, { timeout: 180000 })
+      const prep = prepRes.data
+      if (prep.pdf_error) {
+        message.warning('文档已可审查，但 PDF 预览未准备成功，可先使用文本视图')
+      }
+      setPreprocessStage('预处理完成，正在创建审查任务')
+      const res = await axios.post(`${V9}/start/${prep.preprocess_id}?mine_type=${mineType}`)
+      const pdfReady = !!res.data.preprocess?.pdf_ready
       setJobId(res.data.job_id)
       setDocName(res.data.doc_name)
       localStorage.setItem(activeJobKey, JSON.stringify({
-        jobId: res.data.job_id, docName: res.data.doc_name,
+        jobId: res.data.job_id, docName: res.data.doc_name, pdfReady,
       }))
       setJobInfo({ status: 'pending', progress: 0, n_chunks: 0, n_done: 0 })
       setDocumentBlocks([])
-      setPreviewMode('pdf')
+      setPreviewMode(pdfReady ? 'pdf' : 'annotated')
+      if (pdfReady) {
+        setPdfUrl(`${V9}/preview-pdf/${res.data.job_id}?t=${Date.now()}`)
+        setPdfLoading(true)
+        setPdfError("")
+      } else {
+        setPdfUrl(null)
+        setPdfLoading(false)
+        setPdfError("")
+      }
       connectSSE(res.data.job_id)
-      message.success('文档上传成功，审查任务已创建')
+      message.success(pdfReady ? '预处理完成，审查任务已创建' : '预处理完成，审查任务已创建；PDF 可稍后手动生成')
     } catch (err) {
-      message.error('上传失败：' + (err.response?.data?.detail || err.message))
+      message.error('预处理/上传失败：' + (err.response?.data?.detail || err.message))
     } finally {
+      setPreprocessStage('')
       setUploading(false)
     }
   }
@@ -450,7 +470,8 @@ export default function Review() {
       }
     }
     localStorage.removeItem(activeJobKey)
-    setJobId(null); setJobInfo(null); setDocName(null); setPdfUrl(null); setPdfBlobUrl(null); setPdfLoading(false); setPdfError("")
+    setJobId(null); setJobInfo(null); setDocName(null); setPreprocessStage('')
+    setPdfUrl(null); setPdfBlobUrl(null); setPdfLoading(false); setPdfError("")
     setDocumentBlocks([]); setPreviewMode('pdf')
     setIssues([]); setSelectedId(null)
     setFeedbackMap({}); setCustomText('')
@@ -528,6 +549,39 @@ export default function Review() {
   const isRunning = jobInfo && ['pending', 'parsing', 'reviewing'].includes(jobInfo.status)
   const isDone    = jobInfo?.status === 'done'
   const isFailed  = jobInfo?.status === 'failed'
+  const agentStage = jobInfo?.agent_stage || ''
+  const isVectorizing = agentStage === 'vectorizing'
+  const isRetrievalRerank = agentStage === 'retrieval_rerank'
+  const isReviewingChunks = agentStage === 'reviewing'
+  const phaseDone = Number(jobInfo?.phase_done ?? 0)
+  const phaseTotal = Number(jobInfo?.phase_total ?? jobInfo?.n_chunks ?? 0)
+  const progressDone = (isVectorizing || isRetrievalRerank)
+    ? phaseDone
+    : Number(jobInfo?.n_done ?? 0)
+  const progressTotal = (isVectorizing || isRetrievalRerank)
+    ? phaseTotal
+    : Number(jobInfo?.n_chunks ?? phaseTotal ?? 0)
+  const timingText = useMemo(() => {
+    const timings = jobInfo?.timings || {}
+    const items = [
+      ['parse', '解析'],
+      ['vectorize', '向量化'],
+      ['retrieval_rerank', '检索重排'],
+      ['review', '审查'],
+      ['repetition', '重复性'],
+      ['total', '总计'],
+    ].filter(([key]) => typeof timings[key] === 'number' && timings[key] > 0)
+    return items.map(([key, label]) => `${label} ${timings[key].toFixed(1)}s`).join(' · ')
+  }, [jobInfo?.timings])
+
+  const phaseProgressText = useMemo(() => {
+    if (isDone) return `共发现 ${issues.length} 个问题`
+    if (isVectorizing) return `已向量化 ${progressDone} / ${progressTotal} 段`
+    if (isRetrievalRerank) return `已检索重排 ${progressDone} / ${progressTotal} 段`
+    if (agentStage === 'repetition') return '正在检查文档级重复内容'
+    if (isReviewingChunks) return `已审查 ${progressDone} / ${progressTotal} 段`
+    return `${progressDone} / ${progressTotal} 段`
+  }, [agentStage, isDone, isRetrievalRerank, isReviewingChunks, isVectorizing, issues.length, progressDone, progressTotal])
 
   const countByType = issues.reduce((acc, i) => {
     acc[i.issue_type] = (acc[i.issue_type] || 0) + 1; return acc
@@ -645,7 +699,7 @@ export default function Review() {
             )}
             {isRunning && jobInfo?.n_chunks > 0 && (
               <span className="rv-stats">
-                {jobInfo.n_done}/{jobInfo.n_chunks} 段
+                {progressDone}/{progressTotal} 段
               </span>
             )}
           </>
@@ -671,7 +725,7 @@ export default function Review() {
       {isRunning && jobInfo?.n_chunks > 0 && (
         <div style={{ padding: '0 0 2px 0', background: '#1a1a2e' }}>
           <Progress
-            percent={Math.round((jobInfo.n_done / jobInfo.n_chunks) * 100)}
+            percent={progressTotal > 0 ? Math.round((progressDone / progressTotal) * 100) : 0}
             status="active"
             strokeColor={{ '0%': '#2f54eb', '100%': '#52c41a' }}
             showInfo={false}
@@ -777,11 +831,16 @@ export default function Review() {
                 onClick={() => fileInputRef.current?.click()}
               >
                 {uploading
-                  ? <Spin indicator={<LoadingOutlined style={{ fontSize: 36 }} spin />} />
+                  ? <>
+                    <Spin indicator={<LoadingOutlined style={{ fontSize: 36 }} spin />} />
+                    <div style={{ fontSize: 14, fontWeight: 500, color: '#444', maxWidth: 360, textAlign: 'center' }}>
+                      {preprocessStage || '正在处理文档'}
+                    </div>
+                  </>
                   : <>
                     <CloudUploadOutlined style={{ fontSize: 40, color: '#2f54eb' }} />
                     <div style={{ fontSize: 15, fontWeight: 500, color: '#444' }}>拖拽 Word 文档到此，或点击上传</div>
-                    <div style={{ fontSize: 12, color: '#aaa' }}>.docx / .doc</div>
+                    <div style={{ fontSize: 12, color: '#aaa' }}>.docx / .doc，上传后先预处理再审查</div>
                   </>
                 }
               </div>
@@ -800,7 +859,11 @@ export default function Review() {
                 <Radio.Group
                   size="small"
                   value={previewMode}
-                  onChange={e => setPreviewMode(e.target.value)}
+                  onChange={e => {
+                    const next = e.target.value
+                    setPreviewMode(next)
+                    if (next === 'pdf' && jobId && !pdfUrl && !pdfBlobUrl) refreshPdfPreview(false)
+                  }}
                   className="rv-preview-switch"
                 >
                   <Radio.Button value="pdf">PDF 高亮</Radio.Button>
@@ -808,13 +871,13 @@ export default function Review() {
                 </Radio.Group>
                 {(isRunning || isDone) && (
                   <span className="rv-pdf-progress-text">
-                    {isDone ? `共发现 ${issues.length} 个问题` : `已审 ${jobInfo?.n_done ?? 0} / ${jobInfo?.n_chunks ?? 0} 段`}
+                    {phaseProgressText}
                   </span>
                 )}
               </div>
               {(isRunning || isDone) && (
                 <Progress
-                  percent={isDone ? 100 : (jobInfo?.n_chunks > 0 ? Math.round((jobInfo.n_done / jobInfo.n_chunks) * 100) : 0)}
+                  percent={isDone ? 100 : (progressTotal > 0 ? Math.round((progressDone / progressTotal) * 100) : 0)}
                   status={isFailed ? 'exception' : isDone ? 'success' : 'active'}
                   strokeColor={{ '0%': '#2f54eb', '100%': '#52c41a' }}
                   showInfo={false}
@@ -826,6 +889,9 @@ export default function Review() {
               )}
               {jobInfo?.agent_status && (
                 <div className="rv-pdf-status">{jobInfo.agent_status}</div>
+              )}
+              {timingText && (
+                <div className="rv-pdf-status">耗时：{timingText}</div>
               )}
               <div className="rv-pdf-frame-wrap">
                 {previewMode === 'annotated' ? (
@@ -849,10 +915,10 @@ export default function Review() {
                         <Button size="small" onClick={() => refreshPdfPreview(true)}>重试预览</Button>
                       </div>
                     )}
-                    {!pdfUrl && !pdfError && (
+                    {!pdfUrl && !pdfBlobUrl && !pdfError && (
                       <div className="rv-pdf-loading">
-                        <Spin />
-                        <span>正在准备 PDF 预览...</span>
+                        <span>PDF 预览尚未生成。文本视图可直接使用。</span>
+                        <Button size="small" type="primary" onClick={() => refreshPdfPreview(false)}>生成 PDF 预览</Button>
                       </div>
                     )}
                     {pdfBlobUrl && !pdfError && (
