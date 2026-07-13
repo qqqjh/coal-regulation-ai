@@ -1,9 +1,25 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text, ForeignKey, Boolean
+from sqlalchemy import Column, Integer, String, Float, DateTime, Text, ForeignKey, Boolean, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime
 
 Base = declarative_base()
+
+class AppUser(Base):
+    """系统用户"""
+    __tablename__ = "app_users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    public_id = Column(String(100), unique=True, nullable=False, index=True)
+    username = Column(String(100), unique=True, nullable=False, index=True)
+    display_name = Column(String(100), nullable=False)
+    role = Column(String(50), default="user")
+    password_hash = Column(String(128), nullable=False)
+    password_salt = Column(String(64), nullable=False)
+    avatar = Column(String(500), nullable=True)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 class Session(Base):
     """对话会话"""
@@ -39,11 +55,37 @@ class KnowledgeBase(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
+    owner_user_id = Column(String(100), default="admin", nullable=False, index=True)
+    owner_name = Column(String(100), nullable=True)
+    owner_role = Column(String(50), default="admin")
+    visibility = Column(String(50), default="private")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # 关系
     documents = relationship("Document", back_populates="knowledge_base", cascade="all, delete-orphan")
+
+class ReviewKbUserAccess(Base):
+    """审查知识库权限配置过的用户"""
+    __tablename__ = "review_kb_user_access"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String(100), unique=True, nullable=False, index=True)
+    user_name = Column(String(100), nullable=True)
+    user_role = Column(String(50), default="user")
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class ReviewKbPermission(Base):
+    """用户可用于多智能体审查的规程知识库"""
+    __tablename__ = "review_kb_permissions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "kb_id", name="uq_review_kb_permission_user_kb"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String(100), nullable=False, index=True)
+    kb_id = Column(Integer, ForeignKey("knowledge_bases.id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 class Document(Base):
     """文档"""
@@ -104,7 +146,7 @@ class RAGConfig(Base):
     retrieval_method = Column(String(50), default="similarity")  # similarity, mmr
     retrieval_k = Column(Integer, default=4)
     similarity_threshold = Column(Float, default=0.5)
-    model_name = Column(String(100), default="gpt-3.5-turbo")
+    model_name = Column(String(100), default="qwen-plus")
     temperature = Column(Float, default=0.7)
     max_tokens = Column(Integer, default=2000)
     is_active = Column(Boolean, default=True)

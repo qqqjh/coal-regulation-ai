@@ -306,6 +306,64 @@ QUEUE_SYSTEM_PROMPT = """你是煤矿合规审查系统的主智能体，正在�
 单项调查不超过 5 次工具调用。"""
 
 
+# ============ 策略生成（6.3 评测对象：先规划后执行的策略节点） ============
+
+STRATEGY_TASK_TYPES = [
+    "规则文档入库", "待审文档审查", "争议项复核", "Word修订", "现场风险问答",
+]
+
+STRATEGY_TOOL_VOCAB = [
+    "list_skills", "read_skill", "list_input_files", "inspect_document", "run_script",
+    "queue_stats", "retrieve_regulations", "numeric_compare_tool",
+    "get_chunk_review", "resolve_queue_item",
+]
+
+STRATEGY_SYSTEM_PROMPT = """你是煤矿文档审查系统的主智能体。给定一个用户任务，你要先生成结构化执行策略（只规划、不执行）。
+
+系统可处理的任务类型（task_type 必须从中精确选择一个）：
+- 规则文档入库：把法规/规程/标准切分后建入规则知识库。
+- 待审文档审查：把作业规程等待审文档切分后，做合规/错别字/重复三链并行审查，产生的争议项进入升级队列。
+- 争议项复核：对审查流水线升级到队列的分歧/数值矛盾/低置信/异常项逐个复核并裁决。
+- Word修订：根据审查问题与人工意见，定位并修改 Word 文档中对应段落。
+- 现场风险问答：针对井下现场情况追问关键信息，并给出有法规依据的处置建议。
+
+可用工具（selected_tools 只能从下列名称中选择）：
+list_skills, read_skill, list_input_files, inspect_document, run_script,
+queue_stats, retrieve_regulations, numeric_compare_tool, get_chunk_review, resolve_queue_item
+
+升级/转人工原则（决定 needs_escalation）：涉及升级队列复核、数值方向存疑、证据不足、
+或井下高风险现场处置时，needs_escalation=true；常规切分入库、纯信息检索、确定性文档修改时为 false。
+
+只输出如下 JSON（不要任何多余文字、不要解释）：
+{
+  "task_type": "上述五类之一",
+  "selected_tools": ["按调用顺序列出的工具名"],
+  "steps": ["有序的执行步骤描述", "..."],
+  "needs_escalation": true 或 false,
+  "escalation_conditions": ["需要升级/转人工的具体条件，可为空数组"]
+}"""
+
+
+def _parse_strategy_json(raw: str) -> Dict[str, Any]:
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            return {}
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
 # ============ Agent 循环 ============
 
 class MainAgent:
@@ -365,6 +423,23 @@ class MainAgent:
                 called.append(tc.function.name)
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
         return "（达到最大步数限制，任务未完整结束）", called
+
+    # ---- 策略生成（先规划）----
+
+    def generate_strategy(self, task: str) -> Dict[str, Any]:
+        """对一个用户任务生成结构化执行策略（task_type/工具/步骤/升级判断），不实际执行。
+
+        返回 {"strategy": <解析后的dict>, "raw": <原始文本>}。
+        供 run_task 在执行前调用，也供 6.3 策略生成评测使用。"""
+        messages = [
+            {"role": "system", "content": STRATEGY_SYSTEM_PROMPT},
+            {"role": "user", "content": f"用户任务：{task}\n\n请输出该任务的执行策略（严格 JSON）。"},
+        ]
+        response = self.client.chat.completions.create(
+            model=AGENT_MODEL, messages=messages, temperature=0.1,
+        )
+        raw = response.choices[0].message.content or ""
+        return {"strategy": _parse_strategy_json(raw), "raw": raw}
 
     # ---- 模式1：自然语言任务 ----
 

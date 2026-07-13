@@ -6,8 +6,12 @@ import Knowledge from '../pages/Knowledge'
 import RAG from '../pages/RAG'
 import Monitor from '../pages/Monitor'
 import Review from '../pages/Review'
+import Profile from '../pages/Profile'
+import Settings from '../pages/Settings'
 import AuthRoute from '../components/AuthRoute'
+import AdminRoute from '../components/AdminRoute'
 import MainLayout from '../components/MainLayout'
+import AdminReviewKb from '../pages/AdminReviewKb'
 
 const AppRoutes = () => {
   return (
@@ -31,6 +35,16 @@ const AppRoutes = () => {
         <Route path="rag" element={<RAG />} />
         <Route path="review" element={<Review />} />
         <Route path="monitor" element={<Monitor />} />
+        <Route
+          path="admin/review-kb"
+          element={
+            <AdminRoute>
+              <AdminReviewKb />
+            </AdminRoute>
+          }
+        />
+        <Route path="profile" element={<Profile />} />
+        <Route path="settings" element={<Settings />} />
       </Route>
     </Routes>
   )

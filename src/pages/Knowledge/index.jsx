@@ -34,12 +34,14 @@ import {
   DownloadOutlined
 } from '@ant-design/icons'
 import DocumentPreview from '../../components/DocumentPreview'
+import useUserStore from '../../store/userStore'
 import './index.css'
 
 const { TextArea } = Input
 const { Dragger } = Upload
 
 const Knowledge = () => {
+  const user = useUserStore((state) => state.user)
   const [knowledgeBases, setKnowledgeBases] = useState([])
   const [documents, setDocuments] = useState([])
   const [loading, setLoading] = useState(false)
@@ -62,21 +64,38 @@ const Knowledge = () => {
   const [batchUploadVisible, setBatchUploadVisible] = useState(false)
   const [uploadingFiles, setUploadingFiles] = useState([]) // {uid, name, size, status: 'uploading'|'success'|'error', progress}
 
+  const authParams = () => new URLSearchParams({
+    user_id: String(user?.id || 'guest'),
+    role: user?.role || 'user',
+  })
+
+  const appendAuthToForm = (values = {}) => new URLSearchParams({
+    ...values,
+    user_id: String(user?.id || 'guest'),
+    role: user?.role || 'user',
+    user_name: user?.name || user?.username || '',
+  })
+
   // 加载知识库列表
   const loadKnowledgeBases = async () => {
     setLoading(true)
     try {
-      const response = await fetch('/api/knowledge/bases')
+      const response = await fetch(`/api/knowledge/bases?${authParams().toString()}`)
       if (response.ok) {
         const data = await response.json()
-        setKnowledgeBases(data.map(kb => ({
+        const nextKnowledgeBases = data.map(kb => ({
           ...kb,
           documentCount: kb.document_count || 0,
           totalSize: kb.total_size || 0,
           status: '已索引',
           createdAt: kb.created_at?.split('T')[0] || '',
           updatedAt: kb.updated_at?.split('T')[0] || kb.created_at?.split('T')[0] || ''
-        })))
+        }))
+        setKnowledgeBases(nextKnowledgeBases)
+        if (selectedKbId && !nextKnowledgeBases.some(kb => kb.id === selectedKbId)) {
+          setSelectedKbId(null)
+          setDocuments([])
+        }
       }
     } catch (error) {
       console.error('加载知识库失败:', error)
@@ -90,7 +109,7 @@ const Knowledge = () => {
   const loadDocuments = async (kbId) => {
     if (!kbId) return
     try {
-      const response = await fetch(`/api/knowledge/bases/${kbId}/documents`)
+      const response = await fetch(`/api/knowledge/bases/${kbId}/documents?${authParams().toString()}`)
       if (response.ok) {
         const data = await response.json()
         setDocuments(data.map(doc => ({
@@ -110,7 +129,7 @@ const Knowledge = () => {
   // 组件加载时获取数据
   useEffect(() => {
     loadKnowledgeBases()
-  }, [])
+  }, [user?.id, user?.role])
 
   // 当选中知识库时加载文档
   useEffect(() => {
@@ -301,7 +320,7 @@ const Knowledge = () => {
         const response = await fetch(`/api/knowledge/bases/${editingKb.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams(values)
+          body: appendAuthToForm(values)
         })
         if (response.ok) {
           message.success('知识库更新成功')
@@ -314,7 +333,7 @@ const Knowledge = () => {
         const response = await fetch('/api/knowledge/bases', {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams(values)
+          body: appendAuthToForm(values)
         })
         if (response.ok) {
           message.success('知识库创建成功')
@@ -342,7 +361,7 @@ const Knowledge = () => {
   // 删除知识库
   const handleDeleteKb = async (id) => {
     try {
-      const response = await fetch(`/api/knowledge/bases/${id}`, {
+      const response = await fetch(`/api/knowledge/bases/${id}?${authParams().toString()}`, {
         method: 'DELETE'
       })
       if (response.ok) {
@@ -377,6 +396,8 @@ const Knowledge = () => {
 
       const formData = new FormData()
       formData.append('file', file)
+      formData.append('user_id', String(user?.id || 'guest'))
+      formData.append('role', user?.role || 'user')
 
       try {
         const response = await fetch(`/api/knowledge/bases/${selectedKbId}/documents`, {
@@ -418,7 +439,7 @@ const Knowledge = () => {
 
   // 下载文档
   const handleDownloadDoc = (record) => {
-    const downloadUrl = `/api/knowledge/documents/${record.id}/download`
+    const downloadUrl = `/api/knowledge/documents/${record.id}/download?${authParams().toString()}`
     const link = document.createElement('a')
     link.href = downloadUrl
     link.download = record.name
@@ -455,7 +476,7 @@ const Knowledge = () => {
   // 删除文档
   const handleDeleteDoc = async (id) => {
     try {
-      const response = await fetch(`/api/knowledge/documents/${id}`, {
+      const response = await fetch(`/api/knowledge/documents/${id}?${authParams().toString()}`, {
         method: 'DELETE'
       })
       if (response.ok) {

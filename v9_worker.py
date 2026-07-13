@@ -16,9 +16,12 @@
 """
 import json
 import os
+import re
 import shutil
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -32,8 +35,23 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 QUEUE_DB = PROJECT_ROOT / "data" / "review_queue_v9.db"
 WORK_DIR = PROJECT_ROOT / "data" / "v9_web_work"      # 段落模型 / 工作副本 docx
 WORK_DIR.mkdir(parents=True, exist_ok=True)
+FEEDBACK_SNAPSHOT_DIR = WORK_DIR / "feedback_snapshots"
+FEEDBACK_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 DEMO_SKIP_RETRIEVAL = os.getenv("V9_DEMO_SKIP_RETRIEVAL", "0") == "1"
 DISABLE_ESCALATION_LOOP = os.getenv("V9_DISABLE_ESCALATION_LOOP", "0") == "1"
+USE_MINERU_FOR_PENDING = os.getenv("V9_USE_MINERU_FOR_PENDING", "1") != "0"
+MINERU_API_URL = os.getenv("V9_MINERU_API_URL", os.getenv("MINERU_API_URL", "http://127.0.0.1:51071"))
+
+
+def _env_int(name: str, default: int, min_value: int = 1, max_value: int = 16) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(min_value, min(max_value, value))
+
+
+WEB_CHUNK_CONCURRENCY = _env_int("V9_WEB_CHUNK_CONCURRENCY", 4, 1, 12)
 
 
 def _load_env_fallback():
@@ -67,6 +85,18 @@ def _timings_json(timings: Dict[str, float]) -> str:
         {key: round(float(value), 2) for key, value in timings.items()},
         ensure_ascii=False,
     )
+
+
+def _compact_text(text: str) -> str:
+    return re.sub(r"\s+", "", text or "")
+
+
+def _feedback_snapshot_path(job_id: str, issue_id: int) -> Path:
+    return FEEDBACK_SNAPSHOT_DIR / f"{job_id}_issue_{int(issue_id)}_before.docx"
+
+
+def _feedback_snapshot_meta_path(job_id: str, issue_id: int) -> Path:
+    return FEEDBACK_SNAPSHOT_DIR / f"{job_id}_issue_{int(issue_id)}_before.json"
 
 
 class V9Worker:
@@ -146,6 +176,159 @@ class V9Worker:
             shutil.copy(original, work)
         return work
 
+    def _blocks_from_content(self, parsed: Dict[str, Any], content: str) -> List[int]:
+        """把 MinerU chunk 内容映射回 docx block_index，供前端高亮/Word 改写使用。"""
+        norm = _compact_text(content)
+        if not norm:
+            return []
+
+        hits: List[int] = []
+        for block in parsed.get("blocks", []):
+            block_text = _compact_text(block.get("text", ""))
+            if not block_text:
+                continue
+            idx = int(block.get("block_index", -1))
+            if idx < 0:
+                continue
+            if block_text in norm or norm in block_text:
+                hits.append(idx)
+                continue
+            # MinerU 和 python-docx 的换行/表格符号可能不同，用首尾短片段兜底。
+            head = block_text[: min(36, len(block_text))]
+            tail = block_text[-min(36, len(block_text)) :]
+            if len(head) >= 12 and head in norm:
+                hits.append(idx)
+            elif len(tail) >= 12 and tail in norm:
+                hits.append(idx)
+
+        return sorted(set(hits))
+
+    def _best_docx_chunk_blocks(self, content: str, docx_chunks: List[Dict[str, Any]]) -> List[int]:
+        norm = _compact_text(content)
+        if not norm:
+            return []
+        sample = norm[:1400]
+        best_score = 0.0
+        best_blocks: List[int] = []
+        for chunk in docx_chunks:
+            candidate = _compact_text(chunk.get("content", ""))
+            if not candidate:
+                continue
+            if norm in candidate or candidate in norm:
+                score = min(len(norm), len(candidate)) / max(len(norm), len(candidate))
+            else:
+                score = SequenceMatcher(None, sample, candidate[:1400]).ratio()
+            if score > best_score:
+                best_score = score
+                best_blocks = list(chunk.get("source_blocks") or [])
+        return best_blocks if best_score >= 0.20 else []
+
+    def _source_units_for_blocks(self, parsed: Dict[str, Any], blocks: List[int]) -> List[Dict[str, Any]]:
+        all_blocks = parsed.get("blocks", [])
+        units: List[Dict[str, Any]] = []
+        for idx in blocks:
+            if 0 <= idx < len(all_blocks):
+                block = all_blocks[idx]
+                units.append({
+                    "text": block.get("text", ""),
+                    "source_blocks": [idx],
+                    "kind": block.get("kind", "paragraph"),
+                })
+        return units
+
+    def _attach_source_blocks_to_mineru_chunks(
+        self,
+        parsed: Dict[str, Any],
+        mineru_chunks: List[Dict[str, Any]],
+        docx_chunks: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        mapped: List[Dict[str, Any]] = []
+        for chunk in mineru_chunks:
+            content = chunk.get("content", "")
+            source_blocks = self._blocks_from_content(parsed, content)
+            if not source_blocks:
+                source_blocks = self._best_docx_chunk_blocks(content, docx_chunks)
+            next_chunk = dict(chunk)
+            next_chunk["source_blocks"] = source_blocks
+            if source_blocks and not next_chunk.get("source_units"):
+                next_chunk["source_units"] = self._source_units_for_blocks(parsed, source_blocks)
+            next_chunk.setdefault("char_count", len(content))
+            next_chunk.setdefault("chunk_level", "paragraph")
+            mapped.append(next_chunk)
+        return mapped
+
+    def _build_pending_chunks_with_mineru(
+        self,
+        docx_path: str,
+        parsed: Dict[str, Any],
+        docx_chunks: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        from mineru_adapter import convert_document_to_mineru_json
+
+        try:
+            result = convert_document_to_mineru_json(
+                docx_path,
+                doc_kind="pending",
+                api_url=MINERU_API_URL,
+                timeout=7200,
+                chunk_pending=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "MinerU 解析待审文档失败。请先启动 MinerU API："
+                "D:/Anaconda/envs/langchain0.3/Scripts/mineru-api.exe "
+                "--host 127.0.0.1 --port 51071；"
+                f"当前 V9_MINERU_API_URL={MINERU_API_URL}；原始错误: {exc}"
+            ) from exc
+        if not result.chunks_preview_path:
+            raise RuntimeError("MinerU 已生成 JSON，但未生成待审文档 chunks")
+        with open(result.chunks_preview_path, "r", encoding="utf-8") as f:
+            chunk_doc = json.load(f)
+        if not isinstance(chunk_doc, dict) or not chunk_doc:
+            raise RuntimeError(f"MinerU 待审 chunks 文件为空: {result.chunks_preview_path}")
+        mineru_chunks = next(iter(chunk_doc.values()))
+        if not isinstance(mineru_chunks, list) or not mineru_chunks:
+            raise RuntimeError(f"MinerU 待审 chunks 结构异常: {result.chunks_preview_path}")
+        chunks = self._attach_source_blocks_to_mineru_chunks(parsed, mineru_chunks, docx_chunks)
+        mapped_count = sum(1 for chunk in chunks if chunk.get("source_blocks"))
+        log(
+            f"MinerU 待审切分完成: {len(chunks)} 段，"
+            f"已映射 Word source_blocks {mapped_count}/{len(chunks)} 段"
+        )
+        return chunks
+
+    def _persist_review_doc_vectors(
+        self,
+        job: Dict[str, Any],
+        chunks: List[Dict[str, Any]],
+        q_dense,
+    ) -> Dict[str, Any]:
+        """复用 Phase A 的待审文档向量，长期写入 Milvus，并镜像 chunk 元数据到 MongoDB。"""
+        if q_dense is None:
+            return {"saved": 0, "mongo": False}
+        try:
+            from review_doc_vector_store import review_doc_vector_store
+
+            records = review_doc_vector_store.upsert_job_chunks(
+                job=job,
+                chunks=chunks,
+                dense_vecs=q_dense,
+            )
+            mongo_ok = False
+            try:
+                backend_dir = PROJECT_ROOT / "backend"
+                if str(backend_dir) not in sys.path:
+                    sys.path.insert(0, str(backend_dir))
+                from app.services.mongo_service import mongo_service
+
+                mongo_ok = mongo_service.replace_review_chunks(job=job, vector_records=records)
+            except Exception as exc:
+                log(f"待审 chunk 元数据写入 MongoDB 失败（不影响审查）: {exc}")
+            return {"saved": len(records), "mongo": bool(mongo_ok)}
+        except Exception as exc:
+            log(f"待审文档向量写入 Milvus 失败（不影响审查）: {exc}")
+            return {"saved": 0, "mongo": False, "error": str(exc)[:200]}
+
     # ---------- 审查任务 ----------
 
     def _is_cancelled(self, job_id: str) -> bool:
@@ -178,7 +361,19 @@ class V9Worker:
             docx_path = self._ensure_docx(docx_path)   # .doc → .docx 自动转换
             if docx_path != job["docx_path"]:
                 self.queue.update_job(job_id, docx_path=docx_path)
-            parsed, chunks = docx_adapter.adapt(docx_path)
+            parsed, docx_chunks = docx_adapter.adapt(docx_path)
+            if USE_MINERU_FOR_PENDING:
+                self.queue.update_job(
+                    job_id,
+                    agent_stage="parsing",
+                    phase_done=0,
+                    phase_total=0,
+                    agent_status="正在调用 MinerU 结构化解析待审文档…",
+                    timings=_timings_json(timings),
+                )
+                chunks = self._build_pending_chunks_with_mineru(docx_path, parsed, docx_chunks)
+            else:
+                chunks = docx_chunks
             timings["parse"] = time.perf_counter() - parse_started
             if self._stop_if_cancelled(job_id, "文档解析后"):
                 return
@@ -209,6 +404,14 @@ class V9Worker:
                 timings["retrieval_rerank"] = time.perf_counter() - retrieval_started
                 if self._stop_if_cancelled(job_id, "法规召回后"):
                     return
+                persist_started = time.perf_counter()
+                persist_result = self._persist_review_doc_vectors(job, chunks, q_dense)
+                timings["persist_review_vectors"] = time.perf_counter() - persist_started
+                if persist_result.get("saved"):
+                    log(
+                        f"任务 {job_id} 待审向量已写入 Milvus: "
+                        f"{persist_result['saved']} 段, mongo={persist_result.get('mongo')}"
+                    )
                 self.queue.update_job(
                     job_id, progress=15,
                     agent_stage="reviewing",
@@ -317,6 +520,14 @@ class V9Worker:
                     f"检索重排 {timings.get('retrieval_rerank', 0.0):.1f}s")
                 if self._stop_if_cancelled(job_id, "法规召回与重排后"):
                     return
+                persist_started = time.perf_counter()
+                persist_result = self._persist_review_doc_vectors(job, chunks, q_dense)
+                timings["persist_review_vectors"] = time.perf_counter() - persist_started
+                if persist_result.get("saved"):
+                    log(
+                        f"任务 {job_id} 待审向量已写入 Milvus: "
+                        f"{persist_result['saved']} 段, mongo={persist_result.get('mongo')}"
+                    )
                 self.queue.update_job(
                     job_id, progress=15, n_done=0, n_chunks=len(chunks),
                     agent_stage="reviewing",
@@ -330,29 +541,64 @@ class V9Worker:
 
             n_issues = 0
             review_started = time.perf_counter()
-            for i, chunk in enumerate(chunks):
-                if self._stop_if_cancelled(job_id, f"chunk#{i + 1} 前"):
-                    return
-                kb_results = kb_results_all[i]
-                source_blocks = chunk.get("source_blocks", [])
-                n_issues += self._review_one_chunk(
-                    job_id, job["doc_name"], i, chunk, kb_results, parsed, source_blocks
-                )
-                if self._stop_if_cancelled(job_id, f"chunk#{i + 1} 后"):
-                    return
-                progress = 15 + int((i + 1) / max(1, len(chunks)) * 80)
-                timings["review"] = time.perf_counter() - review_started
-                self.queue.update_job(
-                    job_id,
-                    progress=progress,
-                    n_done=i + 1,
-                    n_chunks=len(chunks),
-                    agent_stage="reviewing",
-                    phase_done=i + 1,
-                    phase_total=len(chunks),
-                    agent_status=f"合规/错别字/数值核验中：已审查 {i + 1}/{len(chunks)} 段",
-                    timings=_timings_json(timings),
-                )
+            total_chunks = len(chunks)
+            concurrency = min(WEB_CHUNK_CONCURRENCY, max(1, total_chunks))
+            log(f"任务 {job_id} Phase B 开始: chunk级并发={concurrency}, chunks={total_chunks}")
+            self.queue.update_job(
+                job_id,
+                progress=15,
+                n_done=0,
+                n_chunks=total_chunks,
+                agent_stage="reviewing",
+                phase_done=0,
+                phase_total=total_chunks,
+                agent_status=f"合规/错别字/数值核验中：并发 {concurrency}，已审查 0/{total_chunks} 段",
+                timings=_timings_json(timings),
+            )
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                futures = {}
+                for i, chunk in enumerate(chunks):
+                    if self._stop_if_cancelled(job_id, f"chunk#{i + 1} 提交前"):
+                        return
+                    futures[
+                        pool.submit(
+                            self._review_one_chunk,
+                            job_id,
+                            job["doc_name"],
+                            i,
+                            chunk,
+                            kb_results_all[i],
+                            parsed,
+                            chunk.get("source_blocks", []),
+                        )
+                    ] = i
+
+                completed = 0
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    try:
+                        n_issues += int(future.result() or 0)
+                    except Exception as exc:
+                        log(f"  chunk#{idx + 1} worker future异常: {exc}")
+                    completed += 1
+                    if self._stop_if_cancelled(job_id, f"chunk#{idx + 1} 完成后"):
+                        return
+                    progress = 15 + int(completed / max(1, total_chunks) * 80)
+                    timings["review"] = time.perf_counter() - review_started
+                    self.queue.update_job(
+                        job_id,
+                        progress=progress,
+                        n_done=completed,
+                        n_chunks=total_chunks,
+                        agent_stage="reviewing",
+                        phase_done=completed,
+                        phase_total=total_chunks,
+                        agent_status=(
+                            f"合规/错别字/数值核验中：并发 {concurrency}，"
+                            f"已审查 {completed}/{total_chunks} 段"
+                        ),
+                        timings=_timings_json(timings),
+                    )
 
             # 文档级重复性（一次性，复用 Phase A 向量）
             try:
@@ -459,14 +705,20 @@ class V9Worker:
 
         # 有升级但没有具体 issue（如"不确定"/反向核验）时，也产出一条供人工裁决
         if not review.get("issues") and escalations:
+            first_escalation = escalations[0]
+            escalation_reason = first_escalation.get("reason", "") if isinstance(first_escalation, dict) else str(first_escalation)
             self.queue.add_issue(
                 job_id, idx, "escalation", status or "不确定",
                 block_indices=source_blocks,
                 title="需人工裁决",
                 original_text=chunk["content"][:120],
-                reason="审查链已将该项加入主智能体升级队列",
-                detail={"numeric": numeric_detail, "summary": review.get("summary", "")},
-                escalation_type=escalations[0],
+                reason=escalation_reason or "审查链已将该项加入主智能体升级队列",
+                detail={
+                    "numeric": numeric_detail,
+                    "summary": review.get("summary", ""),
+                    "escalations": escalations,
+                },
+                escalation_type=first_escalation,
             )
             count += 1
 
@@ -518,10 +770,36 @@ class V9Worker:
         doc = Document(str(work))
         block_indices = fb.get("block_indices") or []
         applied = False
-        for bi in block_indices:
-            if docx_adapter.apply_edit_at_block(doc, bi, original, new_text):
-                applied = True
-                break
+        snapshot_path = _feedback_snapshot_path(job_id, issue_id)
+        snapshot_meta_path = _feedback_snapshot_meta_path(job_id, issue_id)
+        try:
+            shutil.copy2(work, snapshot_path)
+            snapshot_meta_path.write_text(
+                json.dumps({
+                    "issue_id": issue_id,
+                    "job_id": job_id,
+                    "original_text": original,
+                    "new_text": new_text,
+                    "suggestion": fb.get("suggestion", ""),
+                    "human_text": fb.get("human_text", ""),
+                    "human_action": action,
+                    "block_indices": block_indices,
+                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            log(f"  issue#{issue_id} 保存撤回快照失败（继续尝试改写）: {exc}")
+
+        # 先按系统建议中的“将 X 改为 Y”做最小替换，适合数值冲突和错别字。
+        suggestion = fb.get("suggestion", "")
+        if action == "accept" and suggestion:
+            applied = docx_adapter.apply_suggestion_at_blocks(doc, block_indices, suggestion)
+
+        # 再按原文片段改写。该函数支持规范化匹配和跨多个 block 的整体改写。
+        if not applied:
+            applied = docx_adapter.apply_rewrite_at_blocks(doc, block_indices, original, new_text)
+
         if not applied:
             # 兜底：全文段落范围内尝试
             parsed = docx_adapter.parse_docx(work)
@@ -543,6 +821,11 @@ class V9Worker:
                 agent_note=f"已将「{original[:20]}…」改写为「{new_text[:20]}…」")
             log(f"  issue#{issue_id} 已改写 Word")
         else:
+            try:
+                snapshot_path.unlink(missing_ok=True)
+                snapshot_meta_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             self.queue.finish_feedback(issue_id, applied=-1,
                                        agent_note="未能在文档中定位原文，改写失败")
 

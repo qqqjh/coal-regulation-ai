@@ -53,6 +53,15 @@ from review_queue import (
 # ============ 配置 ============
 PROJECT_ROOT = Path(__file__).resolve().parent
 
+
+def _env_int(name: str, default: int, min_value: int = 1, max_value: int = 64) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(min_value, min(max_value, value))
+
+
 API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 BASE_URL = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 QWEN_MODEL = "qwen-plus"
@@ -73,6 +82,8 @@ SEGMENT_MAX_PER_CHUNK = 12       # 每chunk最多片段数（超出则相邻合�
 SEGMENT_POOL_PER_CHANNEL = 5     # 片段query：每路召回数
 BGE_MAX_LENGTH = 2048            # 与评估管线一致
 BGE_BATCH_SIZE = 8
+RETRIEVAL_RECALL_CONCURRENCY = _env_int("V9_RETRIEVAL_RECALL_CONCURRENCY", 4, 1, 16)
+RETRIEVAL_CHUNK_GROUP_SIZE = _env_int("V9_RETRIEVAL_CHUNK_GROUP_SIZE", 16, 1, 64)
 
 CHUNK_CONCURRENCY = 4            # 同时审查的chunk数
 LLM_MAX_CONCURRENCY = 8          # 全局LLM并发上限（防止触发QPM限流）
@@ -545,6 +556,49 @@ class HybridRAGReviewerV9:
             if score >= RERANK_SCORE_THRESHOLD
         ]
 
+    def _recall_chunk_pairs(self, chunk_index: int,
+                            texts: List[str],
+                            segments_per_chunk: List[List[str]],
+                            all_dense: np.ndarray,
+                            all_lex: List[Dict[str, float]],
+                            seg_slices: List[Tuple[int, int]]) -> Tuple[int, List[Tuple[str, int]]]:
+        """只做召回，不做rerank；供 prepare_retrieval 批量重排使用。"""
+        pairs: List[Tuple[str, int]] = []
+        full_text = texts[chunk_index]
+        for idx in self._recall_union(
+            all_dense[chunk_index], all_lex[chunk_index], RERANK_POOL_PER_CHANNEL
+        ):
+            pairs.append((full_text, idx))
+
+        lo, hi = seg_slices[chunk_index]
+        for s_i, segment in enumerate(segments_per_chunk[chunk_index]):
+            dense_i = lo + s_i
+            if dense_i >= hi:
+                break
+            for idx in self._recall_union(
+                all_dense[dense_i], all_lex[dense_i], SEGMENT_POOL_PER_CHANNEL
+            ):
+                pairs.append((segment, idx))
+        return chunk_index, list(dict.fromkeys(pairs))
+
+    def _rank_recalled_pairs(self, pairs: List[Tuple[str, int]],
+                             score_by_pair: Dict[Tuple[str, int], float],
+                             top_k: int = TOP_K) -> List[Dict]:
+        best: Dict[int, float] = {}
+        for pair in pairs:
+            score = score_by_pair.get(pair)
+            if score is None:
+                continue
+            _query, idx = pair
+            if score > best.get(idx, -1.0):
+                best[idx] = score
+        ranked = sorted(best.items(), key=lambda x: x[1], reverse=True)
+        return [
+            {"chunk": self.kb_chunks[idx], "score": round(score, 4)}
+            for idx, score in ranked[:top_k]
+            if score >= RERANK_SCORE_THRESHOLD
+        ]
+
     @staticmethod
     def _pending_encoding_inputs(chunks: List[Dict]) -> Tuple[List[str], List[List[str]], List[str], List[Tuple[int, int]], str]:
         """构建待审文档多查询编码输入，并生成与文件名无关的内容哈希。"""
@@ -581,20 +635,70 @@ class HybridRAGReviewerV9:
         )
         q_dense = all_dense[:len(texts)]
 
-        kb_results_all: List[List[Dict]] = []
+        kb_results_all: List[List[Dict]] = [[] for _ in chunks]
         retrieve_start = time.time()
+        total_chunks = len(chunks)
         if retrieval_progress_cb:
-            retrieval_progress_cb(0, len(chunks))
-        for i in range(len(chunks)):
-            lo, hi = seg_slices[i]
-            kb_results_all.append(self.search_chunk_multi(
-                texts[i], all_dense[i], all_lex[i],
-                segments_per_chunk[i], all_dense[lo:hi], all_lex[lo:hi],
+            retrieval_progress_cb(0, total_chunks)
+
+        group_size = min(RETRIEVAL_CHUNK_GROUP_SIZE, max(1, total_chunks))
+        recall_workers = min(RETRIEVAL_RECALL_CONCURRENCY, group_size)
+        print(
+            f"  [Phase A] 召回并发={recall_workers}, "
+            f"重排批大小={group_size} chunks"
+        )
+
+        completed = 0
+        for group_start in range(0, total_chunks, group_size):
+            group_indices = list(range(group_start, min(group_start + group_size, total_chunks)))
+            pairs_by_chunk: Dict[int, List[Tuple[str, int]]] = {}
+
+            with ThreadPoolExecutor(max_workers=recall_workers) as pool:
+                futures = {
+                    pool.submit(
+                        self._recall_chunk_pairs,
+                        i,
+                        texts,
+                        segments_per_chunk,
+                        all_dense,
+                        all_lex,
+                        seg_slices,
+                    ): i
+                    for i in group_indices
+                }
+                for future in as_completed(futures):
+                    i, pairs = future.result()
+                    pairs_by_chunk[i] = pairs
+
+            unique_pairs: List[Tuple[str, int]] = list(dict.fromkeys(
+                pair
+                for i in group_indices
+                for pair in pairs_by_chunk.get(i, [])
             ))
-            if (i + 1) % 20 == 0:
-                print(f"    检索+重排 {i + 1}/{len(chunks)}")
-            if retrieval_progress_cb:
-                retrieval_progress_cb(i + 1, len(chunks))
+            if unique_pairs:
+                scores = self.retriever.rerank_pairs(
+                    [[query, self.kb_texts[idx]] for query, idx in unique_pairs]
+                )
+                score_by_pair = {
+                    pair: float(score)
+                    for pair, score in zip(unique_pairs, scores)
+                }
+            else:
+                score_by_pair = {}
+
+            for i in group_indices:
+                kb_results_all[i] = self._rank_recalled_pairs(
+                    pairs_by_chunk.get(i, []),
+                    score_by_pair,
+                )
+                completed += 1
+                if completed % 20 == 0:
+                    print(f"    检索+重排 {completed}/{total_chunks}")
+                if retrieval_progress_cb:
+                    retrieval_progress_cb(completed, total_chunks)
+
+        if completed and completed % 20 != 0:
+            print(f"    检索+重排 {completed}/{total_chunks}")
         print(f"  [Phase A] 多查询检索完成，耗时 {time.time() - retrieve_start:.1f}s")
         return kb_results_all, q_dense
 

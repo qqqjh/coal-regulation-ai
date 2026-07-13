@@ -7,7 +7,7 @@ script: v9_worker.py
 # v9 Web Word 审查与改写
 
 ## 何时使用
-用户通过前端“审查”页面上传 `.docx` / `.doc`，需要在页面中查看 Word/PDF 预览、定位审查问题、人工采纳/驳回/自定义改写，并下载改写后的 Word 工作副本。
+用户通过前端“审查”页面上传 `.docx` / `.doc`，系统先进行文档预处理（保存原件、统一为 `.docx`、尽量生成 PDF 预览缓存），再创建审查任务。用户需要在页面中查看 Word/PDF 预览、定位审查问题、人工采纳/驳回/自定义改写，并下载改写后的 Word 工作副本。
 
 ## 关键文件
 - 前端页面：`src/pages/Review/index.jsx`、`src/pages/Review/index.css`
@@ -19,6 +19,8 @@ script: v9_worker.py
 - LLM 编辑工具：`llm_doc_editor.py`
 
 ## 后端接口
+- `POST /api/v9/preprocess`：上传 Word 并完成审查前预处理，返回 `preprocess_id`、`.docx` 就绪状态和 PDF 预览状态
+- `POST /api/v9/start/{preprocess_id}?mine_type=non_outburst|outburst`：基于预处理结果创建审查任务
 - `POST /api/v9/upload?mine_type=non_outburst|outburst`：上传 Word 并创建任务
 - `GET /api/v9/stream/{job_id}`：SSE 推送任务状态与增量 issues
 - `GET /api/v9/document/{job_id}`：返回段落模型 JSON

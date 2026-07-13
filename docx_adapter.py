@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import re
+import difflib
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -205,6 +207,113 @@ def _ordered_paragraph_map(document: _DocxDocument) -> Dict[int, Paragraph]:
     return mapping
 
 
+def _norm_text(text: str) -> str:
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(text or "")))
+
+
+def _norm_span(full_text: str, target: str) -> Optional[Tuple[int, int]]:
+    """返回 target 规范化后在 full_text 中对应的原始字符区间。"""
+    norm_target = _norm_text(target)
+    if not norm_target:
+        return None
+    norm_chars: List[str] = []
+    index_map: List[int] = []
+    for idx, ch in enumerate(str(full_text or "")):
+        normalized = _norm_text(ch)
+        if not normalized:
+            continue
+        for out_ch in normalized:
+            norm_chars.append(out_ch)
+            index_map.append(idx)
+    norm_full = "".join(norm_chars)
+    pos = norm_full.find(norm_target)
+    if pos < 0:
+        return None
+    start = index_map[pos]
+    end = index_map[pos + len(norm_target) - 1] + 1
+    return start, end
+
+
+def _replace_span_in_para(
+    para: Paragraph,
+    start: int,
+    end: int,
+    new_text: str,
+    mark_color: Optional[Tuple[int, int, int]] = (0, 128, 0),
+) -> bool:
+    from docx.shared import RGBColor
+
+    pos = 0
+    changed = False
+    for run in para.runs:
+        run_start = pos
+        run_end = pos + len(run.text)
+        pos = run_end
+        if run_end <= start or run_start >= end:
+            continue
+        prefix = run.text[: max(0, start - run_start)] if run_start <= start else ""
+        suffix = run.text[max(0, end - run_start):] if run_end >= end else ""
+        insert = new_text if not changed else ""
+        run.text = prefix + insert + suffix
+        if mark_color and insert:
+            run.font.color.rgb = RGBColor(*mark_color)
+        changed = True
+    return changed
+
+
+def _set_para_text(
+    para: Paragraph,
+    text: str,
+    mark_color: Optional[Tuple[int, int, int]] = (0, 128, 0),
+) -> bool:
+    from docx.shared import RGBColor
+
+    if para.runs:
+        para.runs[0].text = text
+        if mark_color:
+            para.runs[0].font.color.rgb = RGBColor(*mark_color)
+        for run in para.runs[1:]:
+            run.text = ""
+    else:
+        run = para.add_run(text)
+        if mark_color:
+            run.font.color.rgb = RGBColor(*mark_color)
+    return True
+
+
+def _split_rewrite_lines(text: str, n: int) -> List[str]:
+    lines = [line.strip() for line in re.split(r"\n+", str(text or "")) if line.strip()]
+    if not lines:
+        return ["" for _ in range(n)]
+    if len(lines) >= n:
+        return lines[: n - 1] + ["\n".join(lines[n - 1:])]
+    return lines + ["" for _ in range(n - len(lines))]
+
+
+def _extract_suggestion_pairs(suggestion: str) -> List[Tuple[str, str]]:
+    """抽取“将 X 改/修改/调整为 Y”类局部替换建议。"""
+    text = str(suggestion or "")
+    if not text:
+        return []
+    pattern = re.compile(
+        r"将\s*[\"'「『【]?\s*(.+?)\s*[\"'」』】]?\s*"
+        r"(?:修改为|改为|更改为|调整为)\s*"
+        r"[\"'「『【]?\s*(.+?)\s*[\"'」』】]?"
+        r"(?=以|，|。|；|;|$)"
+    )
+    pairs = []
+    for old, new in pattern.findall(text):
+        old = old.strip(" \t\r\n\"'「」『』【】")
+        new = new.strip(" \t\r\n\"'「」『』【】")
+        if old and new and old != new:
+            pairs.append((old, new))
+            old_num = re.sub(r"^[<>≤≥=]+", "", old)
+            new_num = re.sub(r"^[<>≤≥=]+", "", new)
+            if old_num and new_num and old_num != old:
+                pairs.append((old_num, new_num))
+    return pairs
+
+
 def apply_edit_at_block(document: _DocxDocument, block_index: int,
                         old_text: str, new_text: str,
                         mark_color: Optional[Tuple[int, int, int]] = (0, 128, 0)) -> bool:
@@ -232,7 +341,11 @@ def apply_edit_at_block(document: _DocxDocument, block_index: int,
         return True
 
     if old_text not in para.text:
-        return False
+        span = _norm_span(para.text, old_text)
+        if span is None:
+            return False
+        return _replace_span_in_para(para, span[0], span[1], new_text, mark_color)
+
     # 优先在单个 run 内替换（保留样式）
     for run in para.runs:
         if old_text in run.text:
@@ -252,6 +365,87 @@ def apply_edit_at_block(document: _DocxDocument, block_index: int,
     return False
 
 
+def apply_suggestion_at_blocks(
+    document: _DocxDocument,
+    block_indices: List[int],
+    suggestion: str,
+    mark_color: Optional[Tuple[int, int, int]] = (0, 128, 0),
+) -> bool:
+    """按“将 X 改为 Y”建议在候选段落内做最小替换。"""
+    pairs = _extract_suggestion_pairs(suggestion)
+    if not pairs:
+        return False
+    para_map = _ordered_paragraph_map(document)
+    indices = [i for i in block_indices if i in para_map]
+    if not indices:
+        indices = list(para_map.keys())
+    for old, new in pairs:
+        for bi in indices:
+            if apply_edit_at_block(document, bi, old, new, mark_color):
+                return True
+    return False
+
+
+def revert_suggestion_at_blocks(
+    document: _DocxDocument,
+    block_indices: List[int],
+    suggestion: str,
+    mark_color: Optional[Tuple[int, int, int]] = None,
+) -> bool:
+    """按“将 X 改为 Y”建议反向替换，用于撤回已改写裁决。"""
+    pairs = _extract_suggestion_pairs(suggestion)
+    if not pairs:
+        return False
+    para_map = _ordered_paragraph_map(document)
+    indices = [i for i in block_indices if i in para_map]
+    if not indices:
+        indices = list(para_map.keys())
+    for old, new in pairs:
+        for bi in indices:
+            if apply_edit_at_block(document, bi, new, old, mark_color):
+                return True
+    return False
+
+
+def apply_rewrite_at_blocks(
+    document: _DocxDocument,
+    block_indices: List[int],
+    old_text: str,
+    new_text: str,
+    mark_color: Optional[Tuple[int, int, int]] = (0, 128, 0),
+) -> bool:
+    """在候选 block 区域内改写。
+
+    先逐段做精确/规范化替换；若原文跨多个段落，则在候选区域整体重写。
+    """
+    para_map = _ordered_paragraph_map(document)
+    indices = [i for i in block_indices if i in para_map]
+    for bi in indices:
+        if apply_edit_at_block(document, bi, old_text, new_text, mark_color):
+            return True
+    if len(indices) <= 1:
+        return False
+
+    paras = [para_map[i] for i in indices]
+    combined = "\n".join(para.text for para in paras)
+    norm_old = _norm_text(old_text)
+    norm_combined = _norm_text(combined)
+    similar = difflib.SequenceMatcher(None, norm_old, norm_combined).ratio() if norm_old and norm_combined else 0.0
+    if not (
+        norm_combined and (
+            norm_combined in norm_old
+            or norm_old in norm_combined
+            or similar >= 0.45
+        )
+    ):
+        return False
+
+    lines = _split_rewrite_lines(new_text, len(paras))
+    for para, line in zip(paras, lines):
+        _set_para_text(para, line, mark_color if line else None)
+    return True
+
+
 def locate_text_blocks(parsed: Dict[str, Any], needle: str,
                        hint_blocks: Optional[List[int]] = None) -> List[int]:
     """在段落模型中定位包含 needle 的 block_index（前端高亮兜底用）。
@@ -262,8 +456,13 @@ def locate_text_blocks(parsed: Dict[str, Any], needle: str,
     blocks = parsed["blocks"]
 
     def search(indices):
-        return [i for i in indices
+        hits = [i for i in indices
                 if 0 <= i < len(blocks) and needle in blocks[i]["text"]]
+        if hits:
+            return hits
+        norm_needle = _norm_text(needle)
+        return [i for i in indices
+                if 0 <= i < len(blocks) and norm_needle and norm_needle in _norm_text(blocks[i]["text"])]
 
     if hint_blocks:
         hit = search(hint_blocks)
@@ -272,7 +471,7 @@ def locate_text_blocks(parsed: Dict[str, Any], needle: str,
         # 截断匹配（needle 可能跨段或含标点差异）
         short = needle[:12]
         hit = [i for i in hint_blocks
-               if 0 <= i < len(blocks) and short and short in blocks[i]["text"]]
+               if 0 <= i < len(blocks) and short and _norm_text(short) in _norm_text(blocks[i]["text"])]
         if hit:
             return hit
     return search(range(len(blocks)))

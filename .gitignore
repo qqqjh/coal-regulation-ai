@@ -37,5 +37,11 @@ __pycache__/
 /rag_eval/reports/
 /models/
 /.agents/
+/output/
+/backend/data/chroma_db/
+/backend/data/milvus_standalone/
+/backend/data/mongodb/
+/backend/data/redis/
+~$*
 *.db
 *.sqlite3

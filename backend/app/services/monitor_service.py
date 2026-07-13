@@ -29,7 +29,7 @@ class MonitorService:
             latency=latency,
             cost=cost,
             error_msg=error_msg,
-            metadata=json.dumps(metadata) if metadata else None,
+            extra_data=json.dumps(metadata, ensure_ascii=False) if metadata else None,
             timestamp=datetime.utcnow()
         )
         db.add(log)
@@ -156,6 +156,45 @@ class MonitorService:
             {
                 "name": row.module,
                 "value": row.count
+            }
+            for row in rows
+        ]
+
+    async def get_module_usage(
+        self,
+        db: AsyncSession,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None
+    ) -> List[Dict]:
+        """按模块汇总调用、Token、成本和耗时"""
+        if not start_time:
+            start_time = datetime.utcnow() - timedelta(days=7)
+        if not end_time:
+            end_time = datetime.utcnow()
+
+        query = select(
+            MonitorLog.module,
+            func.count(MonitorLog.id).label("calls"),
+            func.sum(MonitorLog.tokens).label("tokens"),
+            func.sum(MonitorLog.cost).label("cost"),
+            func.avg(MonitorLog.latency).label("avg_latency"),
+        ).where(
+            and_(
+                MonitorLog.timestamp >= start_time,
+                MonitorLog.timestamp <= end_time
+            )
+        ).group_by(MonitorLog.module).order_by(func.sum(MonitorLog.tokens).desc())
+
+        result = await db.execute(query)
+        rows = result.fetchall()
+
+        return [
+            {
+                "module": row.module,
+                "calls": int(row.calls or 0),
+                "tokens": int(row.tokens or 0),
+                "cost": round(row.cost or 0.0, 4),
+                "avg_latency": round(row.avg_latency or 0.0, 3),
             }
             for row in rows
         ]

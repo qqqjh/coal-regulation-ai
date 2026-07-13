@@ -298,9 +298,10 @@ def _word_com_convert(src_docx: Path, page_from: int = 0, page_to: int = 0) -> b
     shutil.copy2(src_docx, tmp_docx)
     pythoncom.CoInitialize()
     try:
-        word = win32com.client.Dispatch("Word.Application")
+        word = win32com.client.DispatchEx("Word.Application")
         word.Visible = False
-        doc = word.Documents.Open(str(tmp_docx.resolve()))
+        word.DisplayAlerts = 0
+        doc = word.Documents.Open(str(tmp_docx.resolve()), ReadOnly=True, AddToRecentFiles=False)
         if page_from > 0 and page_to > 0:
             doc.ExportAsFixedFormat(
                 str(pdf_path.resolve()),
@@ -312,7 +313,11 @@ def _word_com_convert(src_docx: Path, page_from: int = 0, page_to: int = 0) -> b
                 page_to,
             )
         else:
-            doc.SaveAs2(str(pdf_path.resolve()), FileFormat=17)
+            try:
+                doc.SaveAs2(str(pdf_path.resolve()), FileFormat=17)
+            except Exception:
+                if not pdf_path.exists() or pdf_path.stat().st_size == 0:
+                    raise
     finally:
         # 每一步都独立捕获，确保清理不中断也不向上抛异常
         if doc is not None:

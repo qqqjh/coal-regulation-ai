@@ -24,6 +24,7 @@ import {
   LoadingOutlined
 } from '@ant-design/icons'
 import ReactMarkdown from 'react-markdown'
+import useUserStore from '../../store/userStore'
 import './index.css'
 
 const { TextArea } = Input
@@ -51,6 +52,7 @@ function normalizeRagConfig(config = {}) {
 }
 
 const RAG = () => {
+  const user = useUserStore((state) => state.user)
   const [form] = Form.useForm()
   const [query, setQuery] = useState('')
   const [retrievalResults, setRetrievalResults] = useState([])
@@ -58,6 +60,10 @@ const RAG = () => {
   const [isSearching, setIsSearching] = useState(false)
   const [isGenerating, setIsGenerating] = useState(false)
   const [knowledgeBases, setKnowledgeBases] = useState([])
+  const knowledgeAuthQuery = () => new URLSearchParams({
+    user_id: String(user?.id || 'guest'),
+    role: user?.role || 'user',
+  }).toString()
 
   // 从localStorage加载保存的配置
   useEffect(() => {
@@ -80,7 +86,7 @@ const RAG = () => {
   useEffect(() => {
     const fetchKnowledgeBases = async () => {
       try {
-        const response = await fetch('/api/knowledge/bases')
+        const response = await fetch(`/api/knowledge/bases?${knowledgeAuthQuery()}`)
         if (response.ok) {
           const data = await response.json()
           setKnowledgeBases(data)
@@ -89,16 +95,17 @@ const RAG = () => {
           const savedConfig = localStorage.getItem('ragConfig')
           if (savedConfig) {
             const config = JSON.parse(savedConfig)
-            if (config.knowledgeBase) {
-              // 如果有保存的知识库ID，使用它
+            if (config.knowledgeBase && data.some(kb => kb.id === config.knowledgeBase)) {
               form.setFieldsValue({ knowledgeBase: config.knowledgeBase })
             } else if (data.length > 0) {
-              // 否则默认选中第一个知识库
               form.setFieldsValue({ knowledgeBase: data[0].id })
+            } else {
+              form.setFieldsValue({ knowledgeBase: null })
             }
           } else if (data.length > 0) {
-            // 没有保存的配置，默认选中第一个知识库
             form.setFieldsValue({ knowledgeBase: data[0].id })
+          } else {
+            form.setFieldsValue({ knowledgeBase: null })
           }
         }
       } catch (error) {
@@ -106,7 +113,7 @@ const RAG = () => {
       }
     }
     fetchKnowledgeBases()
-  }, [form])
+  }, [form, user?.id, user?.role])
 
   // 处理检索
   const handleRetrieval = async () => {
@@ -135,7 +142,9 @@ const RAG = () => {
           query: query,
           kb_id: config.knowledgeBase,
           top_k: config.topK,
-          similarity_threshold: config.similarityThreshold
+          similarity_threshold: config.similarityThreshold,
+          user_id: String(user?.id || 'guest'),
+          role: user?.role || 'user',
         })
       })
 
@@ -176,7 +185,9 @@ const RAG = () => {
           kb_id: config.knowledgeBase,
           model: config.model,
           temperature: config.temperature,
-          top_k: config.topK
+          top_k: config.topK,
+          user_id: String(user?.id || 'guest'),
+          role: user?.role || 'user',
         })
       })
 

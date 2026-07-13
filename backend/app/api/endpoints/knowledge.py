@@ -17,16 +17,88 @@ import time
 
 router = APIRouter()
 
+
+def _normalize_user_id(user_id: str | int | None) -> str:
+    value = str(user_id or "guest").strip()
+    return value[:100] or "guest"
+
+
+def _is_admin(user_id: str | int | None = None, role: str | None = None) -> bool:
+    return role == "admin" or _normalize_user_id(user_id) in {"admin", "1"}
+
+
+def _serialize_kb(kb: KnowledgeBase) -> dict:
+    return {
+        "id": kb.id,
+        "name": kb.name,
+        "description": kb.description,
+        "created_at": kb.created_at.isoformat() + 'Z',
+        "document_count": len(kb.documents),
+        "total_size": sum(doc.file_size for doc in kb.documents if doc.file_size),
+        "updated_at": max(
+            (doc.indexed_time or doc.upload_time for doc in kb.documents if doc.indexed_time or doc.upload_time),
+            default=kb.created_at
+        ).isoformat() + 'Z',
+        "owner_user_id": kb.owner_user_id,
+        "owner_name": kb.owner_name,
+        "owner_role": kb.owner_role,
+        "visibility": kb.visibility,
+    }
+
+
+async def _get_visible_kb(
+    db: AsyncSession,
+    kb_id: int,
+    user_id: str | int | None = None,
+    role: str | None = None,
+) -> KnowledgeBase:
+    result = await db.execute(
+        select(KnowledgeBase)
+        .options(selectinload(KnowledgeBase.documents))
+        .where(KnowledgeBase.id == kb_id)
+    )
+    kb = result.scalar_one_or_none()
+    if not kb:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    if _is_admin(user_id, role):
+        return kb
+    if kb.owner_user_id != _normalize_user_id(user_id):
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    return kb
+
+
+async def _get_visible_doc(
+    db: AsyncSession,
+    doc_id: int,
+    user_id: str | int | None = None,
+    role: str | None = None,
+) -> Document:
+    result = await db.execute(select(Document).where(Document.id == doc_id))
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    await _get_visible_kb(db, doc.kb_id, user_id, role)
+    return doc
+
+
 @router.post("/bases")
 async def create_knowledge_base(
     name: str = Form(...),
     description: str = Form(None),
+    user_id: str = Form("guest"),
+    role: str = Form("user"),
+    user_name: str = Form(None),
     db: AsyncSession = Depends(get_db)
 ):
     """创建知识库"""
+    owner_id = "admin" if _is_admin(user_id, role) else _normalize_user_id(user_id)
     kb = KnowledgeBase(
         name=name,
         description=description,
+        owner_user_id=owner_id,
+        owner_name=user_name or ("管理员" if owner_id == "admin" else owner_id),
+        owner_role="admin" if _is_admin(user_id, role) else "user",
+        visibility="private",
         created_at=datetime.utcnow()
     )
     db.add(kb)
@@ -37,59 +109,48 @@ async def create_knowledge_base(
         "id": kb.id,
         "name": kb.name,
         "description": kb.description,
+        "owner_user_id": kb.owner_user_id,
         "created_at": kb.created_at.isoformat()
     }
 
 @router.get("/bases")
-async def list_knowledge_bases(db: AsyncSession = Depends(get_db)):
+async def list_knowledge_bases(
+    user_id: str = "guest",
+    role: str = "user",
+    db: AsyncSession = Depends(get_db),
+):
     """获取知识库列表"""
-    result = await db.execute(
+    stmt = (
         select(KnowledgeBase)
         .options(selectinload(KnowledgeBase.documents))
         .order_by(KnowledgeBase.created_at.desc())
     )
+    if not _is_admin(user_id, role):
+        stmt = stmt.where(KnowledgeBase.owner_user_id == _normalize_user_id(user_id))
+    result = await db.execute(
+        stmt
+    )
     kbs = result.scalars().all()
 
-    return [
-        {
-            "id": kb.id,
-            "name": kb.name,
-            "description": kb.description,
-            "created_at": kb.created_at.isoformat() + 'Z',  # 添加Z表示UTC时间
-            "document_count": len(kb.documents),
-            # 计算总存储空间（字节）
-            "total_size": sum(doc.file_size for doc in kb.documents if doc.file_size),
-            # 获取最近更新时间（最新文档的上传时间或索引时间）
-            "updated_at": max(
-                (doc.indexed_time or doc.upload_time for doc in kb.documents if doc.indexed_time or doc.upload_time),
-                default=kb.created_at
-            ).isoformat() + 'Z'  # 添加Z表示UTC时间
-        }
-        for kb in kbs
-    ]
+    return [_serialize_kb(kb) for kb in kbs]
 
 @router.get("/bases/{kb_id}")
 async def get_knowledge_base(
     kb_id: int,
+    user_id: str = "guest",
+    role: str = "user",
     db: AsyncSession = Depends(get_db)
 ):
     """获取知识库详情"""
-    result = await db.execute(
-        select(KnowledgeBase)
-        .options(selectinload(KnowledgeBase.documents))
-        .where(KnowledgeBase.id == kb_id)
-    )
-    kb = result.scalar_one_or_none()
-
-    if not kb:
-        raise HTTPException(status_code=404, detail="知识库不存在")
+    kb = await _get_visible_kb(db, kb_id, user_id, role)
 
     return {
         "id": kb.id,
         "name": kb.name,
         "description": kb.description,
         "created_at": kb.created_at.isoformat(),
-        "document_count": len(kb.documents)
+        "document_count": len(kb.documents),
+        "owner_user_id": kb.owner_user_id,
     }
 
 @router.put("/bases/{kb_id}")
@@ -97,16 +158,12 @@ async def update_knowledge_base(
     kb_id: int,
     name: str = Form(...),
     description: str = Form(...),
+    user_id: str = Form("guest"),
+    role: str = Form("user"),
     db: AsyncSession = Depends(get_db)
 ):
     """更新知识库信息"""
-    result = await db.execute(
-        select(KnowledgeBase).where(KnowledgeBase.id == kb_id)
-    )
-    kb = result.scalar_one_or_none()
-
-    if not kb:
-        raise HTTPException(status_code=404, detail="知识库不存在")
+    kb = await _get_visible_kb(db, kb_id, user_id, role)
 
     kb.name = name
     kb.description = description
@@ -123,18 +180,12 @@ async def update_knowledge_base(
 @router.delete("/bases/{kb_id}")
 async def delete_knowledge_base(
     kb_id: int,
+    user_id: str = "guest",
+    role: str = "user",
     db: AsyncSession = Depends(get_db)
 ):
     """删除知识库"""
-    result = await db.execute(
-        select(KnowledgeBase)
-        .options(selectinload(KnowledgeBase.documents))
-        .where(KnowledgeBase.id == kb_id)
-    )
-    kb = result.scalar_one_or_none()
-
-    if not kb:
-        raise HTTPException(status_code=404, detail="知识库不存在")
+    kb = await _get_visible_kb(db, kb_id, user_id, role)
 
     # 1. 删除该知识库下所有文档的物理文件
     deleted_files = 0
@@ -169,6 +220,8 @@ async def delete_knowledge_base(
 async def upload_document(
     kb_id: int,
     file: UploadFile = File(...),
+    user_id: str = Form("guest"),
+    role: str = Form("user"),
     db: AsyncSession = Depends(get_db)
 ):
     """上传文档到知识库"""
@@ -176,13 +229,7 @@ async def upload_document(
 
     try:
         # 检查知识库是否存在
-        result = await db.execute(
-            select(KnowledgeBase).where(KnowledgeBase.id == kb_id)
-        )
-        kb = result.scalar_one_or_none()
-
-        if not kb:
-            raise HTTPException(status_code=404, detail="知识库不存在")
+        await _get_visible_kb(db, kb_id, user_id, role)
 
         # 处理文件名冲突：如果文件已存在，添加数字后缀
         original_filename = file.filename
@@ -239,6 +286,8 @@ async def upload_document(
             "message": result_msg
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         await monitor_service.log_operation(
             db=db,
@@ -253,17 +302,13 @@ async def upload_document(
 @router.get("/bases/{kb_id}/documents")
 async def list_documents(
     kb_id: int,
+    user_id: str = "guest",
+    role: str = "user",
     db: AsyncSession = Depends(get_db)
 ):
     """获取知识库的文档列表"""
     # 检查知识库是否存在
-    result = await db.execute(
-        select(KnowledgeBase).where(KnowledgeBase.id == kb_id)
-    )
-    kb = result.scalar_one_or_none()
-
-    if not kb:
-        raise HTTPException(status_code=404, detail="知识库不存在")
+    await _get_visible_kb(db, kb_id, user_id, role)
 
     # 获取文档列表
     result = await db.execute(
@@ -290,16 +335,12 @@ async def list_documents(
 async def get_document_content(
     doc_id: int,
     limit: int = 20,
+    user_id: str = "guest",
+    role: str = "user",
     db: AsyncSession = Depends(get_db)
 ):
     """获取文档内容（分块）- 从向量数据库检索真实内容"""
-    result = await db.execute(
-        select(Document).where(Document.id == doc_id)
-    )
-    doc = result.scalar_one_or_none()
-
-    if not doc:
-        raise HTTPException(status_code=404, detail="文档不存在")
+    doc = await _get_visible_doc(db, doc_id, user_id, role)
 
     # 使用文档ID和知识库ID从向量数据库获取文档分块和总数
     chunks, total_chunks = vector_store_service.get_document_chunks(doc.id, doc.kb_id, limit=limit)
@@ -318,16 +359,12 @@ async def get_document_content(
 @router.get("/documents/{doc_id}")
 async def get_document(
     doc_id: int,
+    user_id: str = "guest",
+    role: str = "user",
     db: AsyncSession = Depends(get_db)
 ):
     """获取文档详情"""
-    result = await db.execute(
-        select(Document).where(Document.id == doc_id)
-    )
-    doc = result.scalar_one_or_none()
-
-    if not doc:
-        raise HTTPException(status_code=404, detail="文档不存在")
+    doc = await _get_visible_doc(db, doc_id, user_id, role)
 
     return {
         "id": doc.id,
@@ -343,16 +380,12 @@ async def get_document(
 @router.get("/documents/{doc_id}/download")
 async def download_document(
     doc_id: int,
+    user_id: str = "guest",
+    role: str = "user",
     db: AsyncSession = Depends(get_db)
 ):
     """下载文档原文件"""
-    result = await db.execute(
-        select(Document).where(Document.id == doc_id)
-    )
-    doc = result.scalar_one_or_none()
-
-    if not doc:
-        raise HTTPException(status_code=404, detail="文档不存在")
+    doc = await _get_visible_doc(db, doc_id, user_id, role)
 
     if not os.path.exists(doc.file_path):
         raise HTTPException(status_code=404, detail="文件不存在")
@@ -366,16 +399,12 @@ async def download_document(
 @router.delete("/documents/{doc_id}")
 async def delete_document(
     doc_id: int,
+    user_id: str = "guest",
+    role: str = "user",
     db: AsyncSession = Depends(get_db)
 ):
     """删除文档"""
-    result = await db.execute(
-        select(Document).where(Document.id == doc_id)
-    )
-    doc = result.scalar_one_or_none()
-
-    if not doc:
-        raise HTTPException(status_code=404, detail="文档不存在")
+    doc = await _get_visible_doc(db, doc_id, user_id, role)
 
     # 1. 删除向量数据库中的数据（使用文档ID和知识库ID）
     deleted_count = 0
@@ -397,11 +426,20 @@ async def delete_document(
     return {"message": "文档已删除", "id": doc_id, "deleted_chunks": deleted_count}
 
 @router.get("/list", response_model=List[DocumentInfo])
-async def list_all_documents(db: AsyncSession = Depends(get_db)):
+async def list_all_documents(
+    user_id: str = "guest",
+    role: str = "user",
+    db: AsyncSession = Depends(get_db),
+):
     """获取所有文档列表（兼容旧接口）"""
-    result = await db.execute(
-        select(Document).order_by(Document.upload_time.desc())
+    stmt = (
+        select(Document)
+        .join(KnowledgeBase, KnowledgeBase.id == Document.kb_id)
+        .order_by(Document.upload_time.desc())
     )
+    if not _is_admin(user_id, role):
+        stmt = stmt.where(KnowledgeBase.owner_user_id == _normalize_user_id(user_id))
+    result = await db.execute(stmt)
     docs = result.scalars().all()
 
     return [
@@ -419,6 +457,9 @@ async def list_all_documents(db: AsyncSession = Depends(get_db)):
 @router.post("/upload")
 async def upload_document_simple(
     file: UploadFile = File(...),
+    user_id: str = Form("guest"),
+    role: str = Form("user"),
+    user_name: str = Form(None),
     db: AsyncSession = Depends(get_db)
 ):
     """上传文档（简化版，自动创建默认知识库）"""
@@ -426,8 +467,12 @@ async def upload_document_simple(
 
     try:
         # 查找或创建默认知识库
+        owner_id = "admin" if _is_admin(user_id, role) else _normalize_user_id(user_id)
         result = await db.execute(
-            select(KnowledgeBase).where(KnowledgeBase.name == "默认知识库")
+            select(KnowledgeBase).where(
+                KnowledgeBase.name == "默认知识库",
+                KnowledgeBase.owner_user_id == owner_id,
+            )
         )
         kb = result.scalar_one_or_none()
 
@@ -435,6 +480,10 @@ async def upload_document_simple(
             kb = KnowledgeBase(
                 name="默认知识库",
                 description="自动创建的默认知识库",
+                owner_user_id=owner_id,
+                owner_name=user_name or ("管理员" if owner_id == "admin" else owner_id),
+                owner_role="admin" if _is_admin(user_id, role) else "user",
+                visibility="private",
                 created_at=datetime.utcnow()
             )
             db.add(kb)

@@ -1,0 +1,33 @@
+{
+  "schema": "coal_main_agent_strategy_eval_tasks_v1",
+  "tasks": [
+    {
+      "task_id": "route_review_docs",
+      "task_type": "待审文档切分与审查路由",
+      "task": "把 new_docs 里的待审文档切分并启动审查流程。",
+      "required_tools": ["list_input_files", "run_script"],
+      "allowed_extra_tools": ["list_skills", "read_skill", "inspect_document", "queue_stats"]
+    },
+    {
+      "task_id": "retrieve_rule_basis",
+      "task_type": "法规依据检索",
+      "task": "检索瓦斯浓度达到1.0%必须停止用电作业的法规依据，并给出可引用条款。",
+      "required_tools": ["retrieve_regulations"],
+      "allowed_extra_tools": ["list_skills", "read_skill"]
+    },
+    {
+      "task_id": "inspect_skill_route",
+      "task_type": "技能读取与流程判断",
+      "task": "读取 chunk-pending-doc 技能，说明待审文档应该使用哪个脚本切分。",
+      "required_tools": ["list_skills", "read_skill"],
+      "allowed_extra_tools": ["list_input_files", "inspect_document"]
+    },
+    {
+      "task_id": "queue_status_triage",
+      "task_type": "升级队列状态判断",
+      "task": "查看当前升级队列状态，并判断是否需要进入人工或主智能体裁决流程。",
+      "required_tools": ["queue_stats"],
+      "allowed_extra_tools": ["list_skills", "read_skill"]
+    }
+  ]
+}

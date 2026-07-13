@@ -72,6 +72,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     docx_path TEXT NOT NULL,
     paragraphs_path TEXT,          -- 段落模型 JSON 落盘路径（前端中间面板用）
     mine_type TEXT NOT NULL DEFAULT 'non_outburst',
+    kb_id INTEGER,
+    user_id TEXT DEFAULT 'guest',
     status TEXT NOT NULL DEFAULT 'pending',  -- pending/parsing/reviewing/done/failed/cancelled
     progress INTEGER NOT NULL DEFAULT 0,
     n_chunks INTEGER DEFAULT 0,
@@ -135,6 +137,8 @@ class ReviewQueue:
         rows = self._conn.execute("PRAGMA table_info(jobs)").fetchall()
         existing = {row["name"] for row in rows}
         additions = {
+            "user_id": "TEXT DEFAULT 'guest'",
+            "kb_id": "INTEGER",
             "agent_stage": "TEXT",
             "phase_done": "INTEGER DEFAULT 0",
             "phase_total": "INTEGER DEFAULT 0",
@@ -362,12 +366,14 @@ class ReviewQueue:
 
     def create_job(self, job_id: str, doc_name: str, docx_path: str,
                    mine_type: str = "non_outburst",
-                   paragraphs_path: Optional[str] = None) -> int:
+                   paragraphs_path: Optional[str] = None,
+                   user_id: str = "guest",
+                   kb_id: Optional[int] = None) -> int:
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO jobs (job_id, created_at, updated_at, doc_name, docx_path, "
-                "paragraphs_path, mine_type, status) VALUES (?,?,?,?,?,?,?, 'pending')",
-                (job_id, _now(), _now(), doc_name, docx_path, paragraphs_path, mine_type),
+                "paragraphs_path, mine_type, user_id, kb_id, status) VALUES (?,?,?,?,?,?,?,?,?, 'pending')",
+                (job_id, _now(), _now(), doc_name, docx_path, paragraphs_path, mine_type, user_id, kb_id),
             )
             self._conn.commit()
             return cur.lastrowid
@@ -408,6 +414,41 @@ class ReviewQueue:
             ).fetchone()
         return dict(row) if row else None
 
+    def list_jobs(self, user_id: Optional[str] = None, limit: int = 30) -> List[Dict[str, Any]]:
+        """列出审查历史，最新在前。user_id 为空时返回全部任务。"""
+        limit = max(1, min(int(limit), 200))
+        with self._lock:
+            if user_id:
+                rows = self._conn.execute(
+                    """
+                    SELECT j.*,
+                           COUNT(i.id) AS issue_count,
+                           SUM(CASE WHEN i.human_action != 'pending' THEN 1 ELSE 0 END) AS decided_count
+                    FROM jobs j
+                    LEFT JOIN issues i ON i.job_id = j.job_id
+                    WHERE COALESCE(j.user_id, 'guest') = ?
+                    GROUP BY j.id
+                    ORDER BY j.id DESC
+                    LIMIT ?
+                    """,
+                    (user_id, limit),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT j.*,
+                           COUNT(i.id) AS issue_count,
+                           SUM(CASE WHEN i.human_action != 'pending' THEN 1 ELSE 0 END) AS decided_count
+                    FROM jobs j
+                    LEFT JOIN issues i ON i.job_id = j.job_id
+                    GROUP BY j.id
+                    ORDER BY j.id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
     def cancel_job(self, job_id: str, reason: str = "用户取消任务") -> bool:
         """取消未完成任务。pending 任务不会再被 worker 领取；运行中任务由 worker 协作停止。"""
         with self._lock:
@@ -420,6 +461,14 @@ class ReviewQueue:
             self._conn.commit()
             return cur.rowcount > 0
 
+    def delete_job(self, job_id: str) -> bool:
+        """删除 Web 审查任务及其问题记录。文件缓存由上层按需清理。"""
+        with self._lock:
+            self._conn.execute("DELETE FROM issues WHERE job_id=?", (job_id,))
+            cur = self._conn.execute("DELETE FROM jobs WHERE job_id=?", (job_id,))
+            self._conn.commit()
+            return cur.rowcount > 0
+
     # ============ 问题（issues）：边审边写 / SSE 流式读 / 人工反馈回流 ============
 
     def add_issue(self, job_id: str, chunk_index: int, issue_type: str, status: str,
@@ -427,6 +476,8 @@ class ReviewQueue:
                   title: str = "", original_text: str = "", suggestion: str = "",
                   regulation: str = "", reason: str = "",
                   detail: Optional[Dict] = None, escalation_type: str = "") -> int:
+        if escalation_type and not isinstance(escalation_type, str):
+            escalation_type = json.dumps(escalation_type, ensure_ascii=False)
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO issues (job_id, created_at, chunk_index, block_indices, "
@@ -445,6 +496,12 @@ class ReviewQueue:
         item = dict(row)
         item["block_indices"] = json.loads(item.get("block_indices") or "[]")
         item["detail"] = json.loads(item.get("detail") or "{}")
+        esc = item.get("escalation_type")
+        if isinstance(esc, str) and esc.strip().startswith(("{", "[")):
+            try:
+                item["escalation_type"] = json.loads(esc)
+            except json.JSONDecodeError:
+                pass
         return item
 
     def list_issues(self, job_id: str, after_id: int = 0) -> List[Dict[str, Any]]:
@@ -498,6 +555,17 @@ class ReviewQueue:
                 (int(applied), agent_note, _now(), int(issue_id)),
             )
             self._conn.commit()
+
+    def revoke_issue_feedback(self, issue_id: int) -> bool:
+        """撤回尚未安全落盘的人工裁决，恢复为待人工处理。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE issues SET human_action='pending', human_text='', "
+                "agent_applied=0, agent_note='', updated_at=? WHERE id=?",
+                (_now(), int(issue_id)),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
 
 if __name__ == "__main__":

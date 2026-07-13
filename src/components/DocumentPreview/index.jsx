@@ -8,6 +8,7 @@ import {
   ClockCircleOutlined,
   DatabaseOutlined
 } from '@ant-design/icons'
+import useUserStore from '../../store/userStore'
 import './index.css'
 
 const { Title, Paragraph, Text } = Typography
@@ -118,6 +119,7 @@ const mockDocumentContent = {
 }
 
 const DocumentPreview = memo(({ visible, document, onClose }) => {
+  const user = useUserStore((state) => state.user)
   const [loading, setLoading] = useState(false)
   const [activeTab, setActiveTab] = useState('content')
   const [docContent, setDocContent] = useState(null)
@@ -130,7 +132,12 @@ const DocumentPreview = memo(({ visible, document, onClose }) => {
       setLoading(true)
       try {
         // 先尝试从API加载，最多获取10个块
-        let response = await fetch(`/api/knowledge/document-content/${document.id}?limit=10`)
+        const params = new URLSearchParams({
+          limit: '10',
+          user_id: String(user?.id || 'guest'),
+          role: user?.role || 'user',
+        })
+        let response = await fetch(`/api/knowledge/document-content/${document.id}?${params.toString()}`)
 
         // 如果API失败，尝试从本地JSON文件加载（包含真实的煤矿安全规程内容）
         if (!response.ok) {

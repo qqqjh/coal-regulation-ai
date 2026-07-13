@@ -8,8 +8,12 @@ import './index.css'
 const { TextArea } = Input
 const { Option } = Select
 
-const Chat = () => {
+  const Chat = () => {
   const user = useUserStore((state) => state.user)
+  const knowledgeAuthQuery = () => new URLSearchParams({
+    user_id: String(user?.id || 'guest'),
+    role: user?.role || 'user',
+  }).toString()
 
   // 从 localStorage 加载会话数据
   const loadSessions = () => {
@@ -60,12 +64,13 @@ const Chat = () => {
   useEffect(() => {
     const fetchKnowledgeBases = async () => {
       try {
-        const response = await fetch('/api/knowledge/bases')
+        const response = await fetch(`/api/knowledge/bases?${knowledgeAuthQuery()}`)
         if (response.ok) {
           const data = await response.json()
           setKnowledgeBases(data)
-          // 如果有知识库且没有选中，默认选中第一个
-          if (data.length > 0 && !selectedKbId) {
+          if (data.length === 0) {
+            setSelectedKbId(null)
+          } else if (!selectedKbId || !data.some(kb => kb.id === selectedKbId)) {
             setSelectedKbId(data[0].id)
           }
         }
@@ -74,7 +79,7 @@ const Chat = () => {
       }
     }
     fetchKnowledgeBases()
-  }, [selectedKbId])
+  }, [selectedKbId, user?.id, user?.role])
 
   // 保存会话到 localStorage
   useEffect(() => {
@@ -210,7 +215,9 @@ const Chat = () => {
           ],
           useRAG: true,
           kbId: selectedKbId,  // 传递选中的知识库ID
-          model: selectedModel  // 传递选中的模型
+          model: selectedModel,  // 传递选中的模型
+          userId: String(user?.id || 'guest'),
+          role: user?.role || 'user',
         })
       })
 

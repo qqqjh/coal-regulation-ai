@@ -28,8 +28,21 @@ class Settings(BaseSettings):
     # MinerU：规则文档上传时推荐连接本机常驻 mineru-api
     MINERU_API_URL: str = "http://127.0.0.1:51071"
 
+    # 向量库：默认连接本机 Docker Milvus Standalone
+    VECTOR_BACKEND: str = "milvus"
+    MILVUS_URI: str = "http://localhost:19530"
+    MILVUS_TOKEN: str = ""
+    MILVUS_COLLECTION_PREFIX: str = "coal_regulation"
+    DEFAULT_TENANT_ID: str = "default"
+    DEFAULT_KB_ID: int = 3
+
     # 数据库
     SQLITE_URL: str = f"sqlite+aiosqlite:///{(BACKEND_DIR / 'data' / 'app.db')}"
+    ENABLE_MONGODB: bool = True
+    MONGODB_URI: str = "mongodb://coal_admin:coal_password@localhost:27017/coal_regulation_ai?authSource=admin"
+    MONGODB_DB: str = "coal_regulation_ai"
+    MONGODB_SERVER_SELECTION_TIMEOUT_MS: int = 500
+    REDIS_URL: str = "redis://localhost:6379/0"
 
     model_config = SettingsConfigDict(
         env_file=str(Path(__file__).resolve().parent.parent.parent / ".env"),

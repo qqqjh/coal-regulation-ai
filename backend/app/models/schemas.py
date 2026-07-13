@@ -13,7 +13,9 @@ class ChatRequest(BaseModel):
     sessionId: Optional[str] = None
     useRAG: bool = True
     kbId: Optional[int] = None  # 知识库ID，使用RAG时必须指定
-    model: Optional[str] = "gpt-3.5-turbo"  # 模型选择，默认gpt-3.5-turbo
+    model: Optional[str] = "qwen-plus"  # 模型选择，默认 Qwen Plus
+    userId: Optional[str] = None
+    role: Optional[str] = "user"
 
 # --- Knowledge Base Models ---
 class DocumentUploadResponse(BaseModel):
@@ -34,7 +36,7 @@ class RAGConfig(BaseModel):
     retrieval_k: int = 4
     temperature: float = 0.7
     similarity_threshold: float = 0.5
-    model_name: str = "gpt-3.5-turbo"
+    model_name: str = "qwen-plus"
 
 # --- Review Models ---
 class ReviewRequest(BaseModel):
