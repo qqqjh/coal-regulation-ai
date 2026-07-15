@@ -76,6 +76,51 @@ class PendingPdfCoordinateTests(unittest.TestCase):
         self.assertEqual([0], mapping["p1-u0"])
         self.assertEqual([2], mapping["p2-u1"])
 
+    def test_pdf_location_ignores_running_header_and_prefers_context(self):
+        chunk = {
+            "source_units": [
+                {
+                    "source_unit_id": "p23-header",
+                    "text": "S1302 工作面作业规程",
+                    "kind": "header",
+                    "page": 23,
+                    "bbox": [70, 32, 525, 55],
+                    "page_width": 595,
+                    "page_height": 842,
+                    "coordinate_space": "original_pdf",
+                },
+                {
+                    "source_unit_id": "p23-body",
+                    "text": "S1302 胶带顺槽长度为2013.7m。",
+                    "kind": "text",
+                    "page": 23,
+                    "bbox": [76, 410, 524, 442],
+                    "page_width": 595,
+                    "page_height": 842,
+                    "coordinate_space": "original_pdf",
+                },
+                {
+                    "source_unit_id": "p24-body",
+                    "text": "另一处也提到了S1302。",
+                    "kind": "text",
+                    "page": 24,
+                    "bbox": [76, 220, 524, 252],
+                    "page_width": 595,
+                    "page_height": 842,
+                    "coordinate_space": "original_pdf",
+                },
+            ]
+        }
+
+        locations = V9Worker._pdf_locations_for_text(
+            chunk,
+            "S1302",
+            "S1302 胶带顺槽长度为2013.7m。",
+        )
+
+        self.assertEqual(["p23-body"], [item["source_unit_id"] for item in locations])
+        self.assertEqual("text", locations[0]["kind"])
+
     def test_pdf_editable_docx_is_built_from_unique_mineru_units(self):
         chunks = [
             {

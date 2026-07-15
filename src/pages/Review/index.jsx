@@ -55,6 +55,37 @@ function normalizeText(text = '') {
   return String(text).normalize('NFKC').replace(/\s+/g, '')
 }
 
+const PDF_MARGIN_KINDS = new Set([
+  'header', 'footer', 'page_header', 'page_footer', 'page-header', 'page-footer',
+  'page_number', 'page-number', 'pagenumber',
+])
+
+function isPdfMarginLocation(location) {
+  const kind = String(location?.kind || '').trim().toLowerCase()
+  if (PDF_MARGIN_KINDS.has(kind)) return true
+
+  const bbox = Array.isArray(location?.bbox) ? location.bbox.map(Number) : []
+  const pageHeight = Number(location?.page_height)
+  if (bbox.length !== 4 || bbox.some(value => !Number.isFinite(value)) || !(pageHeight > 0)) {
+    return false
+  }
+  // MinerU bboxes use a top-left origin. Ignore running header/footer bands so
+  // a repeated document code does not outrank the same text in the body.
+  const centerY = (bbox[1] + bbox[3]) / 2
+  return centerY <= pageHeight * 0.12 || centerY >= pageHeight * 0.93
+}
+
+function isPdfMarginElement(element) {
+  const page = element?.closest?.('.rv-pdf-page')
+  if (!page) return false
+  const pageRect = page.getBoundingClientRect()
+  const rect = element.getBoundingClientRect()
+  if (!(pageRect.height > 0)) return false
+  const centerY = (rect.top + rect.bottom) / 2
+  return centerY <= pageRect.top + pageRect.height * 0.12
+    || centerY >= pageRect.top + pageRect.height * 0.93
+}
+
 function issuePdfLocations(issue) {
   const detail = issue?.detail || {}
   const groups = [
@@ -69,7 +100,7 @@ function issuePdfLocations(issue) {
     if (!Number.isFinite(page) || page < 1 || bbox.length !== 4 || bbox.some(value => !Number.isFinite(value))) {
       return false
     }
-    if (bbox[2] <= bbox[0] || bbox[3] <= bbox[1]) return false
+    if (bbox[2] <= bbox[0] || bbox[3] <= bbox[1] || isPdfMarginLocation(location)) return false
     const key = `${page}:${bbox.join(',')}:${location.role}`
     if (seen.has(key)) return false
     seen.add(key)
@@ -119,6 +150,11 @@ function canUsePdfAreaMatch(issue, normStr, normCandidate, isSelected = false) {
   if (normCandidate.length < minCandidateLength || normStr.length < minFragmentLength) return false
   if (!/[\u4e00-\u9fa5A-Za-z0-9]/.test(normStr)) return false
   if (/^[\d.%％Ω]+$/.test(normStr) && normStr.length < 4) return false
+  // Codes such as S1302 often appear alone in every running header. They are
+  // too weak to locate a much longer issue, even when the issue is selected.
+  if (/^[A-Za-z]*\d+[A-Za-z\d._-]*$/.test(normStr)
+      && normStr.length <= 12
+      && normCandidate.length >= normStr.length * 2) return false
   return normCandidate.includes(normStr)
 }
 
@@ -236,7 +272,9 @@ function samePdfAreaRects(a = [], b = []) {
 }
 
 function pdfIssueCandidates(issue) {
-  const items = [...issueCandidates(issue), issue.detail?.context].filter(Boolean)
+  // Context is useful for choosing the page, but highlighting it makes every
+  // repeated header token look like the error itself. Paint only issue text.
+  const items = issueCandidates(issue)
   const out = []
   items.forEach(text => {
     out.push(text)
@@ -312,6 +350,25 @@ function issueLocateCandidates(issue) {
     issue.human_text,
     issue.suggestion,
   ].map(v => (v || '').trim()).filter(Boolean)
+}
+
+function buildPdfLocateFragments(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return []
+  const values = [raw, ...raw.split(/[|｜\n\r]/)]
+  const fragments = []
+  values.forEach(item => {
+    const normalized = normalizeText(item)
+    if (normalized.length < 8) return
+    if (/^[A-Za-z]*\d+[A-Za-z\d._-]*$/.test(normalized) && normalized.length <= 12) return
+    fragments.push(normalized)
+    if (normalized.length > 80) {
+      for (let start = 0; start + 24 <= normalized.length; start += 20) {
+        fragments.push(normalized.slice(start, start + 36))
+      }
+    }
+  })
+  return [...new Set(fragments)].sort((a, b) => b.length - a.length)
 }
 
 function buildBlockPageCandidates(issue, blockByIndex) {
@@ -791,7 +848,17 @@ export default function Review() {
           const pageNo = i + 1
           const page = await pdf.getPage(pageNo)
           const content = await page.getTextContent()
-          return [pageNo, content.items.map(item => item.str || '').join('')]
+          const pageHeight = page.getViewport({ scale: 1 }).height
+          const bodyText = content.items
+            .filter(item => {
+              const y = Number(item?.transform?.[5])
+              if (!Number.isFinite(y) || !(pageHeight > 0)) return true
+              // PDF text coordinates use a bottom-left origin.
+              return y >= pageHeight * 0.07 && y <= pageHeight * 0.895
+            })
+            .map(item => item.str || '')
+            .join('')
+          return [pageNo, bodyText]
         })
       )
       setPdfTextIndex(Object.fromEntries(entries))
@@ -1315,8 +1382,8 @@ export default function Review() {
         return
       }
       const candidates = [
+        ...issueLocateCandidates(issue).flatMap(buildPdfLocateFragments),
         ...buildBlockPageCandidates(issue, blockByIndex),
-        ...issueLocateCandidates(issue).map(candidate => normalizeText(candidate)),
       ].filter(Boolean)
       for (const normalized of candidates) {
         if (normalized.length < 4) continue
@@ -1445,7 +1512,10 @@ export default function Review() {
         : focusedBlock !== null
           ? `.rv-doc-block[data-block-index="${focusedBlock}"]`
           : `.rv-doc-mark[data-issue-id="${selectedId}"], .rv-doc-block[data-issue-ids~="${selectedId}"]`
-      const target = document.querySelector(selector)
+      const targets = Array.from(document.querySelectorAll(selector))
+      const target = previewMode === 'pdf'
+        ? targets.find(item => !isPdfMarginElement(item))
+        : targets[0]
       target?.scrollIntoView({ block: 'center', behavior: 'smooth' })
     }, 120)
     return () => clearTimeout(timer)
@@ -1500,6 +1570,7 @@ export default function Review() {
       marks.forEach(mark => {
         const issueId = Number(mark.dataset.issueId)
         if (!issueById.has(issueId)) return
+        if (isPdfMarginElement(mark)) return
         const rect = mark.getBoundingClientRect()
         if (rect.width < 1 || rect.height < 1) return
         if (!grouped.has(issueId)) grouped.set(issueId, [])

@@ -364,12 +364,24 @@ class V9Worker:
         return units
 
     @staticmethod
-    def _pdf_locations_for_text(chunk: Dict[str, Any], text: str = "") -> List[Dict[str, Any]]:
+    def _pdf_locations_for_text(
+        chunk: Dict[str, Any],
+        text: str = "",
+        context: str = "",
+    ) -> List[Dict[str, Any]]:
         needle = _compact_text(text)
-        locations: List[Dict[str, Any]] = []
+        context_needle = _compact_text(context)
+        candidates: List[tuple[Dict[str, Any], bool]] = []
         seen = set()
         for unit in chunk.get("source_units") or []:
             if str(unit.get("coordinate_space") or "") != "original_pdf":
+                continue
+            kind = str(unit.get("kind") or "").strip().lower()
+            if kind in {
+                "header", "footer", "page_header", "page_footer",
+                "page-header", "page-footer", "page_number", "page-number",
+                "pagenumber",
+            }:
                 continue
             unit_text = _compact_text(unit.get("text", ""))
             if needle and unit_text and needle not in unit_text and unit_text not in needle:
@@ -389,6 +401,7 @@ class V9Worker:
                 "page": page,
                 "bbox": bbox,
                 "source_unit_id": str(unit.get("source_unit_id") or ""),
+                "kind": kind,
             }
             for size_key in ("page_width", "page_height"):
                 try:
@@ -397,8 +410,16 @@ class V9Worker:
                     size = 0
                 if size > 0:
                     location[size_key] = round(size, 3)
-            locations.append(location)
-        return locations
+            context_match = bool(
+                context_needle
+                and unit_text
+                and (context_needle in unit_text or unit_text in context_needle)
+            )
+            candidates.append((location, context_match))
+
+        if context_needle and any(context_match for _, context_match in candidates):
+            candidates = [item for item in candidates if item[1]]
+        return [location for location, _ in candidates]
 
     @staticmethod
     def _pdf_page_sizes(source_path: str) -> Dict[int, Dict[str, float]]:
@@ -1323,7 +1344,11 @@ class V9Worker:
                 detail={"numeric": numeric_detail,
                         "summary": review.get("summary", ""),
                         "adjudication": review.get("main_agent_adjudication", {}),
-                        "pdf_locations": self._pdf_locations_for_text(review_chunk, original),
+                        "pdf_locations": self._pdf_locations_for_text(
+                            review_chunk,
+                            original,
+                            issue.get("context", "") or issue.get("pending_context", ""),
+                        ),
                         "feedback_experience": feedback_trace},
             )
             count += 1
@@ -1379,7 +1404,11 @@ class V9Worker:
                 reason=t.get("reason", ""),
                 detail={"confidence": t.get("confidence", ""),
                         "context": t.get("context", ""),
-                        "pdf_locations": self._pdf_locations_for_text(review_chunk, wrong),
+                        "pdf_locations": self._pdf_locations_for_text(
+                            review_chunk,
+                            wrong,
+                            t.get("context", ""),
+                        ),
                         "feedback_experience": feedback_trace},
             )
             count += 1
