@@ -12,7 +12,8 @@ import {
   SafetyCertificateOutlined,
   HomeOutlined,
   SunOutlined,
-  MoonOutlined
+  MoonOutlined,
+  SyncOutlined
 } from '@ant-design/icons'
 import useUserStore from '../../store/userStore'
 import useThemeStore from '../../store/themeStore'
@@ -78,6 +79,11 @@ const Sidebar = memo(() => {
         key: '/admin/review-kb',
         icon: <DatabaseOutlined />,
         label: '审查知识库权限'
+      },
+      {
+        key: '/admin/flywheel',
+        icon: <SyncOutlined />,
+        label: '数据飞轮'
       }
     ]
     : baseMenuItems

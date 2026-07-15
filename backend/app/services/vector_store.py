@@ -14,6 +14,19 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.core.config import settings
 
+_project_root = str(settings.PROJECT_ROOT)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+from rule_applicability import (  # noqa: E402
+    APPLICABILITY_AUTO,
+    APPLICABILITY_GENERAL,
+    APPLICABILITY_OUTBURST_ONLY,
+    ensure_rule_applicability,
+    normalize_applicability_mode,
+    with_rule_applicability,
+)
+
 
 class VectorStoreService:
     """Milvus-backed vector store for Web knowledge-base RAG.
@@ -307,6 +320,7 @@ class VectorStoreService:
         doc_id: Optional[int],
         kb_id: Optional[int],
         mineru_json_path: str,
+        applicability_mode: str = APPLICABILITY_AUTO,
     ) -> int:
         if kb_id is None:
             raise ValueError("规则文档向量化需要 kb_id")
@@ -314,6 +328,9 @@ class VectorStoreService:
         documents: List[LangChainDocument] = []
         for doc_name, chunks in chunks_by_doc.items():
             for i, chunk in enumerate(chunks):
+                chunk = with_rule_applicability(
+                    chunk, doc_name, applicability_mode
+                )
                 content = str(chunk.get("retrieval_text") or chunk.get("content") or "").strip()
                 if not content:
                     continue
@@ -336,6 +353,10 @@ class VectorStoreService:
                     "semantic_role": chunk.get("semantic_role", ""),
                     "canonical_rule_id": chunk.get("canonical_rule_id", ""),
                     "retrievable": bool(chunk.get("retrievable", True)),
+                    "applicability": chunk["applicability"],
+                    "applicability_mode": chunk["applicability_mode"],
+                    "applicability_reason": chunk["applicability_reason"],
+                    "applicability_matches": chunk["applicability_matches"],
                     "char_count": int(chunk.get("char_count") or len(content)),
                     "upload_time": str(os.path.getmtime(file_path)),
                     "mineru_json_path": mineru_json_path,
@@ -351,6 +372,7 @@ class VectorStoreService:
         filename: str,
         doc_id: Optional[int],
         kb_id: Optional[int],
+        applicability_mode: str = APPLICABILITY_AUTO,
     ) -> str:
         self._ensure_project_root_importable()
         from chapter_based_chunking_v6 import chunk_rule_json_files_v6
@@ -362,9 +384,15 @@ class VectorStoreService:
             api_url=settings.MINERU_API_URL,
             timeout=7200,
         )
+        artifact_dir = (
+            settings.DATA_DIR
+            / "knowledge_chunks"
+            / f"kb_{int(kb_id or 0)}"
+            / f"doc_{int(doc_id or 0)}"
+        )
         all_rule_chunks = chunk_rule_json_files_v6(
-            json_dir=Path(result.project_json_path).parent,
-            output_dir=settings.PROJECT_ROOT / "chunks_visualization",
+            json_files=[Path(result.project_json_path)],
+            output_dir=artifact_dir,
         )
         doc_name = Path(result.project_json_path).stem.replace("MinerU_", "").split("__")[0]
         chunks_by_doc = {doc_name: all_rule_chunks.get(doc_name, [])}
@@ -377,8 +405,12 @@ class VectorStoreService:
             doc_id=doc_id,
             kb_id=kb_id,
             mineru_json_path=result.project_json_path,
+            applicability_mode=applicability_mode,
         )
-        return f"Success: MinerU rule chunks indexed ({added})"
+        return (
+            f"Success: MinerU rule chunks indexed ({added}); "
+            f"applicability={applicability_mode}"
+        )
 
     async def process_file(
         self,
@@ -387,17 +419,25 @@ class VectorStoreService:
         doc_id: Optional[int] = None,
         kb_id: Optional[int] = None,
         original_filename: Optional[str] = None,
+        applicability_mode: str = APPLICABILITY_AUTO,
     ) -> str:
         if kb_id is None:
             raise ValueError("文档向量化需要 kb_id")
 
+        applicability_mode = normalize_applicability_mode(applicability_mode)
         file_path = settings.UPLOAD_DIR / filename
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
         ext = filename.split(".")[-1].lower()
         if ext in {"pdf", "docx", "doc"}:
-            return self._process_rule_file_with_mineru(file_path, filename, doc_id, kb_id)
+            return self._process_rule_file_with_mineru(
+                file_path,
+                filename,
+                doc_id,
+                kb_id,
+                applicability_mode=applicability_mode,
+            )
         if ext != "txt":
             return "Unsupported file format"
 
@@ -409,11 +449,18 @@ class VectorStoreService:
             split.metadata["doc_id"] = int(doc_id or 0)
             split.metadata["kb_id"] = int(kb_id)
             split.metadata["filename"] = original_filename or filename
+            split.metadata["doc_name"] = original_filename or filename
             split.metadata["chunk_index"] = i
             split.metadata["source_type"] = "regulation"
             split.metadata["visibility"] = "internal"
             split.metadata["upload_time"] = str(os.path.getmtime(file_path))
             split.metadata["chunking_strategy"] = "text_recursive"
+            tagged = with_rule_applicability(
+                split.metadata,
+                original_filename or filename,
+                applicability_mode,
+            )
+            split.metadata.update(tagged)
 
         added = self.add_documents(splits, kb_id)
         return f"Success: text chunks indexed ({added})"
@@ -453,6 +500,122 @@ class VectorStoreService:
             docs.append(self._row_to_document(hit, score=hit.get("distance")))
         return docs
 
+    def _query_all_rows(
+        self,
+        expr: str,
+        *,
+        output_fields: Optional[List[str]] = None,
+    ) -> List[Dict]:
+        """读取某个知识库的全部规则块，供 v10 本地 BGE 索引使用。"""
+        client = self._get_client()
+        if not client.has_collection(self.collection_name):
+            return []
+        fields = output_fields or ["id", *self.OUTPUT_FIELDS]
+        iterator = None
+        try:
+            iterator = client.query_iterator(
+                collection_name=self.collection_name,
+                batch_size=1000,
+                filter=expr,
+                output_fields=fields,
+            )
+            rows: List[Dict] = []
+            while True:
+                batch = iterator.next()
+                if not batch:
+                    break
+                rows.extend(batch)
+            return rows
+        except (AttributeError, TypeError, NotImplementedError):
+            # Milvus Lite/旧版客户端可能没有 query_iterator。
+            return client.query(
+                collection_name=self.collection_name,
+                filter=expr,
+                output_fields=fields,
+                limit=10000,
+            )
+        finally:
+            if iterator is not None:
+                try:
+                    iterator.close()
+                except Exception:
+                    pass
+
+    def get_knowledge_base_review_chunks(
+        self,
+        kb_id: int,
+        *,
+        doc_id: Optional[int] = None,
+    ) -> List[Dict]:
+        """按 kb_id 返回可直接交给 v10 审查引擎的规则块。"""
+        expr = self._build_filter(kb_id, doc_id=doc_id)
+        if expr is None:
+            return []
+        rows = self._query_all_rows(expr)
+        chunks: List[Dict] = []
+        for row in rows:
+            document = self._row_to_document(row)
+            metadata = ensure_rule_applicability(
+                document.metadata,
+                str(document.metadata.get("doc_name") or document.metadata.get("filename") or ""),
+            )
+            if metadata.get("retrievable", True) is False:
+                continue
+            chunks.append(
+                {
+                    **metadata,
+                    "id": str(row.get("id") or ""),
+                    "content": document.page_content,
+                    "retrieval_text": document.page_content,
+                    "doc_name": str(
+                        metadata.get("doc_name") or metadata.get("filename") or ""
+                    ),
+                }
+            )
+        return sorted(
+            chunks,
+            key=lambda item: (
+                self._int(item.get("doc_id")),
+                self._int(item.get("chunk_index")),
+            ),
+        )
+
+    def get_applicability_summary(
+        self,
+        kb_id: int,
+        *,
+        doc_id: Optional[int] = None,
+    ) -> Dict[str, int]:
+        chunks = self.get_knowledge_base_review_chunks(kb_id, doc_id=doc_id)
+        general = sum(
+            1 for chunk in chunks if chunk.get("applicability") == APPLICABILITY_GENERAL
+        )
+        outburst_only = sum(
+            1
+            for chunk in chunks
+            if chunk.get("applicability") == APPLICABILITY_OUTBURST_ONLY
+        )
+        return {
+            "total": len(chunks),
+            "general": general,
+            "outburst_only": outburst_only,
+        }
+
+    def get_applicability_summaries(self, kb_id: int) -> Dict[int, Dict[str, int]]:
+        """一次读取整个知识库并按文档汇总，避免列表页逐文档扫描 Milvus。"""
+        summaries: Dict[int, Dict[str, int]] = {}
+        for chunk in self.get_knowledge_base_review_chunks(kb_id):
+            doc_id = self._int(chunk.get("doc_id"))
+            summary = summaries.setdefault(
+                doc_id,
+                {"total": 0, "general": 0, "outburst_only": 0},
+            )
+            summary["total"] += 1
+            applicability = chunk.get("applicability")
+            if applicability in {APPLICABILITY_GENERAL, APPLICABILITY_OUTBURST_ONLY}:
+                summary[applicability] += 1
+        return summaries
+
     def get_stats(self, kb_id: int = None):
         client = self._get_client()
         exists = client.has_collection(self.collection_name)
@@ -489,6 +652,10 @@ class VectorStoreService:
         chunks = []
         for i, row in enumerate(rows):
             metadata = self._row_to_document(row).metadata
+            metadata = ensure_rule_applicability(
+                metadata,
+                str(metadata.get("doc_name") or metadata.get("filename") or ""),
+            )
             chunks.append({
                 "id": i + 1,
                 "content": row.get("text") or "",

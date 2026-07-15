@@ -235,7 +235,26 @@ def run_mineru_api(
         files = {"files": (input_path.name, f)}
         print("[mineru] posting:", endpoint)
         response = requests.post(endpoint, data=data, files=files, timeout=timeout)
-    response.raise_for_status()
+    if not response.ok:
+        try:
+            error_payload = response.json()
+        except (ValueError, TypeError):
+            error_payload = {}
+        if isinstance(error_payload, dict):
+            detail = (
+                error_payload.get("error")
+                or error_payload.get("detail")
+                or error_payload.get("message")
+            )
+            task_id = error_payload.get("task_id")
+        else:
+            detail = ""
+            task_id = ""
+        detail = str(detail or response.text or response.reason or "未知错误").strip()
+        task_note = f"，task_id={task_id}" if task_id else ""
+        raise RuntimeError(
+            f"MinerU API 解析任务失败（HTTP {response.status_code}{task_note}）：{detail[:1000]}"
+        )
     response_json = response.json()
     if response_json.get("status") not in (None, "completed"):
         raise RuntimeError(f"MinerU API 解析失败: {response_json.get('status')} {response_json.get('error')}")

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import {
   Card,
   Button,
@@ -15,7 +15,8 @@ import {
   Row,
   Col,
   Progress,
-  List
+  List,
+  Select
 } from 'antd'
 import {
   PlusOutlined,
@@ -40,11 +41,42 @@ import './index.css'
 const { TextArea } = Input
 const { Dragger } = Upload
 
+const APPLICABILITY_OPTIONS = [
+  {
+    value: 'auto',
+    label: '自动识别',
+    description: '根据规则文档名称和章节标题判断，正文偶然出现“突出”不会误标。'
+  },
+  {
+    value: 'general',
+    label: '整份通用',
+    description: '强制将本次上传文档的全部规则块标记为通用。'
+  },
+  {
+    value: 'outburst_only',
+    label: '整份突出专用',
+    description: '强制将本次上传文档的全部规则块标记为突出矿井专用。'
+  }
+]
+
+const applicabilityMessage = (summary = {}) => {
+  if (summary.available === false) return '已入库，适用性统计稍后刷新'
+  const general = Number(summary.general || 0)
+  const outburst = Number(summary.outburst_only || 0)
+  return `通用 ${general} 块，突出专用 ${outburst} 块`
+}
+
+const SUPPORTED_RULE_EXTENSIONS = ['pdf', 'doc', 'docx', 'txt']
+const isSupportedRuleFile = (file) => {
+  const extension = String(file?.name || '').split('.').pop().toLowerCase()
+  return SUPPORTED_RULE_EXTENSIONS.includes(extension)
+}
+const isWithinUploadLimit = (file) => Number(file?.size || 0) / 1024 / 1024 < 10
+
 const Knowledge = () => {
   const user = useUserStore((state) => state.user)
   const [knowledgeBases, setKnowledgeBases] = useState([])
   const [documents, setDocuments] = useState([])
-  const [loading, setLoading] = useState(false)
 
   const [isKbModalVisible, setIsKbModalVisible] = useState(false)
   const [selectedKbId, setSelectedKbId] = useState(null)
@@ -57,17 +89,18 @@ const Knowledge = () => {
 
   // 文档编辑相关状态
   const [isDocModalVisible, setIsDocModalVisible] = useState(false)
-  const [editingDoc, setEditingDoc] = useState(null)
   const [docForm] = Form.useForm()
 
   // 批量上传相关状态
   const [batchUploadVisible, setBatchUploadVisible] = useState(false)
   const [uploadingFiles, setUploadingFiles] = useState([]) // {uid, name, size, status: 'uploading'|'success'|'error', progress}
+  const [batchUploading, setBatchUploading] = useState(false)
+  const [applicabilityMode, setApplicabilityMode] = useState('auto')
 
-  const authParams = () => new URLSearchParams({
+  const authParams = useCallback(() => new URLSearchParams({
     user_id: String(user?.id || 'guest'),
     role: user?.role || 'user',
-  })
+  }), [user?.id, user?.role])
 
   const appendAuthToForm = (values = {}) => new URLSearchParams({
     ...values,
@@ -77,8 +110,7 @@ const Knowledge = () => {
   })
 
   // 加载知识库列表
-  const loadKnowledgeBases = async () => {
-    setLoading(true)
+  const loadKnowledgeBases = useCallback(async () => {
     try {
       const response = await fetch(`/api/knowledge/bases?${authParams().toString()}`)
       if (response.ok) {
@@ -100,13 +132,11 @@ const Knowledge = () => {
     } catch (error) {
       console.error('加载知识库失败:', error)
       message.error('加载知识库失败')
-    } finally {
-      setLoading(false)
     }
-  }
+  }, [authParams, selectedKbId])
 
   // 加载文档列表
-  const loadDocuments = async (kbId) => {
+  const loadDocuments = useCallback(async (kbId) => {
     if (!kbId) return
     try {
       const response = await fetch(`/api/knowledge/bases/${kbId}/documents?${authParams().toString()}`)
@@ -124,19 +154,19 @@ const Knowledge = () => {
       console.error('加载文档列表失败:', error)
       message.error('加载文档列表失败')
     }
-  }
+  }, [authParams])
 
   // 组件加载时获取数据
   useEffect(() => {
     loadKnowledgeBases()
-  }, [user?.id, user?.role])
+  }, [loadKnowledgeBases])
 
   // 当选中知识库时加载文档
   useEffect(() => {
     if (selectedKbId) {
       loadDocuments(selectedKbId)
     }
-  }, [selectedKbId])
+  }, [loadDocuments, selectedKbId])
 
   // 打开文档预览
   const handlePreviewDocument = (document) => {
@@ -185,7 +215,9 @@ const Knowledge = () => {
       width: 100,
       align: 'center',
       render: (status) => (
-        <Tag color={status === '已索引' ? 'success' : 'processing'}>{status}</Tag>
+        <Tag color={status === '已索引' ? 'success' : status === 'failed' ? 'error' : 'processing'}>
+          {status === 'failed' ? '失败' : status}
+        </Tag>
       )
     },
     {
@@ -255,6 +287,26 @@ const Knowledge = () => {
       dataIndex: 'uploadTime',
       key: 'uploadTime',
       width: 180
+    },
+    {
+      title: '适用范围',
+      dataIndex: 'applicabilitySummary',
+      key: 'applicabilitySummary',
+      width: 210,
+      render: (summary = {}) => {
+        const total = Number(summary.total || 0)
+        const general = Number(summary.general || 0)
+        const outburst = Number(summary.outburst_only || 0)
+        if (summary.available === false || (total > 0 && general + outburst === 0)) {
+          return <Tag>适用性统计暂不可用</Tag>
+        }
+        return (
+          <Space size={[4, 4]} wrap>
+            <Tag color="green">通用 {general}</Tag>
+            <Tag color="volcano">突出专用 {outburst}</Tag>
+          </Space>
+        )
+      }
     },
     {
       title: '状态',
@@ -398,6 +450,7 @@ const Knowledge = () => {
       formData.append('file', file)
       formData.append('user_id', String(user?.id || 'guest'))
       formData.append('role', user?.role || 'user')
+      formData.append('applicability', applicabilityMode)
 
       try {
         const response = await fetch(`/api/knowledge/bases/${selectedKbId}/documents`, {
@@ -407,14 +460,18 @@ const Knowledge = () => {
 
         if (response.ok) {
           const result = await response.json()
-          message.success(`${file.name} 上传成功`)
+          message.success(
+            `${file.name} 上传并索引成功：${applicabilityMessage(result.applicability_summary)}`
+          )
           onSuccess(result)
           // 重新加载文档列表和知识库列表
           loadDocuments(selectedKbId)
           loadKnowledgeBases()
         } else {
-          message.error(`${file.name} 上传失败`)
-          onError(new Error('上传失败'))
+          const errorData = await response.json().catch(() => ({}))
+          const detail = errorData.detail || '上传失败'
+          message.error(`${file.name} 上传失败：${detail}`)
+          onError(new Error(detail))
         }
       } catch (error) {
         console.error('上传失败:', error)
@@ -423,15 +480,13 @@ const Knowledge = () => {
       }
     },
     beforeUpload: (file) => {
-      const isValidType = ['application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'text/plain'].includes(file.type)
-      if (!isValidType) {
+      if (!isSupportedRuleFile(file)) {
         message.error('只支持 PDF、Word、TXT 格式文件')
-        return false
+        return Upload.LIST_IGNORE
       }
-      const isLt10M = file.size / 1024 / 1024 < 10
-      if (!isLt10M) {
+      if (!isWithinUploadLimit(file)) {
         message.error('文件大小不能超过 10MB')
-        return false
+        return Upload.LIST_IGNORE
       }
       return true
     }
@@ -451,7 +506,6 @@ const Knowledge = () => {
 
   // 编辑文档
   const handleEditDoc = (record) => {
-    setEditingDoc(record)
     docForm.setFieldsValue({
       name: record.name
     })
@@ -461,13 +515,12 @@ const Knowledge = () => {
   // 提交文档编辑
   const handleDocSubmit = async () => {
     try {
-      const values = await docForm.validateFields()
+      await docForm.validateFields()
       // 这里可以添加更新文档名称的API调用
       // 暂时只是关闭弹窗
       message.info('文档编辑功能待实现')
       setIsDocModalVisible(false)
       docForm.resetFields()
-      setEditingDoc(null)
     } catch (error) {
       console.error('提交失败:', error)
     }
@@ -498,18 +551,16 @@ const Knowledge = () => {
     multiple: true,
     accept: '.pdf,.doc,.docx,.txt',
     showUploadList: false,
-    beforeUpload: (file, fileList) => {
+    beforeUpload: (file) => {
       // 验证文件类型
-      const isValidType = ['application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'text/plain'].includes(file.type)
-      if (!isValidType) {
+      if (!isSupportedRuleFile(file)) {
         message.error(`${file.name} 格式不支持，只支持 PDF、Word、TXT 格式`)
-        return false
+        return Upload.LIST_IGNORE
       }
       // 验证文件大小
-      const isLt10M = file.size / 1024 / 1024 < 10
-      if (!isLt10M) {
+      if (!isWithinUploadLimit(file)) {
         message.error(`${file.name} 超过10MB限制`)
-        return false
+        return Upload.LIST_IGNORE
       }
       return false // 阻止自动上传
     },
@@ -517,9 +568,8 @@ const Knowledge = () => {
       const { fileList } = info
       // 过滤有效文件
       const validFiles = fileList.filter(file => {
-        const isValidType = ['application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'text/plain'].includes(file.type)
-        const isLt10M = file.size / 1024 / 1024 < 10
-        return isValidType && isLt10M
+        const source = file.originFileObj || file
+        return isSupportedRuleFile(source) && isWithinUploadLimit(source)
       })
 
       // 更新上传文件列表
@@ -536,67 +586,70 @@ const Knowledge = () => {
   }
 
   // 开始批量上传
-  const handleStartBatchUpload = () => {
+  const handleStartBatchUpload = async () => {
     if (uploadingFiles.length === 0) {
       message.warning('请先选择要上传的文件')
       return
     }
+    if (!selectedKbId) {
+      message.error('请先选择知识库')
+      return
+    }
 
-    // 模拟上传每个文件
-    uploadingFiles.forEach((fileInfo, index) => {
-      // 设置为上传中状态
-      setTimeout(() => {
+    setBatchUploading(true)
+    let successCount = 0
+    try {
+      // 串行提交，避免多个 MinerU 解析任务同时争抢显存和内存。
+      for (const fileInfo of uploadingFiles) {
         setUploadingFiles(prev =>
-          prev.map(f => f.uid === fileInfo.uid ? { ...f, status: 'uploading', progress: 0 } : f)
+          prev.map(f => f.uid === fileInfo.uid
+            ? { ...f, status: 'uploading', progress: 35, error: '' }
+            : f)
         )
 
-        // 模拟上传进度
-        let progress = 0
-        const progressInterval = setInterval(() => {
-          progress += Math.random() * 30
-          if (progress >= 100) {
-            progress = 100
-            clearInterval(progressInterval)
+        const formData = new FormData()
+        formData.append('file', fileInfo.file)
+        formData.append('user_id', String(user?.id || 'guest'))
+        formData.append('role', user?.role || 'user')
+        formData.append('applicability', applicabilityMode)
 
-            // 上传完成
-            setUploadingFiles(prev =>
-              prev.map(f => f.uid === fileInfo.uid ? { ...f, status: 'success', progress: 100 } : f)
-            )
-
-            // 添加到文档列表
-            const newDoc = {
-              id: Date.now() + index,
-              knowledgeBaseId: selectedKbId,
-              name: fileInfo.name,
-              size: (fileInfo.size / 1024 / 1024).toFixed(2) + ' MB',
-              uploadTime: new Date().toLocaleString('zh-CN'),
-              status: '索引中'
-            }
-            setDocuments(prev => [...prev, newDoc])
-
-            // 模拟索引完成
-            setTimeout(() => {
-              setDocuments(docs =>
-                docs.map(doc =>
-                  doc.id === newDoc.id ? { ...doc, status: '已索引' } : doc
-                )
-              )
-              setKnowledgeBases(kbs =>
-                kbs.map(kb =>
-                  kb.id === selectedKbId
-                    ? { ...kb, documentCount: kb.documentCount + 1 }
-                    : kb
-                )
-              )
-            }, 2000)
-          } else {
-            setUploadingFiles(prev =>
-              prev.map(f => f.uid === fileInfo.uid ? { ...f, progress: Math.floor(progress) } : f)
-            )
+        try {
+          const response = await fetch(`/api/knowledge/bases/${selectedKbId}/documents`, {
+            method: 'POST',
+            body: formData
+          })
+          const result = await response.json().catch(() => ({}))
+          if (!response.ok) {
+            throw new Error(result.detail || '上传或规则解析失败')
           }
-        }, 200)
-      }, index * 500) // 错开每个文件的上传时间
-    })
+          successCount += 1
+          setUploadingFiles(prev =>
+            prev.map(f => f.uid === fileInfo.uid
+              ? {
+                  ...f,
+                  status: 'success',
+                  progress: 100,
+                  applicabilitySummary: result.applicability_summary
+                }
+              : f)
+          )
+        } catch (error) {
+          setUploadingFiles(prev =>
+            prev.map(f => f.uid === fileInfo.uid
+              ? { ...f, status: 'error', progress: 0, error: error.message }
+              : f)
+          )
+        }
+      }
+    } finally {
+      setBatchUploading(false)
+      await Promise.all([loadDocuments(selectedKbId), loadKnowledgeBases()])
+      if (successCount === uploadingFiles.length) {
+        message.success(`批量上传完成，共索引 ${successCount} 份规则文档`)
+      } else {
+        message.warning(`批量上传完成：成功 ${successCount} 份，失败 ${uploadingFiles.length - successCount} 份`)
+      }
+    }
   }
 
   // 移除待上传文件
@@ -606,12 +659,15 @@ const Knowledge = () => {
 
   // 关闭批量上传弹窗
   const handleCloseBatchUpload = () => {
+    if (batchUploading) return
     setBatchUploadVisible(false)
     setUploadingFiles([])
   }
 
   // 检查是否所有文件都上传完成
-  const allUploaded = uploadingFiles.length > 0 && uploadingFiles.every(f => f.status === 'success')
+  const allUploaded = uploadingFiles.length > 0 && uploadingFiles.every(
+    f => f.status === 'success' || f.status === 'error'
+  )
 
   // 计算统计数据
   const totalDocuments = knowledgeBases.reduce((sum, kb) => sum + (kb.document_count || 0), 0)
@@ -725,9 +781,27 @@ const Knowledge = () => {
             </Space>
           }
           extra={
-            <Space>
+            <Space wrap>
+              <div className="kb-applicability-control">
+                <span className="kb-applicability-label">新规则适用性</span>
+                <Select
+                  value={applicabilityMode}
+                  options={APPLICABILITY_OPTIONS}
+                  onChange={setApplicabilityMode}
+                  optionRender={(option) => (
+                    <div>
+                      <div>{option.data.label}</div>
+                      <div className="kb-applicability-option-help">
+                        {option.data.description}
+                      </div>
+                    </div>
+                  )}
+                  popupMatchSelectWidth={360}
+                  style={{ width: 150 }}
+                />
+              </div>
               <Upload {...uploadProps}>
-                <Button icon={<UploadOutlined />}>上传文档</Button>
+                <Button icon={<UploadOutlined />}>上传规则文档</Button>
               </Upload>
               <Button
                 type="primary"
@@ -795,7 +869,6 @@ const Knowledge = () => {
         onCancel={() => {
           setIsDocModalVisible(false)
           docForm.resetFields()
-          setEditingDoc(null)
         }}
         okText="确定"
         cancelText="取消"
@@ -813,12 +886,14 @@ const Knowledge = () => {
 
       {/* 批量上传弹窗 */}
       <Modal
-        title="批量上传文档"
+        title="批量上传规则文档"
         open={batchUploadVisible}
         onCancel={handleCloseBatchUpload}
+        maskClosable={!batchUploading}
+        closable={!batchUploading}
         width={600}
         footer={[
-          <Button key="cancel" onClick={handleCloseBatchUpload}>
+          <Button key="cancel" onClick={handleCloseBatchUpload} disabled={batchUploading}>
             {allUploaded ? '完成' : '取消'}
           </Button>,
           !allUploaded && (
@@ -826,13 +901,23 @@ const Knowledge = () => {
               key="upload"
               type="primary"
               onClick={handleStartBatchUpload}
-              disabled={uploadingFiles.length === 0 || uploadingFiles.some(f => f.status === 'uploading')}
+              loading={batchUploading}
+              disabled={uploadingFiles.length === 0 || batchUploading}
             >
               开始上传
             </Button>
           )
         ]}
       >
+        <div className="kb-batch-scope">
+          <span>
+            本批规则适用性：
+            <strong>{APPLICABILITY_OPTIONS.find(item => item.value === applicabilityMode)?.label}</strong>
+          </span>
+          <span className="kb-batch-scope-help">
+            {APPLICABILITY_OPTIONS.find(item => item.value === applicabilityMode)?.description}
+          </span>
+        </div>
         <Dragger {...batchUploadProps} style={{ marginBottom: 16 }}>
           <p className="ant-upload-drag-icon">
             <InboxOutlined />
@@ -879,11 +964,16 @@ const Knowledge = () => {
                   title={item.name}
                   description={
                     item.status === 'uploading' ? (
-                      <Progress percent={item.progress} size="small" />
+                      <Space direction="vertical" size={0} style={{ width: '100%' }}>
+                        <span>上传并解析规则中，请勿关闭窗口</span>
+                        <Progress percent={item.progress} size="small" status="active" showInfo={false} />
+                      </Space>
                     ) : item.status === 'success' ? (
-                      <span style={{ color: '#52c41a' }}>上传成功</span>
+                      <span style={{ color: '#52c41a' }}>
+                        上传成功 · {applicabilityMessage(item.applicabilitySummary)}
+                      </span>
                     ) : item.status === 'error' ? (
-                      <span style={{ color: '#ff4d4f' }}>上传失败</span>
+                      <span style={{ color: '#ff4d4f' }}>上传失败：{item.error || '未知错误'}</span>
                     ) : (
                       <span>{(item.size / 1024 / 1024).toFixed(2)} MB</span>
                     )

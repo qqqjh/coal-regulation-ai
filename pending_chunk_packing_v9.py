@@ -285,8 +285,10 @@ class PendingChunkPackerV9:
         source_units = self._source_units_for_content(chunk, content)
         if source_units:
             new_chunk["source_units"] = source_units
+            new_chunk["source_pdf_blocks"] = source_units
         elif "source_units" in new_chunk:
             new_chunk.pop("source_units", None)
+            new_chunk.pop("source_pdf_blocks", None)
         return new_chunk
 
     def _merge_chunk_sources(self, target: Dict[str, Any], source: Dict[str, Any]) -> None:
@@ -295,6 +297,7 @@ class PendingChunkPackerV9:
         )
         if target.get("source_units") or source.get("source_units"):
             target["source_units"] = list(target.get("source_units", [])) + list(source.get("source_units", []))
+            target["source_pdf_blocks"] = list(target["source_units"])
 
     def _pack_units_to_chunks(self, chunk: Dict[str, Any], units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         groups: List[List[Dict[str, Any]]] = []
@@ -497,6 +500,7 @@ class PendingChunkPackerV9:
                 ]
                 if source_units:
                     merged_chunk["source_units"] = source_units
+                    merged_chunk["source_pdf_blocks"] = source_units
                 first_page = str(pending_chunks[0].get("page_range", "")).split("-")[0]
                 last_page = str(normalized.get("page_range", "")).split("-")[-1]
                 if first_page or last_page:
@@ -529,6 +533,7 @@ class PendingChunkPackerV9:
                 ]
                 if source_units:
                     merged_chunk["source_units"] = source_units
+                    merged_chunk["source_pdf_blocks"] = source_units
                 merged.append(merged_chunk)
 
         return merged
