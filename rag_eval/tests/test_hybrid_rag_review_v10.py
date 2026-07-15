@@ -703,6 +703,37 @@ class HybridRAGReviewerV10Tests(unittest.TestCase):
         self.assertEqual(2, result["diagnostics"]["batch_accepted"])
         self.assertIn("通疯", result["diagnostics"]["trace"])
 
+    def test_typo_allowlist_is_in_prompt_and_filters_candidate(self):
+        reviewer = reviewer_without_models()
+        responses = iter(
+            [
+                """[
+                    {"wrong_char":"逼帮板","correct_char":"蔽帮板","context":"检查逼帮板状态","reason":"疑似形近字","confidence":"高"},
+                    {"wrong_char":"通疯","correct_char":"通风","context":"检查通疯系统","reason":"固定术语","confidence":"高"}
+                ]""",
+                '{"accepted_indices":[1]}',
+            ]
+        )
+        prompts = []
+
+        def fake_chat(messages, **kwargs):
+            prompts.append(messages)
+            return next(responses)
+
+        reviewer._chat = fake_chat
+        result = reviewer.check_typos(
+            {
+                "content": "检查逼帮板状态，并检查通疯系统是否正常。",
+                "typo_allow_terms": ["逼帮板"],
+            }
+        )
+
+        self.assertEqual(2, len(prompts))
+        self.assertIn("逼帮板", prompts[0][0]["content"])
+        self.assertEqual(["通疯"], [item["original"] for item in result["issues"]])
+        self.assertEqual(2, result["diagnostics"]["initial_candidates"])
+        self.assertEqual(1, result["diagnostics"]["after_local_filter"])
+
     def test_evaluator_prefers_same_type_short_typo(self):
         gold = [
             {

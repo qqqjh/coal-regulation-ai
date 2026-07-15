@@ -1334,6 +1334,30 @@ class HybridRAGReviewerV10(v9.HybridRAGReviewerV9):
         if len(content) < v9.TYPO_MIN_CHUNK_LEN:
             return default
 
+        # v10 overrides v9's typo chain, so the user's allowlist must be
+        # applied here explicitly as both an LLM instruction and a
+        # deterministic result filter.
+        allow_terms = [
+            str(term).strip()
+            for term in (pending_chunk.get("typo_allow_terms") or [])
+            if str(term).strip()
+        ]
+        normalized_content = self._normalize_allow_text(content)
+        relevant_allow_terms = [
+            term
+            for term in allow_terms
+            if self._normalize_allow_text(term) in normalized_content
+        ]
+        system_prompt = self.TYPO_SYSTEM_PROMPT
+        if relevant_allow_terms:
+            allowlist_text = "、".join(relevant_allow_terms[:200])
+            system_prompt += (
+                "\n\n用户自定义术语屏蔽表（最高优先级）：\n"
+                f"{allowlist_text}\n"
+                "上述术语及其内部字符均为用户认可的专有名词或内部惯用语，"
+                "不得报告为错别字、术语错误或用词错误。"
+            )
+
         feedback_note = self._human_feedback_experience_note(
             pending_chunk,
             {"typo"},
@@ -1345,7 +1369,7 @@ class HybridRAGReviewerV10(v9.HybridRAGReviewerV9):
                 raw = self._strip_json_fence(
                     self._chat(
                         [
-                            {"role": "system", "content": self.TYPO_SYSTEM_PROMPT},
+                            {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_msg},
                         ],
                         temperature=0.0,
@@ -1371,13 +1395,19 @@ class HybridRAGReviewerV10(v9.HybridRAGReviewerV9):
                         continue
                     if any(kw in str(item.get("reason", "")) for kw in skip_keywords):
                         continue
+                    if self._is_typo_allowlisted(item, allow_terms, content):
+                        continue
                     key = (_compact(wrong), _compact(correct), _compact(item.get("context")))
                     if key in seen or not self._is_plausible_typo_issue(item):
                         continue
                     seen.add(key)
                     candidates.append(item)
 
-                verified = self._verify_typo_issues_batch(candidates)
+                verified = [
+                    item
+                    for item in self._verify_typo_issues_batch(candidates)
+                    if not self._is_typo_allowlisted(item, allow_terms, content)
+                ]
                 diagnostics = self._typo_diagnostics(result, candidates, verified)
                 issues = [
                     {

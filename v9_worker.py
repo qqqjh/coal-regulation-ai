@@ -1345,6 +1345,16 @@ class V9Worker:
         # 错别字结果已由引擎与合规链并行产出
         for t in typo.get("issues", []):
             wrong = t.get("original") or t.get("wrong_char", "")
+            # Keep a final deterministic guard at the persistence boundary.
+            # This protects every reviewer version even if an upstream typo
+            # chain forgets to apply the user's allowlist.
+            is_allowlisted = getattr(engine, "_is_typo_allowlisted", None)
+            if callable(is_allowlisted) and is_allowlisted(
+                t,
+                review_chunk.get("typo_allow_terms") or [],
+                review_chunk.get("content", ""),
+            ):
+                continue
             blocks = docx_adapter.locate_text_blocks(parsed, wrong, source_blocks)
             suggestion = t.get("suggestion") or t.get("correct_char", "")
             claim = getattr(engine, "claim_worker_issue", None)
