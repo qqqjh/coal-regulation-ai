@@ -62,6 +62,24 @@ async def get_module_distribution(
 
     return {"data": distribution}
 
+@router.get("/modules")
+async def get_module_usage(
+    start_time: Optional[str] = Query(None, description="开始时间 ISO格式"),
+    end_time: Optional[str] = Query(None, description="结束时间 ISO格式"),
+    db: AsyncSession = Depends(get_db)
+):
+    """获取按模块汇总的调用、Token、成本和耗时"""
+    start_dt = datetime.fromisoformat(start_time) if start_time else None
+    end_dt = datetime.fromisoformat(end_time) if end_time else None
+
+    usage = await monitor_service.get_module_usage(
+        db=db,
+        start_time=start_dt,
+        end_time=end_dt
+    )
+
+    return {"data": usage}
+
 @router.get("/logs")
 async def get_recent_logs(
     limit: int = Query(50, description="返回日志数量"),

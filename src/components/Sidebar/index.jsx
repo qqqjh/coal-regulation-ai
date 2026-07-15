@@ -12,7 +12,8 @@ import {
   SafetyCertificateOutlined,
   HomeOutlined,
   SunOutlined,
-  MoonOutlined
+  MoonOutlined,
+  SyncOutlined
 } from '@ant-design/icons'
 import useUserStore from '../../store/userStore'
 import useThemeStore from '../../store/themeStore'
@@ -20,7 +21,7 @@ import './index.css'
 
 const { Sider } = Layout
 
-const menuItems = [
+const baseMenuItems = [
   {
     key: '/',
     icon: <HomeOutlined />,
@@ -71,6 +72,22 @@ const Sidebar = memo(() => {
     navigate('/login')
   }
 
+  const menuItems = user?.role === 'admin'
+    ? [
+      ...baseMenuItems,
+      {
+        key: '/admin/review-kb',
+        icon: <DatabaseOutlined />,
+        label: '审查知识库权限'
+      },
+      {
+        key: '/admin/flywheel',
+        icon: <SyncOutlined />,
+        label: '数据飞轮'
+      }
+    ]
+    : baseMenuItems
+
   // 用户下拉菜单
   const userMenuItems = [
     {
@@ -97,6 +114,14 @@ const Sidebar = memo(() => {
   const handleUserMenuClick = ({ key }) => {
     if (key === 'logout') {
       handleLogout()
+      return
+    }
+    if (key === 'profile') {
+      navigate('/profile')
+      return
+    }
+    if (key === 'settings') {
+      navigate('/settings')
     }
   }
 
@@ -141,6 +166,7 @@ const Sidebar = memo(() => {
           <div className="user-info">
             <Avatar
               size={36}
+              src={user?.avatar || undefined}
               icon={<UserOutlined />}
               style={{ backgroundColor: '#1890ff' }}
             />

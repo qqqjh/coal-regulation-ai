@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import { useState, useEffect } from 'react'
 import {
   Card,
   Row,
@@ -24,12 +24,35 @@ import {
   LoadingOutlined
 } from '@ant-design/icons'
 import ReactMarkdown from 'react-markdown'
+import useUserStore from '../../store/userStore'
 import './index.css'
 
 const { TextArea } = Input
 const { Option } = Select
 
+const INITIAL_RAG_CONFIG = {
+  knowledgeBase: null,
+  retrievalMethod: 'hybrid',
+  topK: 5,
+  similarityThreshold: 0.7,
+  model: 'qwen-plus',
+  temperature: 0.7,
+  maxTokens: 2000,
+  contextWindow: 4000
+}
+
+const QWEN_MODELS = new Set(['qwen-plus', 'qwen-turbo', 'qwen-max', 'qwen-long'])
+
+function normalizeRagConfig(config = {}) {
+  return {
+    ...INITIAL_RAG_CONFIG,
+    ...config,
+    model: QWEN_MODELS.has(config.model) ? config.model : INITIAL_RAG_CONFIG.model,
+  }
+}
+
 const RAG = () => {
+  const user = useUserStore((state) => state.user)
   const [form] = Form.useForm()
   const [query, setQuery] = useState('')
   const [retrievalResults, setRetrievalResults] = useState([])
@@ -37,40 +60,33 @@ const RAG = () => {
   const [isSearching, setIsSearching] = useState(false)
   const [isGenerating, setIsGenerating] = useState(false)
   const [knowledgeBases, setKnowledgeBases] = useState([])
-
-  // 初始配置
-  const initialConfig = {
-    knowledgeBase: null,
-    retrievalMethod: 'hybrid',
-    topK: 5,
-    similarityThreshold: 0.7,
-    model: 'gpt-3.5-turbo',
-    temperature: 0.7,
-    maxTokens: 2000,
-    contextWindow: 4000
-  }
+  const knowledgeAuthQuery = () => new URLSearchParams({
+    user_id: String(user?.id || 'guest'),
+    role: user?.role || 'user',
+  }).toString()
 
   // 从localStorage加载保存的配置
   useEffect(() => {
     const savedConfig = localStorage.getItem('ragConfig')
     if (savedConfig) {
       try {
-        const config = JSON.parse(savedConfig)
+        const config = normalizeRagConfig(JSON.parse(savedConfig))
+        localStorage.setItem('ragConfig', JSON.stringify(config))
         form.setFieldsValue(config)
       } catch (error) {
         console.error('加载配置失败:', error)
-        form.setFieldsValue(initialConfig)
+        form.setFieldsValue(INITIAL_RAG_CONFIG)
       }
     } else {
-      form.setFieldsValue(initialConfig)
+      form.setFieldsValue(INITIAL_RAG_CONFIG)
     }
-  }, [])
+  }, [form])
 
   // 加载知识库列表
   useEffect(() => {
     const fetchKnowledgeBases = async () => {
       try {
-        const response = await fetch('/api/knowledge/bases')
+        const response = await fetch(`/api/knowledge/bases?${knowledgeAuthQuery()}`)
         if (response.ok) {
           const data = await response.json()
           setKnowledgeBases(data)
@@ -79,16 +95,17 @@ const RAG = () => {
           const savedConfig = localStorage.getItem('ragConfig')
           if (savedConfig) {
             const config = JSON.parse(savedConfig)
-            if (config.knowledgeBase) {
-              // 如果有保存的知识库ID，使用它
+            if (config.knowledgeBase && data.some(kb => kb.id === config.knowledgeBase)) {
               form.setFieldsValue({ knowledgeBase: config.knowledgeBase })
             } else if (data.length > 0) {
-              // 否则默认选中第一个知识库
               form.setFieldsValue({ knowledgeBase: data[0].id })
+            } else {
+              form.setFieldsValue({ knowledgeBase: null })
             }
           } else if (data.length > 0) {
-            // 没有保存的配置，默认选中第一个知识库
             form.setFieldsValue({ knowledgeBase: data[0].id })
+          } else {
+            form.setFieldsValue({ knowledgeBase: null })
           }
         }
       } catch (error) {
@@ -96,46 +113,7 @@ const RAG = () => {
       }
     }
     fetchKnowledgeBases()
-  }, [])
-
-  // 模拟检索结果
-  const mockRetrievalResults = [
-    {
-      id: 1,
-      document: '煤矿安全规程.pdf',
-      content: '第一章 总则\n第一条 为了保障煤矿安全生产和职工人身安全，防止煤矿事故，根据《中华人民共和国安全生产法》、《中华人民共和国矿山安全法》等有关法律、行政法规，制定本规程...',
-      similarity: 0.95,
-      page: 1
-    },
-    {
-      id: 2,
-      document: '瓦斯防治细则.pdf',
-      content: '瓦斯检测与监控系统应当24小时连续运行，系统应当具备实时监测、超限报警、断电和馈电状态监测等功能。井下所有采掘工作面、硐室、使用中的机电设备设置地点、有人员作业的地点都应当纳入监测范围...',
-      similarity: 0.89,
-      page: 15
-    },
-    {
-      id: 3,
-      document: '通风系统管理.docx',
-      content: '矿井必须建立完善的机械通风系统。主要通风机必须安装在地面；装有主要通风机的出风井口应当安装防爆门，防爆门每6个月检查维修1次...',
-      similarity: 0.85,
-      page: 8
-    },
-    {
-      id: 4,
-      document: '煤矿安全规程.pdf',
-      content: '矿井必须建立瓦斯、二氧化碳和其他有害气体检查制度，并遵守下列规定：\n（一）矿长、矿技术负责人、爆破工、采掘区队长、通风区队长、工程技术人员、班长、流动电钳工下井时，必须携带便携式甲烷检测报警仪...',
-      similarity: 0.82,
-      page: 45
-    },
-    {
-      id: 5,
-      document: '技术标准规范.pdf',
-      content: '煤矿企业必须建立健全各级领导安全生产责任制、职能机构安全生产责任制、岗位人员安全生产责任制。企业主要负责人是安全生产的第一责任人...',
-      similarity: 0.78,
-      page: 3
-    }
-  ]
+  }, [form, user?.id, user?.role])
 
   // 处理检索
   const handleRetrieval = async () => {
@@ -164,7 +142,9 @@ const RAG = () => {
           query: query,
           kb_id: config.knowledgeBase,
           top_k: config.topK,
-          similarity_threshold: config.similarityThreshold
+          similarity_threshold: config.similarityThreshold,
+          user_id: String(user?.id || 'guest'),
+          role: user?.role || 'user',
         })
       })
 
@@ -205,7 +185,9 @@ const RAG = () => {
           kb_id: config.knowledgeBase,
           model: config.model,
           temperature: config.temperature,
-          top_k: config.topK
+          top_k: config.topK,
+          user_id: String(user?.id || 'guest'),
+          role: user?.role || 'user',
         })
       })
 
@@ -284,11 +266,10 @@ const RAG = () => {
 
               <Form.Item name="model" label="模型选择">
                 <Select>
-                  <Option value="gpt-3.5-turbo">GPT-3.5 Turbo</Option>
-                  <Option value="gpt-4">GPT-4</Option>
-                  <Option value="gpt-4-turbo">GPT-4 Turbo</Option>
-                  <Option value="gpt-4o">GPT-4o</Option>
-                  <Option value="gpt-4o-mini">GPT-4o Mini</Option>
+                  <Option value="qwen-plus">Qwen Plus</Option>
+                  <Option value="qwen-turbo">Qwen Turbo</Option>
+                  <Option value="qwen-max">Qwen Max</Option>
+                  <Option value="qwen-long">Qwen Long</Option>
                 </Select>
               </Form.Item>
 

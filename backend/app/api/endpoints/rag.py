@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
 from app.models.schemas import RAGConfig as RAGConfigSchema
-from app.models.database import RAGConfig as RAGConfigDB
+from app.models.database import KnowledgeBase, RAGConfig as RAGConfigDB
 from app.services.vector_store import vector_store_service
 from app.services.monitor_service import monitor_service
 from app.db.database import get_db
@@ -12,6 +12,29 @@ from app.core.config import settings
 import time
 
 router = APIRouter()
+QWEN_MODELS = {"qwen-plus", "qwen-turbo", "qwen-max", "qwen-long"}
+
+
+def _normalize_qwen_model(model: str = None) -> str:
+    return model if model in QWEN_MODELS else "qwen-plus"
+
+
+def _normalize_user_id(user_id: str | int | None) -> str:
+    value = str(user_id or "guest").strip()
+    return value[:100] or "guest"
+
+
+def _is_admin(user_id: str | int | None = None, role: str | None = None) -> bool:
+    return role == "admin" or _normalize_user_id(user_id) in {"admin", "1"}
+
+
+async def _assert_kb_visible(db: AsyncSession, kb_id: int, user_id: str | None, role: str | None):
+    result = await db.execute(select(KnowledgeBase).where(KnowledgeBase.id == kb_id))
+    kb = result.scalar_one_or_none()
+    if not kb:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    if not _is_admin(user_id, role) and kb.owner_user_id != _normalize_user_id(user_id):
+        raise HTTPException(status_code=404, detail="知识库不存在")
 
 # 请求模型
 class RetrieveRequest(BaseModel):
@@ -19,13 +42,17 @@ class RetrieveRequest(BaseModel):
     kb_id: int
     top_k: int = 5
     similarity_threshold: float = 0.0
+    user_id: str | None = None
+    role: str | None = "user"
 
 class GenerateRequest(BaseModel):
     query: str
     kb_id: int
-    model: str = "gpt-3.5-turbo"
+    model: str = "qwen-plus"
     temperature: float = 0.7
     top_k: int = 5
+    user_id: str | None = None
+    role: str | None = "user"
 
 @router.post("/test")
 async def test_rag(
@@ -45,7 +72,7 @@ async def test_rag(
         llm = ChatOpenAI(
             api_key=settings.OPENAI_API_KEY,
             base_url=settings.OPENAI_BASE_URL,
-            model=config.model_name,
+            model=_normalize_qwen_model(config.model_name),
             temperature=config.temperature
         )
 
@@ -105,12 +132,12 @@ async def get_config(
         # 返回默认配置
         return RAGConfigSchema()
 
-    return {
-        "retrieval_k": config.retrieval_k,
-        "temperature": config.temperature,
-        "similarity_threshold": config.similarity_threshold,
-        "model_name": config.model_name
-    }
+        return {
+            "retrieval_k": config.retrieval_k,
+            "temperature": config.temperature,
+            "similarity_threshold": config.similarity_threshold,
+            "model_name": _normalize_qwen_model(config.model_name)
+        }
 
 @router.post("/config")
 async def save_config(
@@ -132,7 +159,7 @@ async def save_config(
         existing_config.retrieval_k = config.retrieval_k
         existing_config.temperature = config.temperature
         existing_config.similarity_threshold = config.similarity_threshold
-        existing_config.model_name = config.model_name
+        existing_config.model_name = _normalize_qwen_model(config.model_name)
         existing_config.retrieval_method = config.retrieval_method if hasattr(config, 'retrieval_method') else "similarity"
     else:
         # 创建新配置
@@ -141,7 +168,7 @@ async def save_config(
             retrieval_k=config.retrieval_k,
             temperature=config.temperature,
             similarity_threshold=config.similarity_threshold,
-            model_name=config.model_name,
+            model_name=_normalize_qwen_model(config.model_name),
             retrieval_method="similarity",
             is_active=True
         )
@@ -149,6 +176,7 @@ async def save_config(
 
     await db.commit()
 
+    config.model_name = _normalize_qwen_model(config.model_name)
     return {"status": "success", "config": config}
 
 @router.post("/retrieve")
@@ -160,6 +188,7 @@ async def retrieve_documents(
     start_time = time.time()
 
     try:
+        await _assert_kb_visible(db, request.kb_id, request.user_id, request.role)
         # 从指定知识库检索文档
         docs = vector_store_service.search(request.query, kb_id=request.kb_id, k=request.top_k)
 
@@ -188,6 +217,8 @@ async def retrieve_documents(
             "total": len(docs)
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         await monitor_service.log_operation(
             db=db,
@@ -208,6 +239,7 @@ async def generate_answer(
     start_time = time.time()
 
     try:
+        await _assert_kb_visible(db, request.kb_id, request.user_id, request.role)
         # 1. 检索相关文档
         docs = vector_store_service.search(request.query, kb_id=request.kb_id, k=request.top_k)
 
@@ -231,7 +263,7 @@ async def generate_answer(
         llm = ChatOpenAI(
             api_key=settings.OPENAI_API_KEY,
             base_url=settings.OPENAI_BASE_URL,
-            model=request.model,
+            model=_normalize_qwen_model(request.model),
             temperature=request.temperature
         )
 
@@ -260,10 +292,12 @@ async def generate_answer(
             "query": request.query,
             "answer": response.content,
             "retrieved_count": len(docs),
-            "model": request.model,
+            "model": _normalize_qwen_model(request.model),
             "temperature": request.temperature
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         await monitor_service.log_operation(
             db=db,

@@ -1,18 +1,16 @@
 from langchain_openai import ChatOpenAI
-from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage, AIMessage
 from app.core.config import settings
 from app.services.vector_store import vector_store_service
-from typing import List, Generator
+from typing import List
 
 class ChatService:
     def __init__(self):
         # 不再在初始化时创建固定的LLM实例
         pass
 
-    def _get_llm(self, model: str = "gpt-3.5-turbo"):
+    def _get_llm(self, model: str = "qwen-plus"):
         """根据模型名称创建LLM实例"""
         return ChatOpenAI(
             api_key=settings.OPENAI_API_KEY,
@@ -21,7 +19,7 @@ class ChatService:
             temperature=0.7
         )
 
-    async def chat_stream(self, messages: List[dict], use_rag: bool = True, kb_id: int = None, model: str = "gpt-3.5-turbo"):
+    async def chat_stream(self, messages: List[dict], use_rag: bool = True, kb_id: int = None, model: str = "qwen-plus"):
         # 转换现有消息历史
         history = []
         # 保留最近几轮对话以适应上下文窗口，这里简单处理
@@ -42,10 +40,13 @@ class ChatService:
                 yield "错误：使用RAG模式时必须指定知识库ID"
                 return
 
-            # 获取指定知识库的collection并创建retriever
-            vector_store = vector_store_service._get_collection(kb_id)
-            retriever = vector_store.as_retriever(
-                search_kwargs={"k": 6}  # 增加检索数量
+            docs = vector_store_service.search(last_user_input, kb_id=kb_id, k=6)
+            if not docs:
+                yield "未从当前知识库检索到相关内容。"
+                return
+            context = "\n\n".join(
+                f"【参考内容{i + 1}】来源: {doc.metadata.get('filename', 'unknown')}\n{doc.page_content}"
+                for i, doc in enumerate(docs)
             )
 
             system_prompt = (
@@ -66,18 +67,14 @@ class ChatService:
                 ("human", "{input}"),
             ])
 
-            question_answer_chain = create_stuff_documents_chain(llm, prompt)
-            rag_chain = create_retrieval_chain(retriever, question_answer_chain)
-
-            # 流式输出RAG结果
-            # 注意：LangChain的RAG chain每个chunk的answer字段只包含单个字符或增量内容
-            async for chunk in rag_chain.astream({"input": last_user_input, "chat_history": history}):
-                # LangChain的astream会返回不同的chunk类型
-                if isinstance(chunk, dict) and "answer" in chunk:
-                    # answer字段包含增量内容（通常是单个字符）
-                    delta = chunk["answer"]
-                    if isinstance(delta, str) and delta:
-                        yield delta
+            chain = prompt | llm
+            async for chunk in chain.astream({
+                "input": last_user_input,
+                "chat_history": history,
+                "context": context,
+            }):
+                if chunk.content:
+                    yield chunk.content
                     
         else:
             # 普通对话模式

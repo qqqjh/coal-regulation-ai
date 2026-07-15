@@ -1,0 +1,67 @@
+.admin-review-kb-page {
+  height: 100%;
+  overflow: auto;
+  padding: 20px;
+  background: #f3f6fb;
+}
+
+.admin-review-kb-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.admin-review-kb-header h1 {
+  margin: 4px 0 6px;
+  color: #172033;
+  font-size: 24px;
+  line-height: 1.25;
+}
+
+.admin-review-kb-header p {
+  max-width: 720px;
+  margin: 0;
+  color: #5d6b82;
+  font-size: 13px;
+}
+
+.admin-review-kb-kicker {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #1d4ed8;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.admin-review-kb-stats {
+  margin-bottom: 12px;
+}
+
+.admin-review-kb-stats .ant-card,
+.admin-review-kb-card {
+  border-radius: 8px;
+  border-color: #dce3ef;
+  box-shadow: none;
+}
+
+.admin-review-kb-note {
+  margin-bottom: 12px;
+  border-radius: 8px;
+}
+
+.admin-review-kb-select {
+  width: 100%;
+}
+
+.admin-review-kb-card .ant-table-thead > tr > th {
+  background: #f8fafc;
+  color: #26335f;
+  font-weight: 800;
+}
+
+.admin-review-kb-card .ant-table-cell {
+  vertical-align: middle;
+}

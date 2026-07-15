@@ -8,8 +8,12 @@ import './index.css'
 const { TextArea } = Input
 const { Option } = Select
 
-const Chat = () => {
+  const Chat = () => {
   const user = useUserStore((state) => state.user)
+  const knowledgeAuthQuery = () => new URLSearchParams({
+    user_id: String(user?.id || 'guest'),
+    role: user?.role || 'user',
+  }).toString()
 
   // 从 localStorage 加载会话数据
   const loadSessions = () => {
@@ -43,17 +47,15 @@ const Chat = () => {
   const [editingName, setEditingName] = useState('')
   const [knowledgeBases, setKnowledgeBases] = useState([])
   const [selectedKbId, setSelectedKbId] = useState(null)
-  const [selectedModel, setSelectedModel] = useState('gpt-3.5-turbo')
+  const [selectedModel, setSelectedModel] = useState('qwen-plus')
   const messagesEndRef = useRef(null)
-  const streamingRef = useRef(null)
 
   // 可用的模型列表
   const availableModels = [
-    { value: 'gpt-3.5-turbo', label: 'GPT-3.5 Turbo (快速)' },
-    { value: 'gpt-4', label: 'GPT-4 (强大)' },
-    { value: 'gpt-4-turbo', label: 'GPT-4 Turbo (平衡)' },
-    { value: 'gpt-4o', label: 'GPT-4o (最新)' },
-    { value: 'gpt-4o-mini', label: 'GPT-4o Mini (经济)' },
+    { value: 'qwen-plus', label: 'Qwen Plus (默认)' },
+    { value: 'qwen-turbo', label: 'Qwen Turbo (快速)' },
+    { value: 'qwen-max', label: 'Qwen Max (强推理)' },
+    { value: 'qwen-long', label: 'Qwen Long (长上下文)' },
   ]
 
   const currentSession = sessions.find(s => s.id === currentSessionId)
@@ -62,12 +64,13 @@ const Chat = () => {
   useEffect(() => {
     const fetchKnowledgeBases = async () => {
       try {
-        const response = await fetch('/api/knowledge/bases')
+        const response = await fetch(`/api/knowledge/bases?${knowledgeAuthQuery()}`)
         if (response.ok) {
           const data = await response.json()
           setKnowledgeBases(data)
-          // 如果有知识库且没有选中，默认选中第一个
-          if (data.length > 0 && !selectedKbId) {
+          if (data.length === 0) {
+            setSelectedKbId(null)
+          } else if (!selectedKbId || !data.some(kb => kb.id === selectedKbId)) {
             setSelectedKbId(data[0].id)
           }
         }
@@ -76,7 +79,7 @@ const Chat = () => {
       }
     }
     fetchKnowledgeBases()
-  }, [])
+  }, [selectedKbId, user?.id, user?.role])
 
   // 保存会话到 localStorage
   useEffect(() => {
@@ -212,7 +215,9 @@ const Chat = () => {
           ],
           useRAG: true,
           kbId: selectedKbId,  // 传递选中的知识库ID
-          model: selectedModel  // 传递选中的模型
+          model: selectedModel,  // 传递选中的模型
+          userId: String(user?.id || 'guest'),
+          role: user?.role || 'user',
         })
       })
 
@@ -224,9 +229,13 @@ const Chat = () => {
       const decoder = new TextDecoder()
       let fullResponse = ''
 
-      while (true) {
+      let streamDone = false
+      while (!streamDone) {
         const { done, value } = await reader.read()
-        if (done) break
+        if (done) {
+          streamDone = true
+          continue
+        }
 
         const chunk = decoder.decode(value, { stream: true })
         fullResponse += chunk
@@ -260,15 +269,6 @@ const Chat = () => {
       setStreamingContent('')
     }
   }
-
-  // 清理流式输出定时器
-  useEffect(() => {
-    return () => {
-      if (streamingRef.current) {
-        clearInterval(streamingRef.current)
-      }
-    }
-  }, [])
 
   // 回车发送
   const handleKeyPress = (e) => {

@@ -5,13 +5,33 @@ from sqlalchemy import select, delete
 from app.models.schemas import ChatRequest
 from app.services.chat_service import chat_service
 from app.services.monitor_service import monitor_service
-from app.models.database import Session as ChatSession, Message
+from app.models.database import KnowledgeBase, Session as ChatSession, Message
 from app.db.database import get_db
 from datetime import datetime
 import time
 import json
 
 router = APIRouter()
+
+
+def _normalize_user_id(user_id: str | int | None) -> str:
+    value = str(user_id or "guest").strip()
+    return value[:100] or "guest"
+
+
+def _is_admin(user_id: str | int | None = None, role: str | None = None) -> bool:
+    return role == "admin" or _normalize_user_id(user_id) in {"admin", "1"}
+
+
+async def _assert_kb_visible(db: AsyncSession, kb_id: int | None, user_id: str | None, role: str | None):
+    if not kb_id:
+        return
+    result = await db.execute(select(KnowledgeBase).where(KnowledgeBase.id == kb_id))
+    kb = result.scalar_one_or_none()
+    if not kb:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+    if not _is_admin(user_id, role) and kb.owner_user_id != _normalize_user_id(user_id):
+        raise HTTPException(status_code=404, detail="知识库不存在")
 
 @router.post("/completions")
 async def chat_completions(
@@ -20,6 +40,9 @@ async def chat_completions(
 ):
     """聊天补全（流式）"""
     start_time = time.time()
+
+    if request.useRAG and request.kbId:
+        await _assert_kb_visible(db, request.kbId, request.userId, request.role)
 
     # 将 Pydantic models 转换为 dict 用于 service
     msgs = [{"role": m.role, "content": m.content} for m in request.messages]

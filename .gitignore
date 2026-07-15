@@ -11,6 +11,11 @@ node_modules
 dist
 dist-ssr
 *.local
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
 
 # Editor directories and files
 .vscode/*
@@ -22,3 +27,22 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# ===== 生成物 / 数据 / 模型（不入库）=====
+/data/*
+!/data/regulation_rules_v1.json
+/backend/data/uploads/
+/review_results/
+/chunks_visualization/
+/rag_eval/data/
+/rag_eval/reports/
+/models/
+/.agents/
+/output/
+/backend/data/chroma_db/
+/backend/data/milvus_standalone/
+/backend/data/mongodb/
+/backend/data/redis/
+~$*
+*.db
+*.sqlite3

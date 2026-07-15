@@ -1,0 +1,141 @@
+{
+  "schema": "coal_main_agent_strategy_gold_v1",
+  "note": "6.3 主智能体策略生成评测金标。task_type 为五类规范标签；required_tools 为应选工具集；needs_escalation 为应给出的升级判断；key_actions 用于策略执行匹配度（用'/'表示同义可命中其一）。",
+  "tasks": [
+    {
+      "task_id": "ingest_rule_safety_reg",
+      "task_type": "规则文档入库",
+      "task": "我把《煤矿安全规程》的 MinerU JSON 放进来了，请切分后建入规则知识库。",
+      "required_tools": ["list_input_files", "run_script"],
+      "allowed_extra_tools": ["inspect_document", "list_skills", "read_skill"],
+      "needs_escalation": false,
+      "key_actions": ["规则/法规", "切分", "入库/知识库/索引"]
+    },
+    {
+      "task_id": "ingest_rule_outburst",
+      "task_type": "规则文档入库",
+      "task": "新增一本《防治煤与瓦斯突出细则》，请走规则文档入库流程。",
+      "required_tools": ["list_input_files", "run_script"],
+      "allowed_extra_tools": ["inspect_document", "list_skills", "read_skill"],
+      "needs_escalation": false,
+      "key_actions": ["规则/法规", "切分", "入库/知识库/索引"]
+    },
+    {
+      "task_id": "ingest_rule_unknown_type",
+      "task_type": "规则文档入库",
+      "task": "这份文件不确定是规则还是待审，如果是法规标准就把它切分入规则库。",
+      "required_tools": ["inspect_document", "run_script"],
+      "allowed_extra_tools": ["list_input_files", "list_skills", "read_skill"],
+      "needs_escalation": false,
+      "key_actions": ["判断/确认", "切分", "入库/知识库"]
+    },
+    {
+      "task_id": "review_pending_comprehensive",
+      "task_type": "待审文档审查",
+      "task": "把 new_docs 里的待审作业规程切分并启动合规审查流程。",
+      "required_tools": ["list_input_files", "run_script"],
+      "allowed_extra_tools": ["inspect_document", "list_skills", "read_skill", "queue_stats"],
+      "needs_escalation": true,
+      "key_actions": ["切分", "审查/三链", "升级/队列"]
+    },
+    {
+      "task_id": "review_pending_one_doc",
+      "task_type": "待审文档审查",
+      "task": "只审查 004 这一份综采工作面作业规程，跑完合规、错别字、重复三链。",
+      "required_tools": ["run_script"],
+      "allowed_extra_tools": ["list_input_files", "inspect_document", "list_skills", "read_skill", "queue_stats"],
+      "needs_escalation": true,
+      "key_actions": ["切分", "审查/三链", "升级/队列"]
+    },
+    {
+      "task_id": "review_pending_then_queue",
+      "task_type": "待审文档审查",
+      "task": "审查刚切好的待审文档，并说明审查中产生的争议项后续怎么处理。",
+      "required_tools": ["run_script"],
+      "allowed_extra_tools": ["list_input_files", "queue_stats", "list_skills", "read_skill"],
+      "needs_escalation": true,
+      "key_actions": ["审查/三链", "升级/队列", "复核/裁决"]
+    },
+    {
+      "task_id": "triage_numeric_conflict",
+      "task_type": "争议项复核",
+      "task": "升级队列里有一条数值矛盾项，请复核并给出最终裁决。",
+      "required_tools": ["queue_stats", "get_chunk_review", "resolve_queue_item"],
+      "allowed_extra_tools": ["numeric_compare_tool", "retrieve_regulations"],
+      "needs_escalation": true,
+      "key_actions": ["读取/查看", "数值/检索核验", "裁决/resolve"]
+    },
+    {
+      "task_id": "triage_low_confidence",
+      "task_type": "争议项复核",
+      "task": "队列里有一条最终结论是“不确定”的低置信项，帮我复核它到底合不合规。",
+      "required_tools": ["queue_stats", "get_chunk_review", "resolve_queue_item"],
+      "allowed_extra_tools": ["retrieve_regulations", "numeric_compare_tool"],
+      "needs_escalation": true,
+      "key_actions": ["读取/查看", "检索/核验", "裁决/resolve"]
+    },
+    {
+      "task_id": "triage_disagreement",
+      "task_type": "争议项复核",
+      "task": "初审判不合规但核验删了全部问题，这条分歧项请你裁定。",
+      "required_tools": ["get_chunk_review", "resolve_queue_item"],
+      "allowed_extra_tools": ["queue_stats", "retrieve_regulations", "numeric_compare_tool"],
+      "needs_escalation": true,
+      "key_actions": ["读取/查看", "检索/核验", "裁决/resolve"]
+    },
+    {
+      "task_id": "revise_word_typo",
+      "task_type": "Word修订",
+      "task": "审查发现第12块有个错别字，请在 Word 文档里把对应段落改正。",
+      "required_tools": ["get_chunk_review"],
+      "allowed_extra_tools": ["run_script", "retrieve_regulations"],
+      "needs_escalation": false,
+      "key_actions": ["读取/定位", "段落", "修改/替换/改写"]
+    },
+    {
+      "task_id": "revise_word_apply_suggestion",
+      "task_type": "Word修订",
+      "task": "把审查给出的合规修改建议应用到 Word 文档对应位置。",
+      "required_tools": ["get_chunk_review"],
+      "allowed_extra_tools": ["run_script"],
+      "needs_escalation": false,
+      "key_actions": ["读取/获取建议", "定位/段落", "修改/替换/改写"]
+    },
+    {
+      "task_id": "revise_word_human_edit",
+      "task_type": "Word修订",
+      "task": "人工确认了一条整改意见，请据此修订 Word 文档里那一段文字。",
+      "required_tools": ["get_chunk_review"],
+      "allowed_extra_tools": ["run_script"],
+      "needs_escalation": false,
+      "key_actions": ["读取/意见", "定位/段落", "修改/替换/改写"]
+    },
+    {
+      "task_id": "field_qa_gas_high_risk",
+      "task_type": "现场风险问答",
+      "task": "现场掘进面瓦斯浓度突然升到1.6%，作业人员该怎么处置？给出依据。",
+      "required_tools": ["retrieve_regulations"],
+      "allowed_extra_tools": ["numeric_compare_tool"],
+      "needs_escalation": true,
+      "key_actions": ["追问/确认现场", "检索法规依据", "处置建议"]
+    },
+    {
+      "task_id": "field_qa_water_high_risk",
+      "task_type": "现场风险问答",
+      "task": "工作面出现淋水加大、煤壁挂红，疑似透水征兆，现场应如何应急处置？",
+      "required_tools": ["retrieve_regulations"],
+      "allowed_extra_tools": ["numeric_compare_tool"],
+      "needs_escalation": true,
+      "key_actions": ["追问/确认现场", "检索法规依据", "处置/撤人"]
+    },
+    {
+      "task_id": "field_qa_info_lookup",
+      "task_type": "现场风险问答",
+      "task": "想确认一下规程里规定的入井人员自救器佩戴要求是什么。",
+      "required_tools": ["retrieve_regulations"],
+      "allowed_extra_tools": [],
+      "needs_escalation": false,
+      "key_actions": ["检索法规依据", "回答/说明要求"]
+    }
+  ]
+}
