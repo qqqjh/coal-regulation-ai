@@ -10,10 +10,12 @@
                          \\-> (失败 attempts+1) -> pending（重试）-> dead（≥MAX_ATTEMPTS）
 """
 import json
+import re
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from collections import Counter
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -57,7 +59,15 @@ CREATE TABLE IF NOT EXISTS annotations (
     reason TEXT,
     source TEXT NOT NULL,
     escalation_id INTEGER,
-    extra TEXT
+    extra TEXT,
+    job_id TEXT,
+    issue_id INTEGER,
+    user_id TEXT,
+    action TEXT,
+    issue_type TEXT,
+    lifecycle_status TEXT NOT NULL DEFAULT 'active',
+    reused_count INTEGER NOT NULL DEFAULT 0,
+    last_reused_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ann_doc ON annotations(doc_name, chunk_index);
 
@@ -70,6 +80,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at TEXT,
     doc_name TEXT NOT NULL,
     docx_path TEXT NOT NULL,
+    source_format TEXT NOT NULL DEFAULT 'docx',
+    mineru_source_path TEXT,
+    original_pdf_path TEXT,
     paragraphs_path TEXT,          -- 段落模型 JSON 落盘路径（前端中间面板用）
     mine_type TEXT NOT NULL DEFAULT 'non_outburst',
     kb_id INTEGER,
@@ -118,6 +131,16 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _feedback_ngrams(text: str, width: int = 3) -> set[str]:
+    normalized = re.sub(r"\s+", "", str(text or "")).lower()
+    normalized = re.sub(r"[^\w\u4e00-\u9fff.%％]+", "", normalized)
+    if not normalized:
+        return set()
+    if len(normalized) <= width:
+        return {normalized}
+    return {normalized[i:i + width] for i in range(len(normalized) - width + 1)}
+
+
 class ReviewQueue:
     def __init__(self, db_path: Path = DEFAULT_DB):
         self.db_path = Path(db_path)
@@ -131,6 +154,7 @@ class ReviewQueue:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(_SCHEMA)
             self._ensure_job_columns()
+            self._ensure_annotation_columns()
             self._conn.commit()
 
     def _ensure_job_columns(self):
@@ -139,6 +163,9 @@ class ReviewQueue:
         additions = {
             "user_id": "TEXT DEFAULT 'guest'",
             "kb_id": "INTEGER",
+            "source_format": "TEXT NOT NULL DEFAULT 'docx'",
+            "mineru_source_path": "TEXT",
+            "original_pdf_path": "TEXT",
             "agent_stage": "TEXT",
             "phase_done": "INTEGER DEFAULT 0",
             "phase_total": "INTEGER DEFAULT 0",
@@ -147,6 +174,48 @@ class ReviewQueue:
         for name, ddl in additions.items():
             if name not in existing:
                 self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {ddl}")
+
+    def _ensure_annotation_columns(self):
+        rows = self._conn.execute("PRAGMA table_info(annotations)").fetchall()
+        existing = {row["name"] for row in rows}
+        additions = {
+            "job_id": "TEXT",
+            "issue_id": "INTEGER",
+            "user_id": "TEXT",
+            "action": "TEXT",
+            "issue_type": "TEXT",
+            "lifecycle_status": "TEXT NOT NULL DEFAULT 'active'",
+            "reused_count": "INTEGER NOT NULL DEFAULT 0",
+            "last_reused_at": "TEXT",
+        }
+        for name, ddl in additions.items():
+            if name not in existing:
+                self._conn.execute(f"ALTER TABLE annotations ADD COLUMN {name} {ddl}")
+
+        # 兼容已经沉淀的人工反馈：从 extra 中回填 issue/action/type。
+        legacy = self._conn.execute(
+            "SELECT id, extra FROM annotations "
+            "WHERE source='human' AND (issue_id IS NULL OR action IS NULL OR issue_type IS NULL)"
+        ).fetchall()
+        for row in legacy:
+            try:
+                extra = json.loads(row["extra"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                extra = {}
+            self._conn.execute(
+                "UPDATE annotations SET issue_id=COALESCE(issue_id, ?), "
+                "action=COALESCE(action, ?), issue_type=COALESCE(issue_type, ?) WHERE id=?",
+                (
+                    extra.get("issue_id"),
+                    extra.get("action"),
+                    extra.get("issue_type"),
+                    int(row["id"]),
+                ),
+            )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ann_feedback "
+            "ON annotations(source, lifecycle_status, issue_id, id)"
+        )
 
     def close(self):
         with self._lock:
@@ -275,20 +344,91 @@ class ReviewQueue:
                        kb_refs: Optional[List[Dict]] = None,
                        model_verdict: str = "", reason: str = "",
                        escalation_id: Optional[int] = None,
-                       extra: Optional[Dict] = None) -> int:
+                       extra: Optional[Dict] = None,
+                       job_id: str = "", issue_id: Optional[int] = None,
+                       user_id: str = "", action: str = "",
+                       issue_type: str = "") -> int:
         """沉淀一条最终裁决。source: human / agent / frontend。"""
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO annotations (created_at, doc_name, chunk_index, pending_content, "
-                "kb_refs, model_verdict, final_verdict, reason, source, escalation_id, extra) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "kb_refs, model_verdict, final_verdict, reason, source, escalation_id, extra, "
+                "job_id, issue_id, user_id, action, issue_type, lifecycle_status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')",
                 (_now(), doc_name, int(chunk_index), pending_content,
                  json.dumps(kb_refs or [], ensure_ascii=False),
                  model_verdict, final_verdict, reason, source,
-                 escalation_id, json.dumps(extra or {}, ensure_ascii=False)),
+                 escalation_id, json.dumps(extra or {}, ensure_ascii=False),
+                 job_id, issue_id, user_id, action, issue_type),
             )
             self._conn.commit()
             return cur.lastrowid
+
+    def upsert_human_annotation(
+        self,
+        *,
+        doc_name: str,
+        chunk_index: int,
+        pending_content: str,
+        final_verdict: str,
+        issue_id: int,
+        job_id: str = "",
+        user_id: str = "",
+        action: str,
+        issue_type: str = "",
+        kb_refs: Optional[List[Dict]] = None,
+        model_verdict: str = "",
+        reason: str = "",
+        extra: Optional[Dict] = None,
+    ) -> int:
+        """同一问题只保留一条当前有效人工裁决，重新裁决时更新原样本。"""
+        payload = json.dumps(extra or {}, ensure_ascii=False)
+        refs = json.dumps(kb_refs or [], ensure_ascii=False)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM annotations WHERE source='human' AND issue_id=? "
+                "ORDER BY id DESC LIMIT 1",
+                (int(issue_id),),
+            ).fetchone()
+            if row:
+                ann_id = int(row["id"])
+                self._conn.execute(
+                    "UPDATE annotations SET created_at=?, doc_name=?, chunk_index=?, "
+                    "pending_content=?, kb_refs=?, model_verdict=?, final_verdict=?, "
+                    "reason=?, extra=?, job_id=?, user_id=?, action=?, issue_type=?, "
+                    "lifecycle_status='active', reused_count=0, last_reused_at=NULL WHERE id=?",
+                    (
+                        _now(), doc_name, int(chunk_index), pending_content, refs,
+                        model_verdict, final_verdict, reason, payload, job_id, user_id,
+                        action, issue_type, ann_id,
+                    ),
+                )
+            else:
+                cur = self._conn.execute(
+                    "INSERT INTO annotations (created_at, doc_name, chunk_index, pending_content, "
+                    "kb_refs, model_verdict, final_verdict, reason, source, extra, job_id, "
+                    "issue_id, user_id, action, issue_type, lifecycle_status) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'human', ?, ?, ?, ?, ?, ?, 'active')",
+                    (
+                        _now(), doc_name, int(chunk_index), pending_content, refs,
+                        model_verdict, final_verdict, reason, payload, job_id,
+                        int(issue_id), user_id, action, issue_type,
+                    ),
+                )
+                ann_id = int(cur.lastrowid)
+            self._conn.commit()
+            return ann_id
+
+    def deactivate_human_annotation(self, issue_id: int) -> bool:
+        """撤回人工裁决时同步撤回飞轮样本，避免错误标签继续被复用。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE annotations SET lifecycle_status='revoked' "
+                "WHERE source='human' AND issue_id=? AND lifecycle_status='active'",
+                (int(issue_id),),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def list_annotations(self, limit: int = 200, source: Optional[str] = None
                          ) -> List[Dict[str, Any]]:
@@ -322,6 +462,142 @@ class ReviewQueue:
             ).fetchall()
         return {r["source"]: r["n"] for r in rows}
 
+    @staticmethod
+    def _decode_annotation(row: sqlite3.Row | Dict[str, Any]) -> Dict[str, Any]:
+        item = dict(row)
+        for key in ("kb_refs", "extra"):
+            if item.get(key):
+                try:
+                    item[key] = json.loads(item[key])
+                except (json.JSONDecodeError, TypeError):
+                    item[key] = {} if key == "extra" else []
+        return item
+
+    def list_human_feedback(
+        self,
+        *,
+        limit: int = 200,
+        action: str = "",
+        issue_type: str = "",
+        query: str = "",
+        include_revoked: bool = False,
+    ) -> List[Dict[str, Any]]:
+        clauses = ["source='human'"]
+        params: List[Any] = []
+        if not include_revoked:
+            clauses.append("lifecycle_status='active'")
+        if action:
+            clauses.append("action=?")
+            params.append(action)
+        if issue_type:
+            clauses.append("issue_type=?")
+            params.append(issue_type)
+        if query:
+            clauses.append("(doc_name LIKE ? OR pending_content LIKE ? OR reason LIKE ?)")
+            like = f"%{query}%"
+            params.extend([like, like, like])
+        params.append(max(1, min(int(limit), 2000)))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM annotations WHERE " + " AND ".join(clauses)
+                + " ORDER BY id DESC LIMIT ?",
+                tuple(params),
+            ).fetchall()
+        return [self._decode_annotation(row) for row in rows]
+
+    def flywheel_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM annotations WHERE source='human' "
+                "AND lifecycle_status='active' ORDER BY id"
+            ).fetchall()
+        samples = [self._decode_annotation(row) for row in rows]
+        actions = Counter(str(item.get("action") or "unknown") for item in samples)
+        issue_types = Counter(str(item.get("issue_type") or "unknown") for item in samples)
+        reuse_events = sum(int(item.get("reused_count") or 0) for item in samples)
+        reused_samples = sum(1 for item in samples if int(item.get("reused_count") or 0) > 0)
+        doc_count = len({str(item.get("doc_name") or "") for item in samples})
+
+        today = datetime.now().date()
+        day_keys = [(today - timedelta(days=offset)).isoformat() for offset in range(13, -1, -1)]
+        daily_counts = Counter(str(item.get("created_at") or "")[:10] for item in samples)
+        daily = [{"date": day, "count": daily_counts.get(day, 0)} for day in day_keys]
+        confirmed = actions.get("accept", 0) + actions.get("custom", 0)
+        total = len(samples)
+        return {
+            "total_samples": total,
+            "confirmed_samples": confirmed,
+            "rejected_samples": actions.get("reject", 0),
+            "custom_samples": actions.get("custom", 0),
+            "document_count": doc_count,
+            "reused_samples": reused_samples,
+            "reuse_events": reuse_events,
+            "confirmation_rate": round(confirmed / total, 4) if total else 0.0,
+            "action_counts": dict(actions),
+            "issue_type_counts": dict(issue_types),
+            "daily": daily,
+        }
+
+    def search_human_feedback(
+        self,
+        content: str,
+        *,
+        limit: int = 3,
+        issue_types: Optional[tuple[str, ...]] = None,
+        min_score: float = 0.24,
+        mark_reused: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """检索相似的有效人工样本，作为后续审查的少样本经验。"""
+        query_grams = _feedback_ngrams(content)
+        if not query_grams:
+            return []
+        clauses = ["source='human'", "lifecycle_status='active'", "pending_content!=''"]
+        params: List[Any] = []
+        if issue_types:
+            placeholders = ",".join("?" for _ in issue_types)
+            clauses.append(f"issue_type IN ({placeholders})")
+            params.extend(issue_types)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM annotations WHERE " + " AND ".join(clauses)
+                + " ORDER BY id DESC LIMIT 2000",
+                tuple(params),
+            ).fetchall()
+
+        ranked = []
+        for row in rows:
+            sample_grams = _feedback_ngrams(row["pending_content"])
+            if not sample_grams:
+                continue
+            overlap = len(query_grams & sample_grams)
+            if overlap == 0:
+                continue
+            coverage = overlap / len(sample_grams)
+            jaccard = overlap / len(query_grams | sample_grams)
+            score = 0.8 * coverage + 0.2 * jaccard
+            if score < min_score:
+                continue
+            item = self._decode_annotation(row)
+            item["similarity"] = round(score, 4)
+            ranked.append(item)
+        ranked.sort(key=lambda item: (item["similarity"], item["id"]), reverse=True)
+        selected = ranked[:max(1, int(limit))]
+
+        if mark_reused and selected:
+            ids = [int(item["id"]) for item in selected]
+            placeholders = ",".join("?" for _ in ids)
+            with self._lock:
+                self._conn.execute(
+                    f"UPDATE annotations SET reused_count=reused_count+1, last_reused_at=? "
+                    f"WHERE id IN ({placeholders})",
+                    (_now(), *ids),
+                )
+                self._conn.commit()
+            for item in selected:
+                item["reused_count"] = int(item.get("reused_count") or 0) + 1
+                item["last_reused_at"] = _now()
+        return selected
+
     def delete_annotation(self, ann_id: int) -> bool:
         with self._lock:
             cur = self._conn.execute(
@@ -336,7 +612,8 @@ class ReviewQueue:
         placeholders = ",".join("?" for _ in sources)
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT * FROM annotations WHERE source IN ({placeholders}) ORDER BY id",
+                f"SELECT * FROM annotations WHERE source IN ({placeholders}) "
+                "AND lifecycle_status='active' ORDER BY id",
                 sources,
             ).fetchall()
         cases = []
@@ -368,12 +645,20 @@ class ReviewQueue:
                    mine_type: str = "non_outburst",
                    paragraphs_path: Optional[str] = None,
                    user_id: str = "guest",
-                   kb_id: Optional[int] = None) -> int:
+                   kb_id: Optional[int] = None,
+                   source_format: str = "docx",
+                   mineru_source_path: str = "",
+                   original_pdf_path: str = "") -> int:
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO jobs (job_id, created_at, updated_at, doc_name, docx_path, "
-                "paragraphs_path, mine_type, user_id, kb_id, status) VALUES (?,?,?,?,?,?,?,?,?, 'pending')",
-                (job_id, _now(), _now(), doc_name, docx_path, paragraphs_path, mine_type, user_id, kb_id),
+                "source_format, mineru_source_path, original_pdf_path, paragraphs_path, "
+                "mine_type, user_id, kb_id, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'pending')",
+                (
+                    job_id, _now(), _now(), doc_name, docx_path,
+                    str(source_format or "docx").lower(), mineru_source_path,
+                    original_pdf_path, paragraphs_path, mine_type, user_id, kb_id,
+                ),
             )
             self._conn.commit()
             return cur.lastrowid

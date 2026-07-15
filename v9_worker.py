@@ -32,6 +32,7 @@ import docx_adapter
 from review_queue import ReviewQueue
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+BACKEND_DIR = PROJECT_ROOT / "backend"
 QUEUE_DB = PROJECT_ROOT / "data" / "review_queue_v9.db"
 WORK_DIR = PROJECT_ROOT / "data" / "v9_web_work"      # 段落模型 / 工作副本 docx
 WORK_DIR.mkdir(parents=True, exist_ok=True)
@@ -41,6 +42,7 @@ DEMO_SKIP_RETRIEVAL = os.getenv("V9_DEMO_SKIP_RETRIEVAL", "0") == "1"
 DISABLE_ESCALATION_LOOP = os.getenv("V9_DISABLE_ESCALATION_LOOP", "0") == "1"
 USE_MINERU_FOR_PENDING = os.getenv("V9_USE_MINERU_FOR_PENDING", "1") != "0"
 MINERU_API_URL = os.getenv("V9_MINERU_API_URL", os.getenv("MINERU_API_URL", "http://127.0.0.1:51071"))
+REVIEW_ENGINE_VERSION = os.getenv("V9_REVIEW_ENGINE_VERSION", "v9").strip().lower()
 
 
 def _env_int(name: str, default: int, min_value: int = 1, max_value: int = 16) -> int:
@@ -107,12 +109,17 @@ class V9Worker:
         self.llm = OpenAI(api_key=API_KEY, base_url=BASE_URL)
         self.engine = None
         if load_engine:
-            log("加载 v9 引擎（BGE 模型 + KB 索引，仅一次）...")
-            from hybrid_rag_review_v9 import HybridRAGReviewerV9
-            self.engine = HybridRAGReviewerV9()
+            if REVIEW_ENGINE_VERSION == "v10":
+                log("加载 v10 引擎（BGE 模型 + KB 索引，仅一次）...")
+                from hybrid_rag_review_v10 import HybridRAGReviewerV10
+                self.engine = HybridRAGReviewerV10()
+            else:
+                log("加载 v9 引擎（BGE 模型 + KB 索引，仅一次）...")
+                from hybrid_rag_review_v9 import HybridRAGReviewerV9
+                self.engine = HybridRAGReviewerV9()
             self.engine.load_knowledge_base()
             self.engine.build_index()
-            log("引擎就绪，进入轮询循环")
+            log(f"{REVIEW_ENGINE_VERSION} 引擎就绪，进入轮询循环")
 
     # ---------- 段落模型落盘 ----------
 
@@ -168,6 +175,48 @@ class V9Worker:
                 pythoncom.CoUninitialize()
             except Exception:
                 pass
+
+    def _configure_job_knowledge_base(
+        self,
+        job: Dict[str, Any],
+        mine_type: str,
+    ) -> Dict[str, Any]:
+        """让前端选中的 kb_id 真正决定 v10 审查时的法规范围。"""
+        engine = self.engine
+        kb_id = job.get("kb_id")
+        if kb_id is None:
+            changed = engine.use_default_knowledge_base(mine_type)
+            return {
+                "source": "system_default",
+                "kb_id": None,
+                "changed": bool(changed),
+                "chunks": len(engine.kb_chunks),
+                "excluded_outburst": int(engine.excluded_outburst_count),
+            }
+
+        backend_path = str(BACKEND_DIR)
+        if backend_path not in sys.path:
+            sys.path.insert(0, backend_path)
+        from app.services.vector_store import vector_store_service
+
+        records = vector_store_service.get_knowledge_base_review_chunks(int(kb_id))
+        if not records:
+            raise ValueError(
+                f"前端选中的知识库 kb_id={kb_id} 没有已索引的可审查规则块"
+            )
+        changed = engine.load_knowledge_base_records(
+            records,
+            kb_id=int(kb_id),
+            mine_type=mine_type,
+        )
+        return {
+            "source": "frontend_kb",
+            "kb_id": int(kb_id),
+            "changed": bool(changed),
+            "source_chunks": len(records),
+            "chunks": len(engine.kb_chunks),
+            "excluded_outburst": int(engine.excluded_outburst_count),
+        }
 
     def _working_docx(self, job_id: str, original: str) -> Path:
         """每个任务一份可被主智能体改写的工作副本。"""
@@ -236,46 +285,179 @@ class V9Worker:
                 })
         return units
 
+    @staticmethod
+    def _pdf_locations_for_text(chunk: Dict[str, Any], text: str = "") -> List[Dict[str, Any]]:
+        needle = _compact_text(text)
+        locations: List[Dict[str, Any]] = []
+        seen = set()
+        for unit in chunk.get("source_units") or []:
+            if str(unit.get("coordinate_space") or "") != "original_pdf":
+                continue
+            unit_text = _compact_text(unit.get("text", ""))
+            if needle and unit_text and needle not in unit_text and unit_text not in needle:
+                continue
+            try:
+                page = int(unit.get("page") or 0)
+                bbox = [round(float(value), 3) for value in (unit.get("bbox") or [])]
+            except (TypeError, ValueError):
+                continue
+            if page < 1 or len(bbox) != 4 or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+                continue
+            key = (page, *bbox)
+            if key in seen:
+                continue
+            seen.add(key)
+            location: Dict[str, Any] = {
+                "page": page,
+                "bbox": bbox,
+                "source_unit_id": str(unit.get("source_unit_id") or ""),
+            }
+            for size_key in ("page_width", "page_height"):
+                try:
+                    size = float(unit.get(size_key) or 0)
+                except (TypeError, ValueError):
+                    size = 0
+                if size > 0:
+                    location[size_key] = round(size, 3)
+            locations.append(location)
+        return locations
+
+    @staticmethod
+    def _pdf_page_sizes(source_path: str) -> Dict[int, Dict[str, float]]:
+        path = Path(source_path or "")
+        if path.suffix.lower() != ".pdf" or not path.exists():
+            return {}
+        try:
+            from pypdf import PdfReader
+
+            result: Dict[int, Dict[str, float]] = {}
+            reader = PdfReader(str(path))
+            for page_number, page in enumerate(reader.pages, 1):
+                page_box = page.cropbox or page.mediabox
+                width = float(page_box.width)
+                height = float(page_box.height)
+                rotation = int(page.get("/Rotate", 0) or 0) % 360
+                if rotation in {90, 270}:
+                    width, height = height, width
+                result[page_number] = {
+                    "page_width": round(width, 3),
+                    "page_height": round(height, 3),
+                }
+            return result
+        except Exception as exc:
+            log(f"读取原始 PDF 页面尺寸失败，将只保留页码/bbox: {exc}")
+            return {}
+
+    def _map_mineru_units_to_docx(
+        self,
+        parsed: Dict[str, Any],
+        mineru_chunks: List[Dict[str, Any]],
+    ) -> Dict[str, List[int]]:
+        """按文档顺序把稳定 MinerU 单元对齐到转换后的 Word block。"""
+        mapping: Dict[str, List[int]] = {}
+        used_blocks: set[int] = set()
+        cursor = -1
+        fallback_seq = 0
+        for chunk in mineru_chunks:
+            for unit in chunk.get("source_units") or []:
+                unit_id = str(unit.get("source_unit_id") or "").strip()
+                if not unit_id:
+                    unit_id = f"fallback-{fallback_seq}"
+                    fallback_seq += 1
+                    unit["source_unit_id"] = unit_id
+                if unit_id in mapping:
+                    continue
+                candidates = self._blocks_from_content(parsed, str(unit.get("text") or ""))
+                chosen = next(
+                    (value for value in candidates if value > cursor and value not in used_blocks),
+                    None,
+                )
+                if chosen is None:
+                    chosen = next((value for value in candidates if value not in used_blocks), None)
+                if chosen is None and candidates:
+                    chosen = candidates[0]
+                blocks = [int(chosen)] if chosen is not None else []
+                mapping[unit_id] = blocks
+                if blocks:
+                    used_blocks.update(blocks)
+                    cursor = max(cursor, blocks[-1])
+        return mapping
+
     def _attach_source_blocks_to_mineru_chunks(
         self,
         parsed: Dict[str, Any],
         mineru_chunks: List[Dict[str, Any]],
         docx_chunks: List[Dict[str, Any]],
+        mineru_source_path: str = "",
     ) -> List[Dict[str, Any]]:
+        unit_word_blocks = self._map_mineru_units_to_docx(parsed, mineru_chunks)
+        page_sizes = self._pdf_page_sizes(mineru_source_path)
+        native_pdf = Path(mineru_source_path or "").suffix.lower() == ".pdf"
         mapped: List[Dict[str, Any]] = []
         for chunk in mineru_chunks:
             content = chunk.get("content", "")
-            source_blocks = self._blocks_from_content(parsed, content)
+            enriched_units: List[Dict[str, Any]] = []
+            for raw_unit in chunk.get("source_units") or []:
+                unit = dict(raw_unit)
+                unit_id = str(unit.get("source_unit_id") or "")
+                unit["source_blocks"] = list(unit_word_blocks.get(unit_id) or [])
+                try:
+                    page = int(unit.get("page") or 0)
+                except (TypeError, ValueError):
+                    page = 0
+                if native_pdf and page > 0:
+                    unit["coordinate_space"] = "original_pdf"
+                    unit.update(page_sizes.get(page) or {})
+                enriched_units.append(unit)
+
+            source_blocks = sorted({
+                int(block)
+                for unit in enriched_units
+                for block in unit.get("source_blocks") or []
+            })
+            if not source_blocks:
+                source_blocks = self._blocks_from_content(parsed, content)
             if not source_blocks:
                 source_blocks = self._best_docx_chunk_blocks(content, docx_chunks)
             next_chunk = dict(chunk)
             next_chunk["source_blocks"] = source_blocks
-            if source_blocks and not next_chunk.get("source_units"):
+            if enriched_units:
+                next_chunk["source_units"] = enriched_units
+                next_chunk["source_pdf_blocks"] = enriched_units
+            elif source_blocks:
                 next_chunk["source_units"] = self._source_units_for_blocks(parsed, source_blocks)
             next_chunk.setdefault("char_count", len(content))
             next_chunk.setdefault("chunk_level", "paragraph")
             mapped.append(next_chunk)
         return mapped
 
-    def _build_pending_chunks_with_mineru(
-        self,
-        docx_path: str,
-        parsed: Dict[str, Any],
-        docx_chunks: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
+    def _load_pending_mineru_chunks(self, mineru_source_path: str) -> List[Dict[str, Any]]:
+        """调用 MinerU 并读取尚未映射 Word block 的原始待审 chunks。"""
         from mineru_adapter import convert_document_to_mineru_json
 
         try:
             result = convert_document_to_mineru_json(
-                docx_path,
+                mineru_source_path,
                 doc_kind="pending",
                 api_url=MINERU_API_URL,
                 timeout=7200,
                 chunk_pending=True,
             )
         except Exception as exc:
+            error_text = str(exc)
+            connection_failed = any(token in error_text for token in (
+                "Failed to establish a new connection",
+                "Connection refused",
+                "WinError 10061",
+                "Max retries exceeded",
+            ))
+            guidance = (
+                "无法连接 MinerU API，请先启动服务："
+                if connection_failed else
+                "MinerU API 已响应，但内部解析任务失败，请检查下方真实错误："
+            )
             raise RuntimeError(
-                "MinerU 解析待审文档失败。请先启动 MinerU API："
+                "MinerU 解析待审文档失败。" + guidance +
                 "D:/Anaconda/envs/langchain0.3/Scripts/mineru-api.exe "
                 "--host 127.0.0.1 --port 51071；"
                 f"当前 V9_MINERU_API_URL={MINERU_API_URL}；原始错误: {exc}"
@@ -289,7 +471,73 @@ class V9Worker:
         mineru_chunks = next(iter(chunk_doc.values()))
         if not isinstance(mineru_chunks, list) or not mineru_chunks:
             raise RuntimeError(f"MinerU 待审 chunks 结构异常: {result.chunks_preview_path}")
-        chunks = self._attach_source_blocks_to_mineru_chunks(parsed, mineru_chunks, docx_chunks)
+        return mineru_chunks
+
+    @staticmethod
+    def _build_pdf_editable_docx(
+        mineru_chunks: List[Dict[str, Any]],
+        target_path: str | Path,
+    ) -> str:
+        """用 MinerU 的顺序文本生成可裁决、可下载的 DOCX，不再让 Word 打开 PDF。"""
+        target = Path(target_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        doc = Document()
+        doc.core_properties.title = "MinerU PDF 审查工作副本"
+
+        seen: set[str] = set()
+        written = 0
+        fallback_index = 0
+        for chunk in mineru_chunks:
+            units = chunk.get("source_units") or []
+            if not units:
+                units = [{
+                    "source_unit_id": f"chunk-fallback-{fallback_index}",
+                    "text": chunk.get("content", ""),
+                    "kind": chunk.get("chunk_level", "paragraph"),
+                }]
+                fallback_index += 1
+            for unit in units:
+                text = str(unit.get("text") or "").strip()
+                if not text:
+                    continue
+                unit_id = str(unit.get("source_unit_id") or "").strip()
+                if not unit_id:
+                    compact_text = re.sub(r"\s+", "", text)[:80]
+                    unit_id = (
+                        f"p{unit.get('page', '')}-b{unit.get('bbox', '')}-"
+                        f"{compact_text}"
+                    )
+                if unit_id in seen:
+                    continue
+                seen.add(unit_id)
+
+                # XML 1.0 不允许大部分控制字符，清理后再写入 python-docx。
+                safe_text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", text)
+                kind = str(unit.get("kind") or "").lower()
+                style = "Heading 2" if kind in {"title", "heading", "header"} else None
+                doc.add_paragraph(safe_text, style=style)
+                written += 1
+
+        if written == 0:
+            raise RuntimeError("MinerU 未提取到可写入审查工作副本的文本")
+        doc.save(str(target))
+        if not target.exists() or target.stat().st_size == 0:
+            raise RuntimeError("MinerU 文本工作副本生成失败")
+        return str(target)
+
+    def _build_pending_chunks_with_mineru(
+        self,
+        mineru_source_path: str,
+        parsed: Dict[str, Any],
+        docx_chunks: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        mineru_chunks = self._load_pending_mineru_chunks(mineru_source_path)
+        chunks = self._attach_source_blocks_to_mineru_chunks(
+            parsed,
+            mineru_chunks,
+            docx_chunks,
+            mineru_source_path=mineru_source_path,
+        )
         mapped_count = sum(1 for chunk in chunks if chunk.get("source_blocks"))
         log(
             f"MinerU 待审切分完成: {len(chunks)} 段，"
@@ -355,25 +603,57 @@ class V9Worker:
                 agent_stage="parsing",
                 phase_done=0,
                 phase_total=0,
-                agent_status="正在解析文档并生成待审块…",
+                agent_status=(
+                    f"[{REVIEW_ENGINE_VERSION.upper()}] 正在解析文档并生成待审块…"
+                ),
                 timings=_timings_json(timings),
             )
-            docx_path = self._ensure_docx(docx_path)   # .doc → .docx 自动转换
-            if docx_path != job["docx_path"]:
-                self.queue.update_job(job_id, docx_path=docx_path)
-            parsed, docx_chunks = docx_adapter.adapt(docx_path)
-            if USE_MINERU_FOR_PENDING:
+            mineru_source_path = str(job.get("mineru_source_path") or docx_path)
+            native_pdf = Path(mineru_source_path).suffix.lower() == ".pdf"
+            if native_pdf:
+                if not USE_MINERU_FOR_PENDING:
+                    raise RuntimeError("原始 PDF 审查必须启用 V9_USE_MINERU_FOR_PENDING=1")
+                if not Path(mineru_source_path).exists():
+                    raise RuntimeError(f"MinerU 待审源文件不存在: {mineru_source_path}")
                 self.queue.update_job(
                     job_id,
                     agent_stage="parsing",
                     phase_done=0,
                     phase_total=0,
-                    agent_status="正在调用 MinerU 结构化解析待审文档…",
+                    agent_status="正在调用 MinerU 直接解析原始 PDF…",
                     timings=_timings_json(timings),
                 )
-                chunks = self._build_pending_chunks_with_mineru(docx_path, parsed, docx_chunks)
+                mineru_chunks = self._load_pending_mineru_chunks(mineru_source_path)
+                docx_path = self._build_pdf_editable_docx(mineru_chunks, docx_path)
+                self.queue.update_job(job_id, docx_path=docx_path)
+                parsed, docx_chunks = docx_adapter.adapt(docx_path)
+                chunks = self._attach_source_blocks_to_mineru_chunks(
+                    parsed,
+                    mineru_chunks,
+                    docx_chunks,
+                    mineru_source_path=mineru_source_path,
+                )
             else:
-                chunks = docx_chunks
+                docx_path = self._ensure_docx(docx_path)   # .doc → .docx 自动转换
+                if docx_path != job["docx_path"]:
+                    self.queue.update_job(job_id, docx_path=docx_path)
+                parsed, docx_chunks = docx_adapter.adapt(docx_path)
+                if USE_MINERU_FOR_PENDING:
+                    if not Path(mineru_source_path).exists():
+                        raise RuntimeError(f"MinerU 待审源文件不存在: {mineru_source_path}")
+                    self.queue.update_job(
+                        job_id,
+                        agent_stage="parsing",
+                        phase_done=0,
+                        phase_total=0,
+                        agent_status="正在调用 MinerU 结构化解析待审文档…",
+                        timings=_timings_json(timings),
+                    )
+                    chunks = self._build_pending_chunks_with_mineru(
+                        mineru_source_path, parsed, docx_chunks
+                    )
+                else:
+                    chunks = docx_chunks
             timings["parse"] = time.perf_counter() - parse_started
             if self._stop_if_cancelled(job_id, "文档解析后"):
                 return
@@ -389,7 +669,28 @@ class V9Worker:
                                   timings=_timings_json(timings))
 
             engine = self.engine
-            engine.mine_type = mine_type  # 适用性过滤按本任务矿井类型
+            kb_label = (
+                f" kb_id={job.get('kb_id')}"
+                if job.get("kb_id") is not None
+                else "（系统默认）"
+            )
+            self.queue.update_job(
+                job_id,
+                agent_stage="retrieval_rerank",
+                agent_status=(
+                    f"正在加载规程知识库"
+                    f"{kb_label}"
+                    f"，矿井类型={'突出' if mine_type == 'outburst' else '非突出'}…"
+                ),
+                timings=_timings_json(timings),
+            )
+            kb_runtime = self._configure_job_knowledge_base(job, mine_type)
+            log(
+                f"任务 {job_id} 规程知识库已激活: {kb_runtime}"
+            )
+            begin_job = getattr(engine, "begin_worker_job", None)
+            if callable(begin_job):
+                begin_job(job_id)
             if DEMO_SKIP_RETRIEVAL:
                 retrieval_started = time.perf_counter()
                 self.queue.update_job(
@@ -623,17 +924,39 @@ class V9Worker:
                     return
                 for ci, rep in rep_by_chunk.items():
                     if rep.get("has_duplicates"):
-                        dup = rep["duplicates"][0]
-                        self.queue.add_issue(
-                            job_id, ci, "redundancy", "重复",
-                            block_indices=chunks[ci].get("source_blocks", []),
-                            title="重复内容",
-                            original_text=chunks[ci]["content"][:80],
-                            reason=dup.get("note", ""),
-                            detail={"ref": dup.get("chunk_ref", ""),
-                                    "similarity": dup.get("similarity")},
+                        # v9 保持原有“每 chunk 第一条”行为；v10 精确段落模式会把
+                        # 原文和两个 Word 位置带回来，可一次落库全部唯一重复组。
+                        duplicates = (
+                            rep.get("duplicates", [])
+                            if rep.get("persistence_mode") == "v10_exact_paragraph"
+                            else rep.get("duplicates", [])[:1]
                         )
-                        n_issues += 1
+                        for dup in duplicates:
+                            blocks = dup.get("block_indices") or chunks[ci].get("source_blocks", [])
+                            original = dup.get("original_text") or chunks[ci]["content"][:80]
+                            claim = getattr(engine, "claim_worker_issue", None)
+                            if callable(claim) and not claim(
+                                job_id, "redundancy", original, "", blocks
+                            ):
+                                continue
+                            self.queue.add_issue(
+                                job_id, ci, "redundancy", "重复",
+                                block_indices=blocks,
+                                title="重复内容",
+                                original_text=original,
+                                reason=dup.get("note", ""),
+                                detail={
+                                    "ref": dup.get("chunk_ref", ""),
+                                    "similarity": dup.get("similarity"),
+                                    "match_method": dup.get("match_method", "semantic_chunk"),
+                                    "source_block_indices": dup.get("source_block_indices", []),
+                                    "duplicate_block_indices": dup.get("duplicate_block_indices", []),
+                                    "source_pdf_locations": dup.get("source_pdf_locations", []),
+                                    "duplicate_pdf_locations": dup.get("duplicate_pdf_locations", []),
+                                    "occurrence_count": dup.get("occurrence_count", 2),
+                                },
+                            )
+                            n_issues += 1
             except Exception as exc:
                 log(f"重复性检查异常（忽略）: {exc}")
 
@@ -644,7 +967,10 @@ class V9Worker:
                                       phase_done=len(chunks),
                                       phase_total=len(chunks),
                                       timings=_timings_json(timings),
-                                      agent_status=f"审查完成，共发现 {n_issues} 处问题，等待人工裁决")
+                                      agent_status=(
+                                          f"[{REVIEW_ENGINE_VERSION.upper()}] 审查完成，"
+                                          f"共发现 {n_issues} 处问题，等待人工裁决"
+                                      ))
             log(f"任务 {job_id} 完成，问题 {n_issues} 条，耗时: "
                 f"解析 {timings.get('parse', 0.0):.1f}s / "
                 f"向量化 {timings.get('vectorize', 0.0):.1f}s / "
@@ -667,10 +993,26 @@ class V9Worker:
         """单块：合规链 + 错别字，产出 issues。返回新增问题数。"""
         engine = self.engine
         count = 0
+        review_chunk = dict(chunk)
+        feedback_examples = self.queue.search_human_feedback(
+            str(chunk.get("content", "")),
+            limit=3,
+            mark_reused=True,
+        )
+        review_chunk["_human_feedback_examples"] = feedback_examples
+        feedback_trace = [
+            {
+                "annotation_id": int(item["id"]),
+                "action": item.get("action", ""),
+                "issue_type": item.get("issue_type", ""),
+                "similarity": item.get("similarity", 0),
+            }
+            for item in feedback_examples
+        ]
 
         # 复用引擎的合规链与错别字并行处理，并自动写入升级队列
         try:
-            result = engine._process_single_chunk(doc_name, idx, chunk, kb_results)
+            result = engine._process_single_chunk(doc_name, idx, review_chunk, kb_results)
             review = result["review_result"]
             numeric_checks = result["numeric_checks"]
             escalations = result["escalations"]
@@ -690,6 +1032,12 @@ class V9Worker:
         for issue in review.get("issues", []):
             original = issue.get("pending_content", "") or ""
             blocks = docx_adapter.locate_text_blocks(parsed, original, source_blocks)
+            claim = getattr(engine, "claim_worker_issue", None)
+            if callable(claim) and not claim(
+                job_id, "compliance", original, issue.get("suggestion", ""),
+                blocks or source_blocks,
+            ):
+                continue
             self.queue.add_issue(
                 job_id, idx, "compliance", status or "不合规",
                 block_indices=blocks or source_blocks,
@@ -699,7 +1047,10 @@ class V9Worker:
                 regulation=issue.get("regulation_content", ""),
                 reason=issue.get("description", ""),
                 detail={"numeric": numeric_detail,
-                        "summary": review.get("summary", "")},
+                        "summary": review.get("summary", ""),
+                        "adjudication": review.get("main_agent_adjudication", {}),
+                        "pdf_locations": self._pdf_locations_for_text(review_chunk, original),
+                        "feedback_experience": feedback_trace},
             )
             count += 1
 
@@ -717,6 +1068,9 @@ class V9Worker:
                     "numeric": numeric_detail,
                     "summary": review.get("summary", ""),
                     "escalations": escalations,
+                    "adjudication": review.get("main_agent_adjudication", {}),
+                    "pdf_locations": self._pdf_locations_for_text(review_chunk),
+                    "feedback_experience": feedback_trace,
                 },
                 escalation_type=first_escalation,
             )
@@ -726,15 +1080,23 @@ class V9Worker:
         for t in typo.get("issues", []):
             wrong = t.get("original") or t.get("wrong_char", "")
             blocks = docx_adapter.locate_text_blocks(parsed, wrong, source_blocks)
+            suggestion = t.get("suggestion") or t.get("correct_char", "")
+            claim = getattr(engine, "claim_worker_issue", None)
+            if callable(claim) and not claim(
+                job_id, "typo", wrong, suggestion, blocks or source_blocks
+            ):
+                continue
             self.queue.add_issue(
                 job_id, idx, "typo", "错别字",
                 block_indices=blocks or source_blocks,
                 title="错别字",
                 original_text=wrong,
-                suggestion=t.get("suggestion") or t.get("correct_char", ""),
+                suggestion=suggestion,
                 reason=t.get("reason", ""),
                 detail={"confidence": t.get("confidence", ""),
-                        "context": t.get("context", "")},
+                        "context": t.get("context", ""),
+                        "pdf_locations": self._pdf_locations_for_text(review_chunk, wrong),
+                        "feedback_experience": feedback_trace},
             )
             count += 1
 

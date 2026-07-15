@@ -20,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from docx import Document
 
@@ -294,28 +294,20 @@ async def _preprocess_upload_file(file: UploadFile) -> dict:
             _save_preprocess_meta(meta)
             raise HTTPException(500, str(exc)) from exc
     else:
-        try:
-            _convert_pdf_to_docx(original_path, docx_path)
-            shutil.copy2(original_path, pdf_path)
-            steps.append({"name": "convert_pdf_to_docx", "status": "done", "message": "PDF 已转换为可审查 .docx 副本"})
-            steps.append({"name": "use_original_pdf_preview", "status": "done", "message": "已使用原始 PDF 作为预览"})
-        except Exception as exc:
-            meta = {
-                "preprocess_id": preprocess_id,
-                "doc_name": file.filename,
-                "original_path": str(original_path),
-                "docx_path": "",
-                "pdf_path": str(original_path),
-                "docx_ready": False,
-                "pdf_ready": original_path.exists() and original_path.stat().st_size > 0,
-                "pdf_error": "",
-                "status": "failed",
-                "error": str(exc),
-                "steps": steps + [{"name": "convert_pdf_to_docx", "status": "failed", "message": str(exc)}],
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-            }
-            _save_preprocess_meta(meta)
-            raise HTTPException(500, str(exc)) from exc
+        # PDF 必须在上传阶段直接进入 MinerU 链路，不能同步调用 Word。
+        # Word 打开 PDF 时可能弹出隐藏确认框，曾导致整个 FastAPI 事件循环卡死，
+        # 前端最终只能得到“上传失败”。可编辑 DOCX 由 worker 在 MinerU 解析后生成。
+        shutil.copy2(original_path, pdf_path)
+        steps.append({
+            "name": "preserve_original_pdf",
+            "status": "done",
+            "message": "已保存原始 PDF；审查时将由 MinerU 直接解析",
+        })
+        steps.append({
+            "name": "defer_editable_docx",
+            "status": "done",
+            "message": "可编辑 DOCX 将在 MinerU 解析完成后生成",
+        })
 
     if original_suffix == ".pdf":
         pdf_error = ""
@@ -329,10 +321,11 @@ async def _preprocess_upload_file(file: UploadFile) -> dict:
     meta = {
         "preprocess_id": preprocess_id,
         "doc_name": file.filename,
+        "source_format": original_suffix.lstrip("."),
         "original_path": str(original_path),
-        "docx_path": str(docx_path),
+        "docx_path": "" if original_suffix == ".pdf" else str(docx_path),
         "pdf_path": str(pdf_path) if pdf_path.exists() and pdf_path.stat().st_size > 0 else "",
-        "docx_ready": True,
+        "docx_ready": original_suffix != ".pdf",
         "pdf_ready": bool(pdf_path.exists() and pdf_path.stat().st_size > 0),
         "pdf_error": pdf_error,
         "status": "ready",
@@ -351,13 +344,33 @@ def _create_job_from_preprocess(
     kb_id: int | None = None,
 ) -> dict:
     meta = _load_preprocess_meta(preprocess_id)
-    if not meta.get("docx_ready") or not meta.get("docx_path"):
+    source_format = str(meta.get("source_format") or Path(meta["doc_name"]).suffix.lstrip(".") or "docx").lower()
+    if meta.get("status") != "ready":
         raise HTTPException(400, "预处理未完成，不能启动审查")
-    docx_path = Path(meta["docx_path"])
-    if not docx_path.exists():
-        raise HTTPException(404, "预处理后的 .docx 文件不存在")
 
     job_id = uuid.uuid4().hex[:12]
+    original_pdf_path = ""
+    if source_format == "pdf":
+        # 此路径由 worker 在 MinerU 直接解析 PDF 后创建。
+        docx_path = _WORK_DIR / f"{job_id}_source.docx"
+        mineru_source_path = ""
+    else:
+        if not meta.get("docx_ready") or not meta.get("docx_path"):
+            raise HTTPException(400, "预处理未生成可审查的 .docx 文件")
+        docx_path = Path(meta["docx_path"])
+        if not docx_path.exists():
+            raise HTTPException(404, "预处理后的 .docx 文件不存在")
+        mineru_source_path = str(docx_path)
+
+    if source_format == "pdf":
+        source_pdf = Path(meta.get("original_path") or meta.get("pdf_path") or "")
+        if not source_pdf.exists() or source_pdf.stat().st_size == 0:
+            raise HTTPException(404, "预处理后的原始 PDF 不存在")
+        job_pdf = _WORK_DIR / f"{job_id}_original.pdf"
+        shutil.copy2(source_pdf, job_pdf)
+        original_pdf_path = str(job_pdf)
+        mineru_source_path = str(job_pdf)
+
     _queue.create_job(
         job_id,
         doc_name=meta["doc_name"],
@@ -365,6 +378,9 @@ def _create_job_from_preprocess(
         mine_type=mine_type,
         user_id=(user_id or "guest")[:80],
         kb_id=kb_id,
+        source_format=source_format,
+        mineru_source_path=mineru_source_path,
+        original_pdf_path=original_pdf_path,
     )
 
     pdf_path = Path(meta["pdf_path"]) if meta.get("pdf_path") else None
@@ -384,7 +400,7 @@ def _create_job_from_preprocess(
 
 @router.post("/preprocess")
 async def preprocess(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
-    """上传 Word 并完成审查前预处理：保存原件、统一为 .docx、尽量生成 PDF 预览。"""
+    """保存上传文件；Word 生成预览，PDF 保留原件并延后交给 MinerU 直接解析。"""
     started = time.perf_counter()
     try:
         result = await _preprocess_upload_file(file)
@@ -592,6 +608,17 @@ async def rerun_job(job_id: str, user_id: str = "guest", db: AsyncSession = Depe
         raise HTTPException(404, "历史任务的审查副本文档不存在，无法重新审查")
 
     new_job_id = uuid.uuid4().hex[:12]
+    source_format = str(old.get("source_format") or "docx").lower()
+    original_pdf_path = ""
+    mineru_source_path = str(source_docx)
+    if source_format == "pdf":
+        previous_pdf = Path(old.get("original_pdf_path") or "")
+        if not previous_pdf.exists() or previous_pdf.stat().st_size == 0:
+            raise HTTPException(404, "历史任务的原始 PDF 不存在，无法重新审查")
+        copied_pdf = _WORK_DIR / f"{new_job_id}_original.pdf"
+        shutil.copy2(previous_pdf, copied_pdf)
+        original_pdf_path = str(copied_pdf)
+        mineru_source_path = str(copied_pdf)
     _queue.create_job(
         new_job_id,
         doc_name=old.get("doc_name") or source_docx.name,
@@ -599,6 +626,9 @@ async def rerun_job(job_id: str, user_id: str = "guest", db: AsyncSession = Depe
         mine_type=old.get("mine_type") or "non_outburst",
         user_id=(user_id or old.get("user_id") or "guest")[:80],
         kb_id=kb_id,
+        source_format=source_format,
+        mineru_source_path=mineru_source_path,
+        original_pdf_path=original_pdf_path,
     )
     old_preview = _WORK_DIR / f"{job_id}_preview.pdf"
     if old_preview.exists() and old_preview.stat().st_size > 0:
@@ -626,7 +656,7 @@ async def delete_job(job_id: str):
         mongo_service.delete_review_job(job_id)
     except Exception as exc:
         print(f"[mongo] delete review job failed: {exc}")
-    for suffix in ("_preview.pdf", "_paragraphs.json", "_working.docx"):
+    for suffix in ("_preview.pdf", "_original.pdf", "_source.docx", "_paragraphs.json", "_working.docx"):
         try:
             (_WORK_DIR / f"{job_id}{suffix}").unlink(missing_ok=True)
         except Exception:
@@ -684,6 +714,7 @@ async def stream(job_id: str):
                     timings = {}
                 payload = {"type": "status", "job": {
                     "job_id": job["job_id"], "doc_name": job["doc_name"],
+                    "source_format": job.get("source_format") or "docx",
                     "status": job["status"], "progress": job["progress"],
                     "n_chunks": job["n_chunks"], "n_done": job["n_done"],
                     "agent_stage": job.get("agent_stage"),
@@ -742,18 +773,31 @@ async def feedback(body: dict, db: AsyncSession = Depends(get_db)):
         # 人工裁决写入飞轮（最高优先级，source=human）
         final_verdict = {"accept": issue["status"], "reject": "合规",
                          "custom": issue["status"]}[action]
-        _queue.add_annotation(
+        annotation_id = _queue.upsert_human_annotation(
             doc_name=doc_name,
             chunk_index=issue["chunk_index"],
             pending_content=issue.get("original_text", ""),
             final_verdict=final_verdict,
-            source="human",
+            issue_id=int(issue_id),
+            job_id=issue.get("job_id", ""),
+            user_id=str(body.get("user_id") or (job or {}).get("user_id") or "guest"),
+            action=action,
+            issue_type=issue.get("issue_type", ""),
             kb_refs=[{"regulation": issue.get("regulation", "")}],
             model_verdict=issue.get("status", ""),
             reason=text or issue.get("reason", ""),
             extra={"action": action, "issue_id": issue_id,
                    "issue_type": issue.get("issue_type", ""),
-                   "human_text": text},
+                   "human_text": text,
+                   "suggestion": issue.get("suggestion", ""),
+                   "regulation": issue.get("regulation", ""),
+                   "block_indices": issue.get("block_indices", []),
+                   "context": (issue.get("detail") or {}).get("context", ""),
+                   "final_text": (
+                       text if action == "custom"
+                       else issue.get("suggestion", "") if action == "accept"
+                       else issue.get("original_text", "")
+                   )},
         )
 
         # accept/custom → 交 worker 让主智能体改 Word；reject → 无需改写
@@ -781,7 +825,8 @@ async def feedback(body: dict, db: AsyncSession = Depends(get_db)):
         )
 
         return {"ok": True, "issue_id": issue_id, "action": action,
-                "flywheel": "human", "verdict": final_verdict}
+                "flywheel": "human", "annotation_id": annotation_id,
+                "verdict": final_verdict}
     except Exception as exc:
         await monitor_service.log_operation(
             db=db,
@@ -825,6 +870,7 @@ async def revoke_feedback(issue_id: int, db: AsyncSession = Depends(get_db)):
         ok = _queue.revoke_issue_feedback(issue_id)
         if not ok:
             raise HTTPException(404, "问题不存在")
+        _queue.deactivate_human_annotation(issue_id)
 
         latest = _queue.get_issue(issue_id)
         _sync_job_to_mongo(issue["job_id"], include_issues=True)
@@ -862,10 +908,53 @@ async def revoke_feedback(issue_id: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/flywheel")
-async def flywheel_list(source: str = "", limit: int = 200):
-    """列出数据飞轮记录（前端查看）。source 可选 human/agent。"""
-    items = _queue.list_annotations(limit=limit, source=source or None)
-    return {"counts": _queue.count_annotations(), "items": items}
+async def flywheel_list(
+    limit: int = 200,
+    action: str = "",
+    issue_type: str = "",
+    query: str = "",
+):
+    """人工反馈飞轮样本；不混入主智能体自动裁决记录。"""
+    items = _queue.list_human_feedback(
+        limit=limit,
+        action=action,
+        issue_type=issue_type,
+        query=query,
+    )
+    return {"stats": _queue.flywheel_stats(), "items": items}
+
+
+@router.get("/flywheel/stats")
+async def flywheel_stats():
+    return _queue.flywheel_stats()
+
+
+@router.get("/flywheel/export")
+async def flywheel_export():
+    """导出当前有效人工反馈黄金样本，不包含撤回和自动智能体裁决。"""
+    items = _queue.list_human_feedback(limit=2000)
+    cases = [
+        {
+            "case_id": f"human_feedback_{int(item['id']):05d}",
+            "doc_name": item.get("doc_name", ""),
+            "chunk_index": item.get("chunk_index"),
+            "issue_type": item.get("issue_type", ""),
+            "pending_content": item.get("pending_content", ""),
+            "model_verdict": item.get("model_verdict", ""),
+            "human_action": item.get("action", ""),
+            "gold_verdict": item.get("final_verdict", ""),
+            "reason": item.get("reason", ""),
+            "final_text": (item.get("extra") or {}).get("final_text", ""),
+            "kb_refs": item.get("kb_refs", []),
+            "annotated_at": item.get("created_at", ""),
+        }
+        for item in reversed(items)
+    ]
+    filename = f"human_feedback_gold_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    return JSONResponse(
+        content={"cases": cases, "count": len(cases), "exported_at": datetime.now().isoformat()},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.delete("/flywheel/{ann_id}")
@@ -884,17 +973,33 @@ async def preview_pdf(job_id: str, refresh: int = 0, rebuild: int = 0):
     if not job:
         raise HTTPException(404, "任务不存在")
 
+    response_headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+    original_pdf = Path(job.get("original_pdf_path") or "")
+    if (
+        str(job.get("source_format") or "").lower() == "pdf"
+        and original_pdf.exists()
+        and original_pdf.stat().st_size > 0
+    ):
+        return FileResponse(
+            path=str(original_pdf),
+            media_type="application/pdf",
+            headers={
+                **response_headers,
+                "X-Preview-Source": "original-pdf",
+                "X-Pdf-MTime": str(original_pdf.stat().st_mtime),
+            },
+        )
+
     work = _WORK_DIR / f"{job_id}_working.docx"
     source = work if work.exists() else Path(job["docx_path"])
     if not source.exists():
         raise HTTPException(404, "文档不存在")
 
     cache_pdf = _WORK_DIR / f"{job_id}_preview.pdf"
-    response_headers = {
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-        "Pragma": "no-cache",
-        "Expires": "0",
-    }
     if (not rebuild and cache_pdf.exists()
             and cache_pdf.stat().st_size > 0
             and cache_pdf.stat().st_mtime >= source.stat().st_mtime):

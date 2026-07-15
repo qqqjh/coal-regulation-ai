@@ -29,6 +29,34 @@ const getFileIcon = (fileName) => {
   }
 }
 
+const APPLICABILITY_REASON_LABELS = {
+  document_override: '上传时人工指定整份文档的适用范围',
+  document_name: '规则文档名称表明其为突出矿井专用',
+  structure_heading: '章节或上级标题表明该规则块为突出矿井专用',
+  no_outburst_scope_in_structure: '文档名和章节结构未限定为突出矿井专用',
+  stored_metadata: '使用入库时保存的适用范围'
+}
+
+const getApplicabilityTag = (metadata = {}) => {
+  const reason = APPLICABILITY_REASON_LABELS[metadata.applicability_reason]
+    || metadata.applicability_reason
+  if (metadata.applicability === 'outburst_only') {
+    return (
+      <Tag color="volcano" title={reason || '突出矿井专用规则'}>
+        突出专用
+      </Tag>
+    )
+  }
+  if (metadata.applicability === 'general') {
+    return (
+      <Tag color="green" title={reason || '通用规则'}>
+        通用
+      </Tag>
+    )
+  }
+  return null
+}
+
 // Mock 文档内容数据
 const mockDocumentContent = {
   1: {
@@ -156,7 +184,8 @@ const DocumentPreview = memo(({ visible, document, onClose }) => {
             chunks: data.chunks.map((chunk, idx) => ({
               id: chunk.id,
               page: chunk.page || idx + 1,
-              content: chunk.content
+              content: chunk.content,
+              metadata: chunk.metadata || {}
             })),
             totalChunks: data.total_chunks
           })
@@ -201,7 +230,7 @@ const DocumentPreview = memo(({ visible, document, onClose }) => {
     }
 
     loadDocumentContent()
-  }, [document, visible])
+  }, [document, visible, user?.id, user?.role])
 
   if (!document) return null
   if (!docContent) return null
@@ -224,6 +253,7 @@ const DocumentPreview = memo(({ visible, document, onClose }) => {
                 <div className="chunk-item" key={chunk.id}>
                   <div className="chunk-header">
                     <Tag color="blue">第 {chunk.page} 页</Tag>
+                    {getApplicabilityTag(chunk.metadata)}
                     <Text type="secondary">分块 #{chunk.id}</Text>
                   </div>
                   <div className="chunk-content">

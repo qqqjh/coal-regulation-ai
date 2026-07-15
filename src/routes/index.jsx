@@ -12,6 +12,7 @@ import AuthRoute from '../components/AuthRoute'
 import AdminRoute from '../components/AdminRoute'
 import MainLayout from '../components/MainLayout'
 import AdminReviewKb from '../pages/AdminReviewKb'
+import Flywheel from '../pages/Flywheel'
 
 const AppRoutes = () => {
   return (
@@ -40,6 +41,14 @@ const AppRoutes = () => {
           element={
             <AdminRoute>
               <AdminReviewKb />
+            </AdminRoute>
+          }
+        />
+        <Route
+          path="admin/flywheel"
+          element={
+            <AdminRoute>
+              <Flywheel />
             </AdminRoute>
           }
         />

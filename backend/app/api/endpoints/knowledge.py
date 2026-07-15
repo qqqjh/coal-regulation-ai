@@ -4,7 +4,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 from sqlalchemy.orm import selectinload
 from typing import List
-from app.services.vector_store import vector_store_service
+from app.services.vector_store import (
+    normalize_applicability_mode,
+    vector_store_service,
+)
 from app.services.monitor_service import monitor_service
 from app.models.schemas import DocumentInfo
 from app.models.database import KnowledgeBase, Document
@@ -16,6 +19,13 @@ from app.core.config import settings
 import time
 
 router = APIRouter()
+
+
+def _validated_applicability(value: str) -> str:
+    try:
+        return normalize_applicability_mode(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _normalize_user_id(user_id: str | int | None) -> str:
@@ -222,12 +232,15 @@ async def upload_document(
     file: UploadFile = File(...),
     user_id: str = Form("guest"),
     role: str = Form("user"),
+    applicability: str = Form("auto"),
     db: AsyncSession = Depends(get_db)
 ):
     """上传文档到知识库"""
     start_time = time.time()
+    doc = None
 
     try:
+        applicability = _validated_applicability(applicability)
         # 检查知识库是否存在
         await _get_visible_kb(db, kb_id, user_id, role)
 
@@ -259,7 +272,14 @@ async def upload_document(
         await db.refresh(doc)
 
         # 处理文件并向量化，传入 doc_id 和 kb_id
-        result_msg = await vector_store_service.process_file(file, filename, doc.id, kb_id)
+        result_msg = await vector_store_service.process_file(
+            file,
+            filename,
+            doc.id,
+            kb_id,
+            original_filename=original_filename,
+            applicability_mode=applicability,
+        )
 
         # 获取文件大小并更新文档记录
         file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
@@ -267,6 +287,19 @@ async def upload_document(
         success = str(result_msg).startswith("Success")
         doc.status = "indexed" if success else "failed"
         doc.indexed_time = datetime.utcnow() if success else None
+        applicability_summary = {
+            "total": 0, "general": 0, "outburst_only": 0, "available": False
+        }
+        if success:
+            try:
+                applicability_summary = vector_store_service.get_applicability_summary(
+                    kb_id, doc_id=doc.id
+                )
+                applicability_summary["available"] = True
+            except Exception as summary_error:
+                # 入库已成功时，统计读取失败不能把整次上传误报为失败；列表页会再次刷新。
+                print(f"读取规则适用性统计失败: {summary_error}")
+        doc.chunk_count = applicability_summary["total"]
         await db.commit()
         await db.refresh(doc)
 
@@ -283,12 +316,20 @@ async def upload_document(
             "id": doc.id,
             "filename": filename,
             "status": doc.status,
-            "message": result_msg
+            "message": result_msg,
+            "applicability": applicability,
+            "applicability_summary": applicability_summary,
         }
 
     except HTTPException:
         raise
     except Exception as e:
+        if doc is not None:
+            try:
+                doc.status = "failed"
+                await db.commit()
+            except Exception:
+                await db.rollback()
         await monitor_service.log_operation(
             db=db,
             module="knowledge",
@@ -318,18 +359,35 @@ async def list_documents(
     )
     docs = result.scalars().all()
 
-    return [
-        {
+    try:
+        summaries = vector_store_service.get_applicability_summaries(kb_id)
+    except Exception as summary_error:
+        print(f"读取知识库适用性汇总失败: {summary_error}")
+        summaries = {}
+
+    items = []
+    for doc in docs:
+        if doc.id in summaries:
+            applicability_summary = {**summaries[doc.id], "available": True}
+        else:
+            applicability_summary = {
+                "total": int(doc.chunk_count or 0),
+                "general": 0,
+                "outburst_only": 0,
+                "available": False,
+            }
+        items.append({
             "id": doc.id,
             "name": doc.name,
             "type": doc.file_type,
             "size": doc.file_size,
             "status": doc.status,
             "uploadTime": doc.upload_time.isoformat(),
-            "indexedTime": doc.indexed_time.isoformat() if doc.indexed_time else None
-        }
-        for doc in docs
-    ]
+            "indexedTime": doc.indexed_time.isoformat() if doc.indexed_time else None,
+            "chunkCount": applicability_summary["total"],
+            "applicabilitySummary": applicability_summary,
+        })
+    return items
 
 @router.get("/document-content/{doc_id}")
 async def get_document_content(
@@ -460,12 +518,15 @@ async def upload_document_simple(
     user_id: str = Form("guest"),
     role: str = Form("user"),
     user_name: str = Form(None),
+    applicability: str = Form("auto"),
     db: AsyncSession = Depends(get_db)
 ):
     """上传文档（简化版，自动创建默认知识库）"""
     start_time = time.time()
+    doc = None
 
     try:
+        applicability = _validated_applicability(applicability)
         # 查找或创建默认知识库
         owner_id = "admin" if _is_admin(user_id, role) else _normalize_user_id(user_id)
         result = await db.execute(
@@ -513,6 +574,7 @@ async def upload_document_simple(
             doc.id,
             kb.id,
             original_filename=file.filename,
+            applicability_mode=applicability,
         )
 
         # 获取文件大小
@@ -523,6 +585,18 @@ async def upload_document_simple(
         doc.file_size = file_size
         doc.status = "indexed" if success else "failed"
         doc.indexed_time = datetime.utcnow() if success else None
+        summary = {
+            "total": 0, "general": 0, "outburst_only": 0, "available": False
+        }
+        if success:
+            try:
+                summary = vector_store_service.get_applicability_summary(
+                    kb.id, doc_id=doc.id
+                )
+                summary["available"] = True
+            except Exception as summary_error:
+                print(f"读取规则适用性统计失败: {summary_error}")
+            doc.chunk_count = summary["total"]
         await db.commit()
 
         # 记录监控日志
@@ -536,10 +610,18 @@ async def upload_document_simple(
 
         return {
             "filename": file.filename,
-            "status": result_msg
+            "status": result_msg,
+            "applicability": applicability,
+            "applicability_summary": summary,
         }
 
     except Exception as e:
+        if doc is not None:
+            try:
+                doc.status = "failed"
+                await db.commit()
+            except Exception:
+                await db.rollback()
         await monitor_service.log_operation(
             db=db,
             module="knowledge",

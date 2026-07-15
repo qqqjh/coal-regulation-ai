@@ -269,6 +269,7 @@ class PendingDocChunkerV9:
     def extract_text_blocks(self) -> List[Dict[str, Any]]:
         """提取所有文本块"""
         blocks = []
+        source_unit_seq = 0
         for page_idx, page in enumerate(self.pages):
             para_blocks = page.get('para_blocks', [])
             for block in para_blocks:
@@ -283,8 +284,10 @@ class PendingDocChunkerV9:
                             'page': page_idx + 1,
                             'type': 'table',
                             'text': table_text,
-                            'bbox': block.get('bbox', [])
+                            'bbox': block.get('bbox', []),
+                            'source_unit_id': f"p{page_idx + 1}-u{source_unit_seq}",
                         })
+                        source_unit_seq += 1
                     continue
 
                 if block_type == 'list':
@@ -300,8 +303,10 @@ class PendingDocChunkerV9:
                                 'page': page_idx + 1,
                                 'type': 'list_item',
                                 'text': text,
-                                'bbox': sub_block.get('bbox', [])
+                                'bbox': sub_block.get('bbox', []),
+                                'source_unit_id': f"p{page_idx + 1}-u{source_unit_seq}",
                             })
+                            source_unit_seq += 1
                     continue
 
                 text_parts = []
@@ -315,8 +320,10 @@ class PendingDocChunkerV9:
                         'page': page_idx + 1,
                         'type': block_type,
                         'text': text,
-                        'bbox': block.get('bbox', [])
+                        'bbox': block.get('bbox', []),
+                        'source_unit_id': f"p{page_idx + 1}-u{source_unit_seq}",
                     })
+                    source_unit_seq += 1
         return blocks
 
     def detect_structure_type(self, blocks: List[Dict]) -> str:
@@ -780,7 +787,7 @@ class PendingDocChunkerV9:
         """根据文档结构智能合并chunk"""
         chunks = []
         hierarchy = {'part': '', 'chapter': '', 'section': '', 'article': ''}
-        current_content = []
+        current_blocks: List[Dict[str, Any]] = []
         start_page = 1
         chunk_level = None
 
@@ -791,15 +798,15 @@ class PendingDocChunkerV9:
             page = block['page']
 
             if structure_type == 'list_item':
-                current_content.append(text)
+                current_blocks.append(block)
                 continue
 
             if level > 0:
-                if current_content and chunk_level is not None:
+                if current_blocks and chunk_level is not None:
                     chunks.append(self._create_chunk(
-                        hierarchy.copy(), current_content, start_page, page - 1, chunk_level
+                        hierarchy.copy(), current_blocks, start_page, page - 1, chunk_level
                     ))
-                    current_content = []
+                    current_blocks = []
 
                 if structure_type == 'part':
                     hierarchy = {'part': text, 'chapter': '', 'section': '', 'article': ''}
@@ -815,22 +822,34 @@ class PendingDocChunkerV9:
                 elif structure_type == 'title':
                     hierarchy['chapter'] = text
 
-                current_content = [text]
+                current_blocks = [block]
                 start_page = page
                 chunk_level = structure_type
             else:
-                current_content.append(text)
+                current_blocks.append(block)
 
-        if current_content:
+        if current_blocks:
             last_page = self.pages[-1]['page_idx'] + 1 if self.pages else 1
             chunks.append(self._create_chunk(
-                hierarchy.copy(), current_content, start_page, last_page, chunk_level
+                hierarchy.copy(), current_blocks, start_page, last_page, chunk_level
             ))
         return chunks
 
-    def _create_chunk(self, hierarchy: Dict, content: List[str],
-                     start_page: int, end_page: int, chunk_level: str) -> Dict:
+    def _create_chunk(self, hierarchy: Dict, source_blocks: List[Dict[str, Any]],
+                      start_page: int, end_page: int, chunk_level: str) -> Dict:
         """创建chunk对象"""
+        content = [str(block.get('text', '')) for block in source_blocks if block.get('text')]
+        source_units = [
+            {
+                'source_unit_id': str(block.get('source_unit_id') or ''),
+                'text': str(block.get('text', '')),
+                'page': int(block.get('page') or start_page or 1),
+                'bbox': list(block.get('bbox') or []),
+                'kind': str(block.get('type') or 'paragraph'),
+            }
+            for block in source_blocks
+            if block.get('text')
+        ]
         return {
             'part': hierarchy.get('part', ''),
             'chapter': hierarchy.get('chapter', ''),
@@ -841,7 +860,9 @@ class PendingDocChunkerV9:
             'chunk_level': chunk_level,
             'char_count': sum(len(c) for c in content),
             'sub_marker': '',
-            'is_sub_chunk': False
+            'is_sub_chunk': False,
+            'source_units': source_units,
+            'source_pdf_blocks': source_units,
         }
 
     def merge_small_chunks(self, chunks: List[Dict]) -> List[Dict]:

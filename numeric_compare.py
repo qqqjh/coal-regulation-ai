@@ -18,6 +18,7 @@
 """
 import json
 import re
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
 # ============ 单位归一化 ============
@@ -31,15 +32,31 @@ UNIT_ALIASES = {
     "m/s": "m/s", "米/秒": "m/s", "米每秒": "m/s", "km/h": "km/h",
     "m3/min": "m3/min", "m³/min": "m3/min", "立方米/分": "m3/min", "立方米/分钟": "m3/min",
     "m3/s": "m3/s", "m³/s": "m3/s", "立方米/秒": "m3/s",
+    "m3/h": "m3/h", "m³/h": "m3/h", "立方米/小时": "m3/h",
+    "m3/d": "m3/d", "m³/d": "m3/d", "立方米/天": "m3/d",
+    "m3": "m3", "m³": "m3", "立方米": "m3",
+    "m2": "m2", "m²": "m2", "平方米": "m2",
+    "cm2": "cm2", "cm²": "cm2", "平方厘米": "cm2",
+    "mm2": "mm2", "mm²": "mm2", "平方毫米": "mm2",
+    "m3/t": "m3/t", "m³/t": "m3/t", "立方米/吨": "m3/t",
+    "l/min": "L/min", "L/min": "L/min", "升/分钟": "L/min",
+    "m/min": "m/min", "米/分钟": "m/min",
     "pa": "Pa", "帕": "Pa", "kpa": "kPa", "千帕": "kPa", "mpa": "MPa", "兆帕": "MPa",
     "mg/m3": "mg/m3", "mg/m³": "mg/m3", "毫克/立方米": "mg/m3",
     "g/m3": "g/m3", "g/m³": "g/m3", "克/立方米": "g/m3",
     "°c": "C", "℃": "C", "摄氏度": "C", "度": "deg",
     "秒": "s", "分钟": "min", "分": "min", "小时": "h",
+    "天": "d", "日": "d", "周": "week", "月": "month", "年": "year",
     "克": "g", "千克": "kg", "公斤": "kg", "吨": "t",
     "牛": "N", "千牛": "kN",
-    "伏": "V", "千伏": "kV", "安": "A",
+    "伏": "V", "千伏": "kV", "安": "A", "ω": "Ω", "ohm": "Ω", "欧姆": "Ω",
     "lx": "lx", "勒克斯": "lx",
+    "hz": "Hz", "赫兹": "Hz", "r/min": "r/min", "rpm": "r/min", "转/分钟": "r/min",
+    "w": "W", "瓦": "W", "kw": "kW", "千瓦": "kW", "mw": "MW", "兆瓦": "MW",
+    "j": "J", "焦": "J", "kj": "kJ", "千焦": "kJ", "mj": "MJ", "兆焦": "MJ",
+    "db": "dB", "db(a)": "dB", "dB(A)": "dB", "分贝": "dB",
+    "人": "person", "个": "count", "次": "count", "台": "count", "根": "count",
+    "组": "count", "处": "count", "套": "count", "倍": "multiple",
 }
 
 # 标准单位 -> (量纲, 换算到基准单位的系数)
@@ -48,14 +65,28 @@ UNIT_TABLE = {
     "mm": ("length", 0.001), "cm": ("length", 0.01), "m": ("length", 1.0), "km": ("length", 1000.0),
     "m/s": ("speed", 1.0), "km/h": ("speed", 1.0 / 3.6),
     "m3/min": ("airflow", 1.0), "m3/s": ("airflow", 60.0),
+    "m3/h": ("airflow", 1.0 / 60.0), "m3/d": ("airflow", 1.0 / 1440.0),
+    "m3": ("volume", 1.0),
+    "mm2": ("area", 1e-6), "cm2": ("area", 1e-4), "m2": ("area", 1.0),
+    "m3/t": ("gas_content", 1.0), "L/min": ("liquid_flow", 1.0),
+    "m/min": ("speed", 1.0 / 60.0),
     "Pa": ("pressure", 1.0), "kPa": ("pressure", 1000.0), "MPa": ("pressure", 1e6),
     "mg/m3": ("density", 1.0), "g/m3": ("density", 1000.0),
     "C": ("temperature", 1.0), "deg": ("angle", 1.0),
     "s": ("time", 1.0), "min": ("time", 60.0), "h": ("time", 3600.0),
+    "d": ("time", 86400.0), "week": ("time", 604800.0),
+    "month": ("calendar_month", 1.0), "year": ("calendar_year", 1.0),
     "g": ("mass", 0.001), "kg": ("mass", 1.0), "t": ("mass", 1000.0),
     "N": ("force", 1.0), "kN": ("force", 1000.0),
     "V": ("voltage", 1.0), "kV": ("voltage", 1000.0), "A": ("current", 1.0),
+    "Ω": ("resistance", 1.0),
     "lx": ("illuminance", 1.0),
+    "Hz": ("frequency", 1.0), "r/min": ("rotation_speed", 1.0),
+    "W": ("power", 1.0), "kW": ("power", 1000.0), "MW": ("power", 1e6),
+    "J": ("energy", 1.0), "kJ": ("energy", 1000.0), "MJ": ("energy", 1e6),
+    "dB": ("sound_level", 1.0),
+    "person": ("count", 1.0), "count": ("count", 1.0),
+    "multiple": ("ratio_multiple", 1.0),
     "": ("dimensionless", 1.0),  # 无单位（个数、倍数等）
 }
 
@@ -110,11 +141,15 @@ def compare_pair(pair: Dict[str, Any]) -> Dict[str, Any]:
     pending = pair.get("pending") or {}
     rule = pair.get("rule") or {}
 
+    rule_quote = str(rule.get("quote", ""))[:120]
+    table_header = str(rule.get("table_header", "")).strip()
+    if table_header:
+        rule_quote = f"{table_header}\n{rule_quote}"
     base = {
         "parameter": param,
         "constraint_type": ctype,
         "pending_quote": str(pending.get("quote", ""))[:120],
-        "rule_quote": str(rule.get("quote", ""))[:120],
+        "rule_quote": rule_quote,
     }
 
     def out(verdict: str, relation: str, explanation: str) -> Dict[str, Any]:
@@ -239,9 +274,18 @@ EXTRACTION_PROMPT = """从下面的【待审内容】和【法规内容】中，
 配对规则：
 1. 只配对参数语义相同且适用场景相同的数值（如同为"掘进工作面回风流甲烷断电浓度"）
 2. 场景不同（如采煤工作面 vs 掘进工作面、不同传感器位置）不得配对
-3. 待审或法规中找不到对应数值的参数，不要输出
-4. 数值只填阿拉伯数字，单位单独填（如"1.5"和"%"，不要填"1.5%"）
-5. quote 必须是原文片段（30字以内）
+3. 控制阶段必须相同："达到X就报警/断电/停工/撤人"是触发阶段；
+   "低于X方可复电/恢复/送电/开机/开启/进入"是恢复准入阶段，二者不得互相配对
+4. 必须穷举待审内容中的每一项独立数值约束。同一句有多个阈值或动作时逐项输出，
+   不得只选择其中一个看似相等的阈值而忽略其余阈值
+5. 待审或法规中找不到对应数值的参数，不要输出；严禁根据常识补写法规中缺失的数值
+6. 数值只填阿拉伯数字，单位单独填（如"1.5"和"%"，不要填"1.5%"）
+7. pending.quote 和 rule.quote 必须分别逐字来自待审原文和法规原文，且各自必须包含所填数值；
+   法规原文数值为空时不得生成配对
+8. 表格一行含报警、断电、复电多个数值时，必须结合表头选择与待审动作一致的唯一列：
+   恢复/复电/送电/开机/开启只允许配"复电浓度"列；报警配报警列；断电/停工配断电列。
+   rule.quote 应同时包含表头字段和对应行，禁止因为数值恰好相同而跨列配对
+9. 每个待审数值约束最多输出一个最具体配对，不得用同一待审句与多个近义法规行做笛卡尔积重复配对
 
 输出JSON（没有可配对数值时 pairs 为空数组）：
 {{
@@ -270,10 +314,12 @@ def _parse_json_loose(text: str) -> Optional[Dict]:
 
 
 def extract_pairs(llm_client, model: str, pending_text: str, rule_text: str,
-                  temperature: float = 0.0) -> List[Dict[str, Any]]:
+                  temperature: float = 0.0, pending_max_chars: int = 1500,
+                  rule_max_chars: int = 1500) -> List[Dict[str, Any]]:
     """调用 LLM 抽取配对数值约束。失败返回空列表（降级为纯 LLM 审查）。"""
     prompt = EXTRACTION_PROMPT.format(
-        pending_text=pending_text[:1500], rule_text=rule_text[:1500]
+        pending_text=pending_text[:pending_max_chars],
+        rule_text=rule_text[:rule_max_chars],
     )
     response = llm_client.chat.completions.create(
         model=model,
@@ -290,7 +336,207 @@ def extract_pairs(llm_client, model: str, pending_text: str, rule_text: str,
     return pairs if isinstance(pairs, list) else []
 
 
-def numeric_check(llm_client, model: str, pending_text: str, rule_text: str) -> Dict[str, Any]:
+_NUMBER_IN_QUOTE = re.compile(r"-?\d+(?:\.\d+)?")
+_RESTORE_PHASE = re.compile(
+    r"(?:方可|才可|允许).{0,16}(?:复电|恢复|送电|开机|开启|启动|进入|作业)"
+    r"|(?:复电|恢复|送电|开机|开启|启动|进入).{0,16}(?:方可|才可|允许)"
+    r"|复电浓度"
+)
+_TRIGGER_PHASE = re.compile(
+    r"(?:达到|超过|超限|≥|>=|大于).{0,24}(?:报警|断电|停工|停止|撤出|切断)"
+    r"|(?:报警|断电|停工|停止|撤出|切断).{0,16}(?:浓度|阈值)"
+)
+_RELATIVE_PERCENT = re.compile(
+    r"(?:上调|下调|提高|降低|增加|减少|浮动|偏差)\s*\d+(?:\.\d+)?\s*%"
+)
+
+
+def _compact_source_text(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    return re.sub(r"\s+", "", text)
+
+
+def _quote_is_grounded(source_text: str, quote: Any) -> bool:
+    source = _compact_source_text(source_text)
+    candidate = _compact_source_text(quote)
+    return bool(candidate) and candidate in source
+
+
+def _quote_contains_value(quote: Any, value: Any) -> bool:
+    try:
+        expected = float(value)
+    except (TypeError, ValueError):
+        return False
+    for raw in _NUMBER_IN_QUOTE.findall(unicodedata.normalize("NFKC", str(quote or ""))):
+        try:
+            if abs(float(raw) - expected) <= EPS:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _values_with_unit(quote: Any, unit: Any) -> List[float]:
+    normalized = unicodedata.normalize("NFKC", str(quote or ""))
+    normalized_unit = str(unit or "").strip()
+    if normalized_unit in ("%", "％"):
+        unit_pattern = r"%"
+    elif normalized_unit:
+        unit_pattern = re.escape(normalized_unit)
+    else:
+        return []
+    pattern = re.compile(rf"(-?\d+(?:\.\d+)?)\s*{unit_pattern}", re.IGNORECASE)
+    values: List[float] = []
+    for raw in pattern.findall(normalized):
+        try:
+            values.append(float(raw))
+        except ValueError:
+            continue
+    return list(dict.fromkeys(values))
+
+
+def _repair_unique_value_from_grounded_quote(side: Dict[str, Any]) -> bool:
+    """quote 已落地且仅含一个同单位数值时，以原文值纠正 LLM 填错的 value。"""
+    values = _values_with_unit(side.get("quote"), side.get("unit"))
+    if len(values) != 1 or side.get("value_high") is not None:
+        return False
+    side["value"] = values[0]
+    return True
+
+
+def _recover_unique_pending_quote(source_text: str, side: Dict[str, Any]) -> str:
+    """LLM 改写 quote 时，仅用唯一数值候选回填待审原文，不猜测法规原文。"""
+    value = side.get("value")
+    if value is None:
+        return ""
+    candidates: List[str] = []
+    for raw in re.split(r"[\r\n]+|(?<=[。；;])", str(source_text or "")):
+        candidate = re.sub(r"^【待审数值句\d+】", "", raw).strip()
+        if not candidate or not _quote_contains_value(candidate, value):
+            continue
+        if side.get("value_high") is not None and not _quote_contains_value(
+            candidate, side.get("value_high")
+        ):
+            continue
+        candidates.append(candidate)
+    unique = list(dict.fromkeys(_compact_source_text(item) for item in candidates))
+    if len(unique) != 1:
+        return ""
+    compact = unique[0]
+    return next(
+        (item for item in candidates if _compact_source_text(item) == compact), ""
+    )
+
+
+def _constraint_phase(text: Any) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    if _RESTORE_PHASE.search(normalized):
+        return "restore"
+    if _TRIGGER_PHASE.search(normalized):
+        return "trigger"
+    return ""
+
+
+def _repair_restore_pair_from_table(
+    pair: Dict[str, Any], rule_text: str
+) -> bool:
+    """按运行时表头定位复电列，修正模型在同一行中选错报警/断电列。"""
+    rule = pair.get("rule") or {}
+    rule_quote = str(rule.get("quote", "")).strip()
+    if "|" not in rule_quote:
+        return False
+    lines = [line.strip() for line in str(rule_text or "").splitlines() if line.strip()]
+    row_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if _compact_source_text(rule_quote) in _compact_source_text(line)
+            or _compact_source_text(line) in _compact_source_text(rule_quote)
+        ),
+        None,
+    )
+    if row_index is None:
+        return False
+    header = ""
+    for line in reversed(lines[:row_index]):
+        if "|" in line and "复电浓度" in line:
+            header = line
+            break
+    if not header:
+        return False
+    header_cells = [cell.strip() for cell in header.split("|")]
+    row_cells = [cell.strip() for cell in lines[row_index].split("|")]
+    restore_index = next(
+        (index for index, cell in enumerate(header_cells) if "复电浓度" in cell),
+        None,
+    )
+    if restore_index is None or restore_index >= len(row_cells):
+        return False
+    value_match = _NUMBER_IN_QUOTE.search(row_cells[restore_index])
+    if not value_match:
+        return False
+    try:
+        restore_value = float(value_match.group())
+    except ValueError:
+        return False
+    pair["constraint_type"] = "restore_threshold"
+    rule["value"] = restore_value
+    rule["value_high"] = None
+    rule["unit"] = "%" if "%" in header else rule.get("unit", "")
+    # 表头与目标行均分别来自法规原文；中间可能夹有其他数据行，不能要求二者相邻。
+    rule["table_header"] = header
+    return True
+
+
+def validate_extracted_pair(
+    pair: Dict[str, Any], pending_text: str, rule_text: str
+) -> Tuple[bool, str]:
+    """阻断无原文依据或控制阶段错配的 LLM 数值配对。"""
+    pending = pair.get("pending") or {}
+    rule = pair.get("rule") or {}
+    pending_quote = pending.get("quote", "")
+    rule_quote = rule.get("quote", "")
+    if not _quote_is_grounded(pending_text, pending_quote):
+        recovered = _recover_unique_pending_quote(pending_text, pending)
+        if not recovered:
+            return False, "pending_quote_not_grounded"
+        pending["quote"] = recovered
+        pending_quote = recovered
+    if not _quote_is_grounded(rule_text, rule_quote):
+        return False, "rule_quote_not_grounded"
+    if bool(_RELATIVE_PERCENT.search(pending_quote)) != bool(
+        _RELATIVE_PERCENT.search(rule_quote)
+    ):
+        return False, "relative_percentage_mismatch"
+
+    pending_phase = _constraint_phase(pending_quote)
+    if pending_phase == "restore":
+        _repair_restore_pair_from_table(pair, rule_text)
+        rule_quote = rule.get("quote", "")
+
+    for side_name, side in (("pending", pending), ("rule", rule)):
+        if not _quote_contains_value(side.get("quote"), side.get("value")):
+            if not _repair_unique_value_from_grounded_quote(side):
+                return False, f"{side_name}_value_not_in_quote"
+        if side.get("value_high") is not None and not _quote_contains_value(
+            side.get("quote"), side.get("value_high")
+        ):
+            return False, f"{side_name}_high_value_not_in_quote"
+
+    ctype = str(pair.get("constraint_type", "")).strip()
+    rule_phase = _constraint_phase(rule_quote)
+    if pending_phase and rule_phase and pending_phase != rule_phase:
+        return False, "control_phase_mismatch"
+    if ctype == "trigger_threshold" and "restore" in (pending_phase, rule_phase):
+        return False, "type_phase_mismatch"
+    if ctype == "restore_threshold" and "trigger" in (pending_phase, rule_phase):
+        return False, "type_phase_mismatch"
+    return True, ""
+
+
+def numeric_check(llm_client, model: str, pending_text: str, rule_text: str,
+                  pending_max_chars: int = 1500,
+                  rule_max_chars: int = 1500) -> Dict[str, Any]:
     """完整数值核验：LLM 配对抽取 + 代码逐对比较。
 
     返回：
@@ -300,16 +546,51 @@ def numeric_check(llm_client, model: str, pending_text: str, rule_text: str) -> 
        "summary": str}
     """
     try:
-        pairs = extract_pairs(llm_client, model, pending_text, rule_text)
+        raw_pairs = extract_pairs(
+            llm_client,
+            model,
+            pending_text,
+            rule_text,
+            pending_max_chars=pending_max_chars,
+            rule_max_chars=rule_max_chars,
+        )
     except Exception as exc:  # 抽取失败不阻塞主流程
         return {"has_pairs": False, "overall": "无可比数值", "details": [],
                 "summary": f"数值抽取调用失败: {str(exc)[:80]}"}
 
+    pairs: List[Dict[str, Any]] = []
+    rejected_pairs: List[Dict[str, str]] = []
+    for pair in raw_pairs:
+        if not isinstance(pair, dict):
+            rejected_pairs.append({"reason": "pair_not_object"})
+            continue
+        valid, reason = validate_extracted_pair(pair, pending_text, rule_text)
+        if valid:
+            pairs.append(pair)
+        else:
+            rejected_pairs.append(
+                {
+                    "reason": reason,
+                    "parameter": str(pair.get("parameter", ""))[:80],
+                    "pending_quote": str(
+                        (pair.get("pending") or {}).get("quote", "")
+                    )[:160],
+                    "rule_quote": str(
+                        (pair.get("rule") or {}).get("quote", "")
+                    )[:160],
+                }
+            )
+
     if not pairs:
         return {"has_pairs": False, "overall": "无可比数值", "details": [],
-                "summary": "未抽取到可配对的数值约束"}
+                "summary": "未抽取到有双侧原文依据的可配对数值约束",
+                "raw_pair_count": len(raw_pairs),
+                "rejected_pair_count": len(rejected_pairs),
+                "rejected_pairs": rejected_pairs}
 
     details = [compare_pair(p) for p in pairs if isinstance(p, dict)]
+    for detail in details:
+        detail["evidence_grounded"] = True
     verdicts = [d["verdict"] for d in details]
     if "不合规" in verdicts:
         overall = "不合规"
@@ -322,7 +603,10 @@ def numeric_check(llm_client, model: str, pending_text: str, rule_text: str) -> 
     n_ok = verdicts.count("合规")
     n_unsure = verdicts.count("不确定")
     summary = f"数值核验 {len(details)} 对：合规 {n_ok}，不合规 {n_bad}，不确定 {n_unsure}"
-    return {"has_pairs": True, "overall": overall, "details": details, "summary": summary}
+    return {"has_pairs": True, "overall": overall, "details": details,
+            "summary": summary, "raw_pair_count": len(raw_pairs),
+            "rejected_pair_count": len(rejected_pairs),
+            "rejected_pairs": rejected_pairs}
 
 
 def format_for_prompt(result: Dict[str, Any]) -> str:

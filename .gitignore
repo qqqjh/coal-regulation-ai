@@ -29,7 +29,8 @@ __pycache__/
 *.sw?
 
 # ===== 生成物 / 数据 / 模型（不入库）=====
-/data/
+/data/*
+!/data/regulation_rules_v1.json
 /backend/data/uploads/
 /review_results/
 /chunks_visualization/

@@ -8,7 +8,7 @@ import {
   DeleteOutlined, FileTextOutlined, CloudUploadOutlined,
   CheckCircleFilled, CloseCircleFilled, LoadingOutlined,
   CheckOutlined, CloseOutlined, EditOutlined, DownloadOutlined, ReloadOutlined,
-  RedoOutlined, PlayCircleOutlined,
+  RedoOutlined, PlayCircleOutlined, EnvironmentOutlined, SwapOutlined,
 } from '@ant-design/icons'
 import axios from 'axios'
 import { Document as PdfDocument, Page, pdfjs } from 'react-pdf'
@@ -17,10 +17,10 @@ import 'react-pdf/dist/Page/TextLayer.css'
 import './index.css'
 
 const { TextArea } = Input
-const V9 = '/api/v9'
+const REVIEW_API = '/api/v10'
 pdfjs.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString()
 
-// ── v9 issue type metadata ────────────────────────────────────────
+// ── v10 issue type metadata ───────────────────────────────────────
 const TYPE_CFG = {
   compliance:  { label: '合规', color: '#d9363e', bg: '#fff1f0' },
   typo:        { label: '错别字', color: '#7b3ff2', bg: '#f3edff' },
@@ -52,6 +52,32 @@ const ACTION_LABEL = {
 
 function normalizeText(text = '') {
   return String(text).normalize('NFKC').replace(/\s+/g, '')
+}
+
+function issuePdfLocations(issue) {
+  const detail = issue?.detail || {}
+  const groups = [
+    ...(detail.pdf_locations || []).map(location => ({ ...location, role: 'issue' })),
+    ...(detail.source_pdf_locations || []).map(location => ({ ...location, role: 'source' })),
+    ...(detail.duplicate_pdf_locations || []).map(location => ({ ...location, role: 'duplicate' })),
+  ]
+  const seen = new Set()
+  return groups.filter(location => {
+    const page = Number(location?.page)
+    const bbox = Array.isArray(location?.bbox) ? location.bbox.map(Number) : []
+    if (!Number.isFinite(page) || page < 1 || bbox.length !== 4 || bbox.some(value => !Number.isFinite(value))) {
+      return false
+    }
+    if (bbox[2] <= bbox[0] || bbox[3] <= bbox[1]) return false
+    const key = `${page}:${bbox.join(',')}:${location.role}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function issuePdfPages(issue) {
+  return [...new Set(issuePdfLocations(issue).map(location => Number(location.page)))]
 }
 
 function escapeHtml(text = '') {
@@ -341,7 +367,7 @@ function applyStatusMeta(issue) {
     return { color: 'processing', text: '正在改写文档', note: '后台 worker 正在把该建议写入 Word，完成后会自动刷新 PDF。' }
   }
   if (issue.agent_applied === 0) {
-    return { color: 'warning', text: '等待后台改写', note: '人工裁决已记录，但还没有写入 Word/PDF。请确认 v9_worker.py 正在运行。' }
+    return { color: 'warning', text: '等待后台改写', note: '人工裁决已记录，但还没有写入 Word/PDF。请确认 v10_worker.py 正在运行。' }
   }
   if (issue.agent_applied === 2) {
     return { color: 'default', text: '未改写文档', note: issue.agent_note || '主智能体判断无需改写，PDF 会保持原文。' }
@@ -400,7 +426,7 @@ function renderHighlightedText(text = '', blockIssues = [], onSelectIssue) {
   return nodes
 }
 
-function AnnotatedDocument({ blocks, loading, issuesByBlock, onSelectIssue }) {
+function AnnotatedDocument({ blocks, loading, issuesByBlock, onSelectIssue, focusedBlockIndex }) {
   if (loading) {
     return <div className="rv-doc-loading"><Spin /><span>正在加载高亮文档...</span></div>
   }
@@ -425,6 +451,7 @@ function AnnotatedDocument({ blocks, loading, issuesByBlock, onSelectIssue }) {
             block.kind === 'table' ? 'table' : '',
             blockIssues.length ? 'has-issues' : '',
             fixedWithoutExactMatch ? 'fixed-block' : '',
+            Number(block.block_index) === Number(focusedBlockIndex) ? 'repeat-focus' : '',
           ].filter(Boolean).join(' ')
           return (
             <div
@@ -471,6 +498,8 @@ export default function Review() {
   const [pdfAreaRects, setPdfAreaRects] = useState([])
   const [pdfAreaLayerBox, setPdfAreaLayerBox] = useState(null)
   const [previewMode, setPreviewMode] = useState('pdf')
+  const [repeatFocus, setRepeatFocus] = useState(null)
+  const [repeatPdfFocus, setRepeatPdfFocus] = useState(null)
   const [documentBlocks, setDocumentBlocks] = useState([])
   const [documentLoading, setDocumentLoading] = useState(false)
   const [historyDocs, setHistoryDocs] = useState([])
@@ -490,11 +519,16 @@ export default function Review() {
   const pdfPageWrapRef = useRef(null)
   const pdfRefreshSeqRef = useRef(0)
 
+  useEffect(() => {
+    setRepeatFocus(null)
+    setRepeatPdfFocus(null)
+  }, [jobId])
+
   const loadDocument = useCallback(async (jid) => {
     if (!jid) return
     setDocumentLoading(true)
     try {
-      const res = await axios.get(`${V9}/document/${jid}`)
+      const res = await axios.get(`${REVIEW_API}/document/${jid}`)
       setDocumentBlocks(res.data.blocks || [])
     } catch {
       setDocumentBlocks([])
@@ -506,7 +540,7 @@ export default function Review() {
   const loadHistory = useCallback(async () => {
     setHistoryLoading(true)
     try {
-      const res = await axios.get(`${V9}/jobs`, {
+      const res = await axios.get(`${REVIEW_API}/jobs`, {
         params: { user_id: uid, limit: 20, scope: user?.role === 'admin' ? 'all' : 'mine' },
       })
       setHistoryDocs(res.data.items || [])
@@ -554,7 +588,7 @@ export default function Review() {
   // ── SSE ───────────────────────────────────────────────────────
   const connectSSE = useCallback((jid) => {
     if (sseRef.current) sseRef.current.close()
-    const es = new EventSource(`${V9}/stream/${jid}`)
+    const es = new EventSource(`${REVIEW_API}/stream/${jid}`)
     es.onmessage = (e) => {
       try {
         const d = JSON.parse(e.data)
@@ -600,14 +634,14 @@ export default function Review() {
       return
     }
     Promise.all([
-      axios.get(`${V9}/status/${task.jobId}`),
-      axios.get(`${V9}/issues/${task.jobId}`),
+      axios.get(`${REVIEW_API}/status/${task.jobId}`),
+      axios.get(`${REVIEW_API}/issues/${task.jobId}`),
     ]).then(([statusRes, issuesRes]) => {
       if (!active) return
       setJobId(task.jobId)
       setDocName(task.docName || statusRes.data.doc_name)
       if (task.pdfReady) {
-        setPdfUrl(`${V9}/preview-pdf/${task.jobId}?t=${Date.now()}`)
+        setPdfUrl(`${REVIEW_API}/preview-pdf/${task.jobId}?t=${Date.now()}`)
         setPdfLoading(true)
       } else {
         setPdfUrl(null)
@@ -675,7 +709,7 @@ export default function Review() {
     setPdfTextIndex({})
     setPdfAreaRects([])
     setPdfAreaLayerBox(null)
-    setPdfUrl(`${V9}/preview-pdf/${jobId}?t=${Date.now()}&v=${pdfRefreshSeqRef.current}${force ? '&refresh=1' : ''}`)
+    setPdfUrl(`${REVIEW_API}/preview-pdf/${jobId}?t=${Date.now()}&v=${pdfRefreshSeqRef.current}${force ? '&refresh=1' : ''}`)
   }
 
   async function handlePdfLoadSuccess(pdf) {
@@ -716,8 +750,10 @@ export default function Review() {
     try {
       const fd = new FormData()
       fd.append('file', file)
-      setPreprocessStage('正在预处理文档：保存原件、统一 .docx、准备 PDF 预览')
-      const prepRes = await axios.post(`${V9}/preprocess`, fd, { timeout: 180000 })
+      setPreprocessStage(file.name.toLowerCase().endsWith('.pdf')
+        ? '正在保存原始 PDF；审查阶段将由 MinerU 直接解析'
+        : '正在预处理文档：保存原件、统一 .docx、准备 PDF 预览')
+      const prepRes = await axios.post(`${REVIEW_API}/preprocess`, fd, { timeout: 180000 })
       const prep = prepRes.data
       if (prep.pdf_error) {
         message.warning('文档已可审查，但 PDF 预览未准备成功，可稍后手动生成')
@@ -730,18 +766,24 @@ export default function Review() {
       if (!isAdmin && selectedReviewKbId) {
         startParams.set('kb_id', String(selectedReviewKbId))
       }
-      const res = await axios.post(`${V9}/start/${prep.preprocess_id}?${startParams.toString()}`)
+      const res = await axios.post(`${REVIEW_API}/start/${prep.preprocess_id}?${startParams.toString()}`)
       const pdfReady = !!res.data.preprocess?.pdf_ready
       setJobId(res.data.job_id)
       setDocName(res.data.doc_name)
       localStorage.setItem(activeJobKey, JSON.stringify({
         jobId: res.data.job_id, docName: res.data.doc_name, pdfReady,
       }))
-      setJobInfo({ status: 'pending', progress: 0, n_chunks: 0, n_done: 0 })
+      setJobInfo({
+        status: 'pending',
+        progress: 0,
+        n_chunks: 0,
+        n_done: 0,
+        source_format: prep.source_format || 'docx',
+      })
       setDocumentBlocks([])
       setPreviewMode('pdf')
       if (pdfReady) {
-        setPdfUrl(`${V9}/preview-pdf/${res.data.job_id}?t=${Date.now()}`)
+        setPdfUrl(`${REVIEW_API}/preview-pdf/${res.data.job_id}?t=${Date.now()}`)
         setPdfLoading(true)
         setPdfError("")
       } else {
@@ -774,7 +816,7 @@ export default function Review() {
     sseRef.current?.close()
     if (currentJobId) {
       try {
-        await axios.post(`${V9}/cancel/${currentJobId}`)
+        await axios.post(`${REVIEW_API}/cancel/${currentJobId}`)
       } catch {
         // Cancellation is best-effort; local UI state should still reset.
       }
@@ -800,8 +842,8 @@ export default function Review() {
     setFilterType('all')
     try {
       const [statusRes, issuesRes] = await Promise.all([
-        axios.get(`${V9}/status/${item.job_id}`),
-        axios.get(`${V9}/issues/${item.job_id}`),
+        axios.get(`${REVIEW_API}/status/${item.job_id}`),
+        axios.get(`${REVIEW_API}/issues/${item.job_id}`),
       ])
       const statusData = statusRes.data
       setJobId(item.job_id)
@@ -812,7 +854,7 @@ export default function Review() {
       setPdfError('')
       setPdfPage(1)
       setPdfTextIndex({})
-      setPdfUrl(`${V9}/preview-pdf/${item.job_id}?t=${Date.now()}`)
+      setPdfUrl(`${REVIEW_API}/preview-pdf/${item.job_id}?t=${Date.now()}`)
       setPdfLoading(true)
       setPreviewMode('pdf')
       loadDocument(item.job_id)
@@ -832,7 +874,7 @@ export default function Review() {
   async function rerunHistoryJob(item) {
     if (!item?.job_id) return
     try {
-      const res = await axios.post(`${V9}/jobs/${item.job_id}/rerun`, null, {
+      const res = await axios.post(`${REVIEW_API}/jobs/${item.job_id}/rerun`, null, {
         params: { user_id: uid },
       })
       message.success('已创建重新审查任务')
@@ -846,7 +888,7 @@ export default function Review() {
   async function deleteHistoryJob(item) {
     if (!item?.job_id) return
     try {
-      await axios.delete(`${V9}/jobs/${item.job_id}`)
+      await axios.delete(`${REVIEW_API}/jobs/${item.job_id}`)
       if (item.job_id === jobId) {
         sseRef.current?.close()
         localStorage.removeItem(activeJobKey)
@@ -867,7 +909,7 @@ export default function Review() {
   // ── 下载 ──────────────────────────────────────────────────────
   async function handleDownload() {
     try {
-      const res = await axios.get(`${V9}/download/${jobId}`, { responseType: 'blob' })
+      const res = await axios.get(`${REVIEW_API}/download/${jobId}`, { responseType: 'blob' })
       const url = URL.createObjectURL(res.data)
       const a = document.createElement('a')
       a.href = url
@@ -882,17 +924,30 @@ export default function Review() {
   async function submitFeedback(issueId, action, text = '') {
     setFeedbackMap(prev => ({ ...prev, [issueId]: { loading: true } }))
     try {
-      await axios.post(`${V9}/feedback`, { issue_id: issueId, action, text })
+      const feedbackResponse = await axios.post(`${REVIEW_API}/feedback`, {
+        issue_id: issueId,
+        action,
+        text,
+        user_id: String(uid),
+      })
       const nextApplied = action === 'reject' ? 2 : 3
       setIssues(prev => prev.map(i =>
-        i.id === issueId ? { ...i, human_action: action, human_text: text, agent_applied: nextApplied } : i
+        i.id === issueId
+          ? {
+              ...i,
+              human_action: action,
+              human_text: text,
+              agent_applied: nextApplied,
+              flywheel_annotation_id: feedbackResponse.data.annotation_id,
+            }
+          : i
       ))
       setCustomText('')
       if (action === 'reject') {
         setFeedbackMap(prev => ({ ...prev, [issueId]: { loading: false, done: true, action } }))
-        message.success('已驳回，原文保留')
+        message.success('已驳回，原文保留；该误报已进入人工反馈飞轮')
       } else {
-        message.success('反馈已提交，正在改写文档')
+        message.success('反馈已进入数据飞轮，正在改写文档')
         pollFeedbackResult(issueId)
       }
     } catch (err) {
@@ -904,7 +959,7 @@ export default function Review() {
   async function revokeFeedback(issueId) {
     setFeedbackMap(prev => ({ ...prev, [issueId]: { loading: true } }))
     try {
-      const res = await axios.post(`${V9}/feedback/${issueId}/revoke`)
+      const res = await axios.post(`${REVIEW_API}/feedback/${issueId}/revoke`)
       const latest = res.data.issue || {
         id: issueId,
         human_action: 'pending',
@@ -941,7 +996,7 @@ export default function Review() {
     for (let i = 0; i < 80; i += 1) {
       await new Promise(resolve => setTimeout(resolve, 1500))
       try {
-        const res = await axios.get(`${V9}/feedback-status/${issueId}`)
+        const res = await axios.get(`${REVIEW_API}/feedback-status/${issueId}`)
         const data = res.data
         setIssues(prev => prev.map(item =>
           item.id === issueId
@@ -984,7 +1039,7 @@ export default function Review() {
       if (stopped || ids.length === 0) return
       try {
         const results = await Promise.all(
-          ids.map(id => axios.get(`${V9}/feedback-status/${id}`).then(res => res.data).catch(() => null))
+          ids.map(id => axios.get(`${REVIEW_API}/feedback-status/${id}`).then(res => res.data).catch(() => null))
         )
         let shouldRefreshPdf = false
         setIssues(prev => prev.map(item => {
@@ -1092,6 +1147,11 @@ export default function Review() {
       pages.map(page => [page, normalizeText(pdfTextIndex[page] || '')])
     )
     issues.forEach(issue => {
+      const nativePages = issuePdfPages(issue)
+      if (nativePages.length) {
+        map[issue.id] = nativePages[0]
+        return
+      }
       const candidates = [
         ...buildBlockPageCandidates(issue, blockByIndex),
         ...issueLocateCandidates(issue).map(candidate => normalizeText(candidate)),
@@ -1120,13 +1180,22 @@ export default function Review() {
 
   const visiblePdfIssues = useMemo(() => {
     const hasIndex = Object.keys(pdfTextIndex).length > 0
-    if (!hasIndex) return issues
-    return issues.filter(issue => !issuePageMap[issue.id] || issuePageMap[issue.id] === pdfPage)
+    return issues.filter(issue => {
+      const nativePages = issuePdfPages(issue)
+      if (nativePages.length) return nativePages.includes(pdfPage)
+      if (!hasIndex) return true
+      return !issuePageMap[issue.id] || issuePageMap[issue.id] === pdfPage
+    })
   }, [issues, issuePageMap, pdfPage, pdfTextIndex])
 
+  const visibleTextPdfIssues = useMemo(
+    () => visiblePdfIssues.filter(issue => issuePdfLocations(issue).length === 0),
+    [visiblePdfIssues]
+  )
+
   const pdfTextRenderer = useMemo(
-    () => makePdfTextRenderer(visiblePdfIssues, selectedId),
-    [visiblePdfIssues, selectedId]
+    () => makePdfTextRenderer(visibleTextPdfIssues, selectedId),
+    [visibleTextPdfIssues, selectedId]
   )
 
   const historyPanelItems = useMemo(() => {
@@ -1146,27 +1215,70 @@ export default function Review() {
     return items.slice(0, 20)
   }, [docName, historyDocs, issues.length, jobId, jobInfo, progressDone, progressTotal])
 
+  const locateRepeatBlocks = useCallback((issueId, blockIndices = [], pdfLocations = []) => {
+    const nativeLocation = pdfLocations.find(location => (
+      Number(location?.page) > 0
+      && Array.isArray(location?.bbox)
+      && location.bbox.length === 4
+    ))
+    if (nativeLocation) {
+      setSelectedId(Number(issueId))
+      setRepeatFocus(null)
+      setRepeatPdfFocus({
+        issueId: Number(issueId),
+        page: Number(nativeLocation.page),
+        sourceUnitId: nativeLocation.source_unit_id || '',
+      })
+      setPdfPage(Number(nativeLocation.page))
+      setPreviewMode('pdf')
+      return
+    }
+    const firstBlock = blockIndices
+      .map(value => Number(value))
+      .find(value => Number.isFinite(value))
+    if (firstBlock === undefined) {
+      message.warning('该重复位置缺少 Word 段落索引')
+      return
+    }
+    setSelectedId(Number(issueId))
+    setRepeatPdfFocus(null)
+    setRepeatFocus({ issueId: Number(issueId), blockIndex: firstBlock })
+    setPreviewMode('blocks')
+  }, [])
+
   useEffect(() => {
     if (!selectedId) return
-    const mappedPage = issuePageMap[selectedId]
+    const focusedPdfPage = repeatPdfFocus?.issueId === Number(selectedId)
+      ? Number(repeatPdfFocus.page)
+      : null
+    const mappedPage = focusedPdfPage || issuePageMap[selectedId]
     if (previewMode === 'pdf' && mappedPage && mappedPage !== pdfPage) {
       setPdfPage(mappedPage)
       return
     }
     const timer = setTimeout(() => {
+      const focusedBlock = repeatFocus?.issueId === Number(selectedId)
+        ? repeatFocus.blockIndex
+        : null
       const selector = previewMode === 'pdf'
-        ? `.rv-pdf-mark[data-issue-id="${selectedId}"]`
-        : `.rv-doc-mark[data-issue-id="${selectedId}"], .rv-doc-block[data-issue-ids~="${selectedId}"]`
+        ? `.rv-pdf-mark[data-issue-id="${selectedId}"], .rv-pdf-area[data-issue-id="${selectedId}"]`
+        : focusedBlock !== null
+          ? `.rv-doc-block[data-block-index="${focusedBlock}"]`
+          : `.rv-doc-mark[data-issue-id="${selectedId}"], .rv-doc-block[data-issue-ids~="${selectedId}"]`
       const target = document.querySelector(selector)
       target?.scrollIntoView({ block: 'center', behavior: 'smooth' })
     }, 120)
     return () => clearTimeout(timer)
-  }, [selectedId, previewMode, documentBlocks, issues, pdfPage, issuePageMap])
+  }, [selectedId, previewMode, documentBlocks, issues, pdfPage, issuePageMap, repeatFocus, repeatPdfFocus])
 
   useEffect(() => {
     const handler = (event) => {
       const mark = event.target.closest?.('.rv-pdf-mark[data-issue-id]')
-      if (mark?.dataset?.issueId) setSelectedId(Number(mark.dataset.issueId))
+      if (mark?.dataset?.issueId) {
+        setSelectedId(Number(mark.dataset.issueId))
+        setRepeatFocus(null)
+        setRepeatPdfFocus(null)
+      }
     }
     document.addEventListener('click', handler)
     return () => document.removeEventListener('click', handler)
@@ -1243,6 +1355,46 @@ export default function Review() {
     }
   }, [pdfBlobUrl, pdfPage, pdfScale, selectedId, visiblePdfIssues, pdfTextRenderer])
 
+  const pdfNativeRects = useMemo(() => {
+    if (!pdfAreaLayerBox?.width || !pdfAreaLayerBox?.height) return []
+    const result = []
+    visiblePdfIssues.forEach(issue => {
+      issuePdfLocations(issue)
+        .filter(location => Number(location.page) === Number(pdfPage))
+        .forEach((location, index) => {
+          const bbox = location.bbox.map(Number)
+          const pageWidth = Number(location.page_width)
+          const pageHeight = Number(location.page_height)
+          if (!(pageWidth > 0) || !(pageHeight > 0)) return
+          const left = Math.max(0, bbox[0] / pageWidth * pdfAreaLayerBox.width - 4)
+          const top = Math.max(0, bbox[1] / pageHeight * pdfAreaLayerBox.height - 3)
+          const right = Math.min(pdfAreaLayerBox.width, bbox[2] / pageWidth * pdfAreaLayerBox.width + 4)
+          const bottom = Math.min(pdfAreaLayerBox.height, bbox[3] / pageHeight * pdfAreaLayerBox.height + 3)
+          if (right - left < 2 || bottom - top < 2) return
+          const sourceUnitId = location.source_unit_id || ''
+          result.push({
+            left,
+            top,
+            width: right - left,
+            height: bottom - top,
+            key: `native-${issue.id}-${location.role}-${sourceUnitId || index}`,
+            issueId: Number(issue.id),
+            issueType: issue.issue_type || 'other',
+            stateClass: issueHighlightClass(issue).split(' ')[0],
+            role: location.role,
+            sourceUnitId,
+            selected: Number(issue.id) === Number(selectedId),
+            focused: (
+              repeatPdfFocus?.issueId === Number(issue.id)
+              && repeatPdfFocus?.sourceUnitId
+              && repeatPdfFocus.sourceUnitId === sourceUnitId
+            ),
+          })
+        })
+    })
+    return result
+  }, [pdfAreaLayerBox, pdfPage, repeatPdfFocus, selectedId, visiblePdfIssues])
+
   const st = JOB_STATUS[jobInfo?.status] || { label: jobInfo?.status || '', color: '#666' }
 
   // ── render ────────────────────────────────────────────────────
@@ -1251,6 +1403,9 @@ export default function Review() {
       {/* ── 顶栏 ── */}
       <div className="rv-topbar">
         <span className="rv-title">规程合规审查</span>
+        <span className="rv-engine-badge" title="当前前端通过 /api/v10 提交审查任务">
+          <span className="rv-engine-dot" />V10
+        </span>
 
         {/* 无任务时：矿井类型选择 */}
         {!jobId && (
@@ -1491,7 +1646,12 @@ export default function Review() {
                   key={issue.id}
                   className={`rv-issue-item ${isSelected ? 'selected' : ''}`}
                   style={{ borderLeft: `4px solid ${cfg.color}` }}
-                  onClick={() => { setSelectedId(issue.id); setCustomText('') }}
+                  onClick={() => {
+                    setSelectedId(issue.id)
+                    setRepeatFocus(null)
+                    setRepeatPdfFocus(null)
+                    setCustomText('')
+                  }}
                 >
                   <div className="rv-issue-item-header">
                     <span className="rv-dec-dot">
@@ -1579,7 +1739,17 @@ export default function Review() {
                 <FileTextOutlined style={{ color: '#2f54eb' }} />
                 <span className="rv-pdf-doc-name">{docName}</span>
                 <Tag color={st.color}>{st.label}</Tag>
-                <Tag color="blue" className="rv-preview-mode-tag">PDF 高亮</Tag>
+                <Radio.Group
+                  size="small"
+                  optionType="button"
+                  buttonStyle="solid"
+                  value={previewMode}
+                  onChange={event => setPreviewMode(event.target.value)}
+                  options={[
+                    { label: 'PDF 高亮', value: 'pdf' },
+                    { label: '段落定位', value: 'blocks' },
+                  ]}
+                />
                 {(isRunning || isDone) && (
                   <span className="rv-pdf-progress-text">
                     {phaseProgressText}
@@ -1604,6 +1774,23 @@ export default function Review() {
               {timingText && (
                 <div className="rv-pdf-status">耗时：{timingText}</div>
               )}
+              {previewMode === 'blocks' ? (
+                <AnnotatedDocument
+                  blocks={documentBlocks}
+                  loading={documentLoading}
+                  issuesByBlock={issuesByBlock}
+                  focusedBlockIndex={
+                    repeatFocus?.issueId === Number(selectedId)
+                      ? repeatFocus.blockIndex
+                      : null
+                  }
+                  onSelectIssue={(issueId) => {
+                    setSelectedId(issueId)
+                    setRepeatFocus(null)
+                    setRepeatPdfFocus(null)
+                  }}
+                />
+              ) : (
               <div className="rv-pdf-frame-wrap">
                 {pdfLoading && !pdfError && (
                   <div className="rv-pdf-loading">
@@ -1626,9 +1813,18 @@ export default function Review() {
                 {pdfBlobUrl && !pdfError && (
                   <div className="rv-pdf-doc-scroll">
                     <div className="rv-pdf-page-controls">
-                      <Button size="small" disabled={pdfPage <= 1} onClick={() => setPdfPage(p => Math.max(1, p - 1))}>上一页</Button>
+                      <span className="rv-pdf-source-badge">
+                        {jobInfo?.source_format === 'pdf' ? '原始 PDF · MinerU 坐标' : 'Word PDF 预览'}
+                      </span>
+                      <Button size="small" disabled={pdfPage <= 1} onClick={() => {
+                        setRepeatPdfFocus(null)
+                        setPdfPage(p => Math.max(1, p - 1))
+                      }}>上一页</Button>
                       <span>{pdfPage} / {pdfNumPages || '-'}</span>
-                      <Button size="small" disabled={!pdfNumPages || pdfPage >= pdfNumPages} onClick={() => setPdfPage(p => Math.min(pdfNumPages, p + 1))}>下一页</Button>
+                      <Button size="small" disabled={!pdfNumPages || pdfPage >= pdfNumPages} onClick={() => {
+                        setRepeatPdfFocus(null)
+                        setPdfPage(p => Math.min(pdfNumPages, p + 1))
+                      }}>下一页</Button>
                       <Button size="small" onClick={() => setPdfScale(s => Math.max(0.9, +(s - 0.1).toFixed(2)))}>-</Button>
                       <span>{Math.round(pdfScale * 100)}%</span>
                       <Button size="small" onClick={() => setPdfScale(s => Math.min(2.4, +(s + 0.1).toFixed(2)))}>+</Button>
@@ -1651,15 +1847,19 @@ export default function Review() {
                         />
                       </PdfDocument>
                       <div className="rv-pdf-area-layer" style={pdfAreaLayerBox || undefined}>
-                        {pdfAreaRects.map(rect => (
+                        {[...pdfAreaRects, ...pdfNativeRects].map(rect => (
                           <button
                             key={rect.key}
                             type="button"
+                            data-issue-id={rect.issueId}
                             className={[
                               'rv-pdf-area',
                               `issue-${rect.issueType}`,
                               rect.stateClass,
+                              rect.key.startsWith('native-') ? 'native' : '',
+                              rect.role ? `location-${rect.role}` : '',
                               rect.selected ? 'selected' : '',
+                              rect.focused ? 'focused' : '',
                             ].filter(Boolean).join(' ')}
                             style={{
                               left: rect.left,
@@ -1667,7 +1867,15 @@ export default function Review() {
                               width: rect.width,
                               height: rect.height,
                             }}
-                            onClick={() => setSelectedId(rect.issueId)}
+                            onClick={() => {
+                              setSelectedId(rect.issueId)
+                              setRepeatFocus(null)
+                              setRepeatPdfFocus(rect.key.startsWith('native-') ? {
+                                issueId: rect.issueId,
+                                page: pdfPage,
+                                sourceUnitId: rect.sourceUnitId || '',
+                              } : null)
+                            }}
                           />
                         ))}
                       </div>
@@ -1675,6 +1883,7 @@ export default function Review() {
                   </div>
                 )}
               </div>
+              )}
             </div>
           )}
         </div>
@@ -1691,6 +1900,8 @@ export default function Review() {
               onCustomTextChange={setCustomText}
               onFeedback={submitFeedback}
               onRevoke={revokeFeedback}
+              documentBlocks={documentBlocks}
+              onLocateBlocks={locateRepeatBlocks}
             />
           ) : (
             <div className="rv-center" style={{ height: '100%', flexDirection: 'column', gap: 12 }}>
@@ -1703,11 +1914,110 @@ export default function Review() {
   )
 }
 
+function buildRepeatLocation(blockIndices = [], documentBlocks = [], fallbackText = '') {
+  const indices = [...new Set(
+    blockIndices.map(value => Number(value)).filter(value => Number.isFinite(value))
+  )].sort((a, b) => a - b)
+  const ordered = [...documentBlocks].sort(
+    (a, b) => Number(a.block_index) - Number(b.block_index)
+  )
+  const byIndex = new Map(ordered.map(block => [Number(block.block_index), block]))
+  const primary = indices[0]
+  const orderPosition = ordered.findIndex(block => Number(block.block_index) === primary)
+  const blocks = indices.map(index => byIndex.get(index)).filter(Boolean)
+  const heading = orderPosition >= 0
+    ? [...ordered.slice(0, orderPosition + 1)].reverse().find(block => block.is_heading && block.text)?.text
+    : ''
+  const previous = orderPosition > 0 ? ordered[orderPosition - 1]?.text || '' : ''
+  const next = orderPosition >= 0 ? ordered[orderPosition + 1]?.text || '' : ''
+  return {
+    indices,
+    heading: heading || '未识别章节标题',
+    text: blocks.map(block => block.text || '').filter(Boolean).join('\n') || fallbackText,
+    previous,
+    next,
+  }
+}
+
+function DuplicateComparison({ issue, documentBlocks, onLocateBlocks }) {
+  const detail = issue.detail || {}
+  const allIndices = issue.block_indices || []
+  const sourceIndices = detail.source_block_indices?.length
+    ? detail.source_block_indices
+    : allIndices.slice(0, 1)
+  const duplicateIndices = detail.duplicate_block_indices?.length
+    ? detail.duplicate_block_indices
+    : allIndices.slice(1)
+  const sourcePdfLocations = detail.source_pdf_locations || []
+  const duplicatePdfLocations = detail.duplicate_pdf_locations || []
+  const source = buildRepeatLocation(sourceIndices, documentBlocks, issue.original_text)
+  const duplicate = buildRepeatLocation(duplicateIndices, documentBlocks, issue.original_text)
+  const locations = [
+    { key: 'source', label: '首次出现', tone: 'source', data: source, pdfLocations: sourcePdfLocations },
+    { key: 'duplicate', label: '重复出现', tone: 'duplicate', data: duplicate, pdfLocations: duplicatePdfLocations },
+  ]
+  const hasNativePdfLocations = sourcePdfLocations.length > 0 || duplicatePdfLocations.length > 0
+
+  return (
+    <div className="rv-repeat-compare">
+      <div className="rv-repeat-summary">
+        <span><SwapOutlined /> 两处内容完全一致</span>
+        <span>{Number(detail.occurrence_count || 2)} 次出现</span>
+        <span>{detail.match_method === 'exact_paragraph' ? '段落级精确匹配' : '重复内容匹配'}</span>
+        {hasNativePdfLocations && <span>原始 PDF 坐标已关联</span>}
+      </div>
+      <div className="rv-repeat-grid">
+        {locations.map(location => (
+          <div className={`rv-repeat-card ${location.tone}`} key={location.key}>
+            <div className="rv-repeat-card-head">
+              <span className="rv-repeat-order">{location.label}</span>
+              <span className="rv-repeat-blocks">
+                {[
+                  ...location.pdfLocations.map(item => `原PDF第 ${item.page} 页`),
+                  ...location.data.indices.map(index => `Word段落 ${index + 1}`),
+                ].join('、') || '位置缺失'}
+              </span>
+            </div>
+            <div className="rv-repeat-heading">{location.data.heading}</div>
+            <div className="rv-repeat-text">{location.data.text || '未读取到该位置文本'}</div>
+            {(location.data.previous || location.data.next) && (
+              <div className="rv-repeat-context">
+                {location.data.previous && <span>上文：{location.data.previous.slice(0, 64)}</span>}
+                {location.data.next && <span>下文：{location.data.next.slice(0, 64)}</span>}
+              </div>
+            )}
+            <Button
+              size="small"
+              icon={<EnvironmentOutlined />}
+              disabled={!location.data.indices.length && !location.pdfLocations.length}
+              onClick={() => onLocateBlocks(issue.id, location.data.indices, location.pdfLocations)}
+            >
+              定位到{location.label}
+            </Button>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 // ── 问题详情面板 ──────────────────────────────────────────────────
-function IssueDetail({ issue, jobId, userId, feedbackState, customText, onCustomTextChange, onFeedback, onRevoke }) {
+function IssueDetail({
+  issue,
+  jobId,
+  userId,
+  feedbackState,
+  customText,
+  onCustomTextChange,
+  onFeedback,
+  onRevoke,
+  documentBlocks,
+  onLocateBlocks,
+}) {
   const cfg = typeCfg(issue.issue_type)
   const alreadyFed = issue.human_action !== 'pending'
   const { loading } = feedbackState
+  const adjudication = issue.detail?.adjudication
   const applyMeta = applyStatusMeta(issue)
   const [similarLoading, setSimilarLoading] = useState(false)
   const [similarItems, setSimilarItems] = useState([])
@@ -1716,7 +2026,7 @@ function IssueDetail({ issue, jobId, userId, feedbackState, customText, onCustom
     if (!jobId || issue.chunk_index === undefined || issue.chunk_index === null) return
     setSimilarLoading(true)
     try {
-      const res = await axios.get(`${V9}/review-similar/${jobId}/${issue.chunk_index}`, {
+      const res = await axios.get(`${REVIEW_API}/review-similar/${jobId}/${issue.chunk_index}`, {
         params: { user_id: userId || 'guest', top_k: 5 },
       })
       setSimilarItems(res.data.items || [])
@@ -1743,8 +2053,19 @@ function IssueDetail({ issue, jobId, userId, feedbackState, customText, onCustom
         </div>
       )}
 
+      {issue.issue_type === 'redundancy' && (
+        <div className="rv-detail-block">
+          <div className="rv-detail-label">重复位置对照</div>
+          <DuplicateComparison
+            issue={issue}
+            documentBlocks={documentBlocks || []}
+            onLocateBlocks={onLocateBlocks}
+          />
+        </div>
+      )}
+
       {/* 原文片段 */}
-      {issue.original_text && (
+      {issue.original_text && issue.issue_type !== 'redundancy' && (
         <div className="rv-detail-block">
           <div className="rv-detail-label">原文片段</div>
           <div className="rv-detail-orig" style={{ borderLeft: '3px solid #ffc107', background: '#fff8e1', padding: '8px 12px', borderRadius: 4 }}>
@@ -1778,6 +2099,59 @@ function IssueDetail({ issue, jobId, userId, feedbackState, customText, onCustom
         <div className="rv-detail-block">
           <div className="rv-detail-label">分析说明</div>
           <div className="rv-detail-text" style={{ fontSize: 13, lineHeight: 1.7, color: '#555' }}>{issue.reason}</div>
+        </div>
+      )}
+
+      {adjudication?.called && (
+        <div className="rv-detail-block">
+          <div className="rv-detail-label">主智能体裁决</div>
+          <div className="rv-adjudication-card">
+            <div className="rv-adjudication-summary">
+              <span>分歧 {adjudication.conflict_count || 0}</span>
+              <span className="is-keep">保留初审 {adjudication.kept_initial || 0}</span>
+              <span className="is-drop">采纳复核 {adjudication.accepted_verifier || 0}</span>
+              {(adjudication.kept_llm || 0) > 0 && (
+                <span className="is-llm">保留 LLM {adjudication.kept_llm}</span>
+              )}
+              {(adjudication.accepted_numeric_tool || 0) > 0 && (
+                <span className="is-tool">采纳数值工具 {adjudication.accepted_numeric_tool}</span>
+              )}
+              {(adjudication.numeric_issues_added || 0) > 0 && (
+                <span className="is-tool">数值新增 {adjudication.numeric_issues_added}</span>
+              )}
+              {(adjudication.numeric_issues_removed || 0) > 0 && (
+                <span className="is-drop">数值删除 {adjudication.numeric_issues_removed}</span>
+              )}
+              {(adjudication.needs_human || 0) > 0 && (
+                <span className="is-human">转人工 {adjudication.needs_human}</span>
+              )}
+            </div>
+            {adjudication.summary && (
+              <div className="rv-adjudication-copy">{adjudication.summary}</div>
+            )}
+            {(adjudication.decisions || []).map(item => (
+              <div className="rv-adjudication-decision" key={item.conflict_id}>
+                <strong>
+                  {item.conflict_id} · {item.decision}
+                  {item.conflict_type?.startsWith('numeric_') ? ' · 数值分歧' : ''}
+                </strong>
+                {item.reason && <span>{item.reason}</span>}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {issue.detail?.feedback_experience?.length > 0 && (
+        <div className="rv-detail-block">
+          <div className="rv-detail-label">数据飞轮复用记录</div>
+          <div className="rv-feedback-experience-trace">
+            {issue.detail.feedback_experience.map(item => (
+              <Tag key={item.annotation_id} color={item.action === 'reject' ? 'orange' : 'cyan'}>
+                样本 #{item.annotation_id} · {item.action || '反馈'} · 相似度 {Number(item.similarity || 0).toFixed(2)}
+              </Tag>
+            ))}
+          </div>
         </div>
       )}
 
@@ -1846,6 +2220,12 @@ function IssueDetail({ issue, jobId, userId, feedbackState, customText, onCustom
       {/* ── 人工裁决 ── */}
       <div className="rv-detail-block rv-hitl-block">
         <div className="rv-detail-label">人工裁决</div>
+        <div className={`rv-flywheel-note ${alreadyFed ? 'captured' : ''}`}>
+          <span className="rv-flywheel-dot" />
+          {alreadyFed
+            ? '这次人工裁决已沉淀为反馈样本，后续相似片段审查会检索复用。'
+            : '采纳、驳回或人工改写后，将形成可追溯的反馈样本；不会自动修改 Prompt 或 Skill。'}
+        </div>
 
         {alreadyFed ? (
           <div>

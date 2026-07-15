@@ -14,3 +14,44 @@
 .knowledge-container .ant-statistic-content {
   font-size: 24px;
 }
+
+.kb-applicability-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px 4px 12px;
+  border: 1px solid #d9e2ec;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.kb-applicability-label {
+  color: #475569;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.kb-applicability-option-help {
+  margin-top: 2px;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: normal;
+}
+
+.kb-batch-scope {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border-left: 3px solid #1677ff;
+  border-radius: 4px;
+  background: #f0f7ff;
+  color: #1e293b;
+}
+
+.kb-batch-scope-help {
+  color: #64748b;
+  font-size: 12px;
+}

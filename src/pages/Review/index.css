@@ -18,6 +18,26 @@
   flex-shrink: 0;
 }
 .rv-title { font-size: 1.1em; font-weight: 600; white-space: nowrap; }
+.rv-engine-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border: 1px solid rgba(255,255,255,.28);
+  border-radius: 999px;
+  background: rgba(7,19,72,.36);
+  color: rgba(255,255,255,.92);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .12em;
+}
+.rv-engine-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #65e6a6;
+  box-shadow: 0 0 0 3px rgba(101,230,166,.16);
+}
 .rv-stats  { font-size: .88em; opacity: .9; white-space: nowrap; }
 .rv-topbar .ant-select-selector         { background: rgba(255,255,255,.15) !important; border-color: rgba(255,255,255,.35) !important; color: #fff !important; }
 .rv-topbar .ant-select-selection-placeholder { color: rgba(255,255,255,.65) !important; }
@@ -447,7 +467,7 @@
 .rv-doc-para        { font-size: .9em; line-height: 1.9; color: #222; margin: 0 0 6px; white-space: pre-wrap; word-break: break-all; text-indent: 2em; }
 
 /* ── 右栏：详情 ── */
-.rv-right { width: 300px; flex-shrink: 0; background: #fff; border-left: 1px solid #e8e8e8; overflow-y: auto; }
+.rv-right { width: 430px; flex-shrink: 0; background: #fff; border-left: 1px solid #e8e8e8; overflow-y: auto; }
 .rv-detail { padding: 0 0 24px; }
 .rv-detail-header { display: flex; align-items: center; gap: 8px; padding: 14px 16px 12px; }
 .rv-detail-type   { font-size: .84em; color: #555; }
@@ -456,6 +476,147 @@
 .rv-detail-text   { font-size: .88em; color: #333; line-height: 1.6; }
 .rv-detail-orig   { font-size: .85em; color: #666; font-style: italic; background: #fafafa; padding: 6px 8px; border-radius: 4px; border-left: 3px solid #ddd; }
 .rv-detail-ref    { font-size: .85em; color: #1a237e; font-weight: 500; }
+
+/* ── 重复内容：两处位置并排取证 ── */
+.rv-repeat-compare {
+  overflow: hidden;
+  border: 1px solid #ead8ac;
+  border-radius: 9px;
+  background: #fffdf7;
+}
+.rv-repeat-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid #f0dfb8;
+  color: #8a5b00;
+  font-size: 11px;
+  font-weight: 700;
+}
+.rv-repeat-summary span {
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(245, 159, 0, .10);
+}
+.rv-repeat-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1px;
+  background: #ecdcb8;
+}
+.rv-repeat-card {
+  min-width: 0;
+  padding: 10px;
+  background: #fff;
+}
+.rv-repeat-card.source { box-shadow: inset 3px 0 0 #526d82; }
+.rv-repeat-card.duplicate { box-shadow: inset 3px 0 0 #f59f00; }
+.rv-repeat-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.rv-repeat-order {
+  color: #253347;
+  font-size: 12px;
+  font-weight: 800;
+}
+.rv-repeat-card.duplicate .rv-repeat-order { color: #a25f00; }
+.rv-repeat-blocks {
+  overflow: hidden;
+  color: #8c8c8c;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rv-repeat-heading {
+  overflow: hidden;
+  margin-top: 8px;
+  color: #344054;
+  font-size: 11px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rv-repeat-text {
+  display: -webkit-box;
+  min-height: 92px;
+  max-height: 150px;
+  margin: 6px 0;
+  overflow: auto;
+  color: #2f3237;
+  font-size: 12px;
+  line-height: 1.62;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: linear-gradient(180deg, #fffaf0, #fff);
+  border: 1px solid #f2e6c9;
+  border-radius: 5px;
+  padding: 7px;
+}
+.rv-repeat-context {
+  display: grid;
+  gap: 3px;
+  min-height: 48px;
+  margin-bottom: 8px;
+  color: #7a7f87;
+  font-size: 10px;
+  line-height: 1.45;
+}
+.rv-repeat-context span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rv-repeat-card .ant-btn { width: 100%; }
+.rv-feedback-experience-trace { display: flex; flex-wrap: wrap; gap: 5px; }
+.rv-feedback-experience-trace .ant-tag { margin-inline-end: 0; }
+.rv-adjudication-card {
+  overflow: hidden;
+  border: 1px solid #cbd7e6;
+  border-left: 3px solid #1a237e;
+  border-radius: 6px;
+  background: #f6f8fb;
+}
+.rv-adjudication-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 8px 9px;
+  border-bottom: 1px solid #e0e6ef;
+}
+.rv-adjudication-summary span {
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: #e8edf5;
+  color: #43516a;
+  font-size: 10px;
+  font-weight: 700;
+}
+.rv-adjudication-summary .is-keep { background: #ffebe9; color: #b42318; }
+.rv-adjudication-summary .is-drop { background: #e8f5ed; color: #18794e; }
+.rv-adjudication-summary .is-llm { background: #edf2ff; color: #3155a6; }
+.rv-adjudication-summary .is-tool { background: #e6f7f5; color: #087d73; }
+.rv-adjudication-summary .is-human { background: #fff3d6; color: #9a6700; }
+.rv-adjudication-copy {
+  padding: 8px 9px;
+  color: #3f4d63;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.rv-adjudication-decision {
+  display: grid;
+  gap: 3px;
+  padding: 7px 9px;
+  border-top: 1px dashed #d9e0ea;
+  color: #556176;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.rv-adjudication-decision strong { color: #18243a; }
 .rv-detail-fix    { background: #f1f8e9; }
 .rv-detail-fix-text { font-size: .88em; color: #2e7d32; line-height: 1.6; font-weight: 500; }
 .rv-reg-chunk     { background: #f9f9f9; border: 1px solid #eee; border-radius: 4px; padding: 8px 10px; margin-top: 6px; }
@@ -580,6 +741,37 @@
 
 /* ── 右栏 HITL 区域 ── */
 .rv-hitl-block { background: #fafafa; }
+.rv-flywheel-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 5px 0 10px;
+  padding: 7px 9px;
+  border: 1px solid #d8e3ef;
+  border-radius: 6px;
+  background: #f4f8fc;
+  color: #53657a;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.rv-flywheel-note.captured {
+  border-color: #a7e0c3;
+  background: #effbf5;
+  color: #18794e;
+}
+.rv-flywheel-dot {
+  width: 8px;
+  height: 8px;
+  margin-top: 4px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #6b8bb1;
+  box-shadow: 0 0 0 3px rgba(107, 139, 177, .14);
+}
+.rv-flywheel-note.captured .rv-flywheel-dot {
+  background: #22a06b;
+  box-shadow: 0 0 0 3px rgba(34, 160, 107, .14);
+}
 .rv-hitl-btns  { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
 .rv-hitl-btn   { padding: 4px 10px; border-radius: 4px; border: 1px solid #d9d9d9; background: #fff;
                  cursor: pointer; font-size: .8em; color: #555; transition: all .15s; }
@@ -788,6 +980,16 @@
   background: rgba(255,255,255,.94);
   box-shadow: 0 2px 10px rgba(0,0,0,.16);
 }
+.rv-pdf-source-badge {
+  padding: 3px 8px;
+  border: 1px solid #b8d3e4;
+  border-radius: 999px;
+  color: #17506f;
+  background: #edf7fc;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .02em;
+}
 .rv-pdf-page {
   box-shadow: 0 4px 24px rgba(0,0,0,.55);
   line-height: 0;
@@ -843,6 +1045,28 @@
   box-shadow:
     inset 0 0 0 2px rgba(24, 144, 255, .65),
     0 0 0 3px rgba(24, 144, 255, .16);
+}
+.rv-pdf-area.native {
+  border-radius: 3px;
+  outline: 1px dashed rgba(15, 76, 117, .48);
+  outline-offset: 1px;
+}
+.rv-pdf-area.native.location-source {
+  background: rgba(82, 109, 130, .18);
+}
+.rv-pdf-area.native.location-duplicate {
+  background: rgba(245, 159, 0, .25);
+}
+.rv-pdf-area.native.focused {
+  z-index: 3;
+  animation: rv-native-pdf-focus 1.2s ease-out 2;
+  box-shadow:
+    inset 0 0 0 2px rgba(24, 144, 255, .82),
+    0 0 0 5px rgba(24, 144, 255, .20);
+}
+@keyframes rv-native-pdf-focus {
+  0%, 100% { filter: saturate(1); }
+  50% { filter: saturate(1.7) brightness(1.08); }
 }
 .rv-pdf-loading {
   position: absolute;
@@ -921,6 +1145,18 @@
   box-shadow: inset 3px 0 0 rgba(245, 159, 0, .62);
   padding-left: 8px;
 }
+.rv-doc-block.repeat-focus {
+  animation: rv-repeat-focus-pulse 1.5s ease-out 1;
+  outline: 3px solid rgba(24, 144, 255, .72);
+  outline-offset: 5px;
+  border-radius: 4px;
+  background: #fff7d6 !important;
+  box-shadow: 0 0 0 9px rgba(24, 144, 255, .12) !important;
+}
+@keyframes rv-repeat-focus-pulse {
+  0% { outline-color: rgba(24, 144, 255, 1); box-shadow: 0 0 0 16px rgba(24, 144, 255, .22); }
+  100% { outline-color: rgba(24, 144, 255, .72); box-shadow: 0 0 0 9px rgba(24, 144, 255, .12); }
+}
 .rv-doc-block.has-issues.issue-numeric {
   background: rgba(11, 114, 133, .08);
   box-shadow: inset 3px 0 0 rgba(11, 114, 133, .55);
@@ -990,6 +1226,12 @@
 }
 .rv-doc-mark:hover {
   filter: brightness(.96);
+}
+
+@media (max-width: 1380px) {
+  .rv-right { width: 360px; }
+  .rv-repeat-grid { grid-template-columns: 1fr; }
+  .rv-repeat-text { min-height: 70px; }
 }
 
 /* ── 真实 PDF text layer 高亮 ── */

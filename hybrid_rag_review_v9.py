@@ -45,6 +45,11 @@ import numpy as np
 from openai import OpenAI
 
 import numeric_compare
+from rule_applicability import (
+    OUTBURST_DOC_PATTERNS,
+    OUTBURST_STRUCT_KEYWORDS,
+    ensure_rule_applicability,
+)
 from review_queue import (
     ReviewQueue, ESC_DISAGREEMENT, ESC_NUMERIC_CONFLICT,
     ESC_LOW_CONFIDENCE, ESC_ERROR, ESC_COUNTER_CHECK,
@@ -110,34 +115,29 @@ PENDING_CHUNKS_DIR = PROJECT_ROOT / "chunks_visualization"
 OUTPUT_DIR = PROJECT_ROOT / "review_results"
 QUEUE_DB = PROJECT_ROOT / "data" / "review_queue_v9.db"
 
-MINE_APPLICABILITY_NOTE = """【矿井适用性约束】
+def build_mine_applicability_note(mine_type: str) -> str:
+    """按本次任务的矿井类型生成提示词约束，避免索引已切换但 LLM 仍按旧类型判断。"""
+    if mine_type == "outburst":
+        return """【矿井适用性约束】
+本批待审对象按突出矿井处理。通用条款和明确适用于“突出矿井”“煤与瓦斯突出矿井”“突出煤层”“突出危险区域”的专用条款均可作为依据。
+- 引用突出专用条款时，仍须核对条款的作业环节、地点和对象是否与待审内容一致；
+- 不得仅因出现“突出”字样就跨场景套用条款。"""
+    return """【矿井适用性约束】
 本批待审对象按非突出矿井处理。若参考法规片段明确限定为“突出矿井”“煤与瓦斯突出矿井”“突出煤层”“突出危险区域”等突出矿井专用场景：
 - 不得直接作为非突出矿井待审内容的违规依据；
 - 只有待审内容本身明确属于突出矿井/突出煤层/突出危险场景时，才可适用该条款；
 - 若条款既包含突出矿井专用要求又包含通用要求，只能依据其中明确适用于所有矿井或一般场景的部分判断。"""
 
-# 适用性标签关键词：文档级（整本规章只适用突出矿井）与章节结构级
-OUTBURST_DOC_PATTERNS = ("防治煤与瓦斯突出",)
-OUTBURST_STRUCT_KEYWORDS = (
-    "突出矿井", "煤与瓦斯突出", "突出煤层", "突出危险", "防突", "石门揭煤",
-)
 
+# 保留常量作为向后兼容的默认值；审查链内部使用动态方法。
+MINE_APPLICABILITY_NOTE = build_mine_applicability_note("non_outburst")
 
 def tag_applicability(chunk: Dict, doc_name: str) -> str:
     """规则chunk适用性标签：outburst_only（突出矿井专用）/ general。
 
     只在文档级或章节结构级命中时标 outburst_only（整块过滤是安全的）；
     正文内容级的零星提及不过滤，由提示词约束兜底。"""
-    if any(p in doc_name for p in OUTBURST_DOC_PATTERNS):
-        return "outburst_only"
-    struct_text = " ".join([
-        str(chunk.get("part", "")), str(chunk.get("chapter", "")),
-        str(chunk.get("section", "")), str(chunk.get("context_prefix", "") or ""),
-        " ".join(chunk.get("parent_context") or []),
-    ])
-    if any(k in struct_text for k in OUTBURST_STRUCT_KEYWORDS):
-        return "outburst_only"
-    return "general"
+    return ensure_rule_applicability(chunk, doc_name)["applicability"]
 
 
 class FatalAPIError(Exception):
@@ -408,6 +408,10 @@ class HybridRAGReviewerV9:
         self.kb_dense: Optional[np.ndarray] = None
         self.kb_postings: Optional[Dict[str, List[Tuple[int, float]]]] = None
         self.kb_json_path: Optional[Path] = None
+        self._default_kb_json_path: Optional[Path] = None
+        self._kb_raw_data: Dict[str, List[Dict]] = {}
+        self._kb_source_key = ""
+        self._kb_source_hash = ""
         self.excluded_outburst_count = 0
 
         self._llm_semaphore = threading.Semaphore(LLM_MAX_CONCURRENCY)
@@ -445,7 +449,73 @@ class HybridRAGReviewerV9:
         with self._print_lock:
             print(message, flush=True)
 
+    def _mine_applicability_note(self) -> str:
+        return build_mine_applicability_note(
+            getattr(self, "mine_type", "non_outburst")
+        )
+
     # ============ 知识库加载与索引 ============
+
+    @staticmethod
+    def _normalize_mine_type(mine_type: str) -> str:
+        normalized = str(mine_type or "non_outburst").strip().lower()
+        if normalized not in {"non_outburst", "outburst"}:
+            raise ValueError(f"不支持的矿井类型: {mine_type}")
+        return normalized
+
+    @staticmethod
+    def _knowledge_data_hash(kb_data: Dict[str, List[Dict]]) -> str:
+        payload = json.dumps(
+            kb_data,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()[:16]
+
+    def _activate_knowledge_data(
+        self,
+        kb_data: Dict[str, List[Dict]],
+        *,
+        source_key: str,
+        source_hash: Optional[str] = None,
+    ) -> None:
+        self._kb_raw_data = {
+            str(doc_name): [dict(chunk or {}) for chunk in chunks]
+            for doc_name, chunks in kb_data.items()
+        }
+        self._kb_source_key = str(source_key)
+        self._kb_source_hash = source_hash or self._knowledge_data_hash(
+            self._kb_raw_data
+        )
+        self.kb_chunks = []
+        self.kb_texts = []
+        self.kb_dense = None
+        self.kb_postings = None
+        self.excluded_outburst_count = 0
+        chunk_id = 0
+        total = 0
+        for doc_name, chunks in self._kb_raw_data.items():
+            for raw_chunk in chunks:
+                chunk = ensure_rule_applicability(raw_chunk, doc_name)
+                if chunk.get("retrievable", True) is False:
+                    continue
+                total += 1
+                applicability = chunk["applicability"]
+                if self.mine_type == "non_outburst" and applicability == "outburst_only":
+                    self.excluded_outburst_count += 1
+                    continue
+                chunk["source_chunk_id"] = chunk.get("id", "")
+                chunk["id"] = f"kb_{chunk_id}"
+                chunk["doc_name"] = doc_name
+                chunk["applicability"] = applicability
+                chunk_id += 1
+                self.kb_chunks.append(chunk)
+                self.kb_texts.append(chunk.get("retrieval_text") or chunk["content"])
+        print(f"  可检索chunks: {len(self.kb_chunks)} / {total}"
+              f"（适用性过滤排除突出矿井专用 {self.excluded_outburst_count} 条，"
+              f"矿井类型: {self.mine_type}）")
 
     def load_knowledge_base(self, kb_json_path: Optional[str] = None):
         if kb_json_path is None:
@@ -463,38 +533,110 @@ class HybridRAGReviewerV9:
                 kb_json_path = v5_files[0]
             else:
                 raise FileNotFoundError("未找到知识库chunks文件")
-        print(f"加载知识库: {kb_json_path}")
-        self.kb_json_path = Path(kb_json_path)
-        with open(kb_json_path, "r", encoding="utf-8") as f:
+        path = Path(kb_json_path).resolve()
+        print(f"加载知识库: {path}")
+        with path.open("r", encoding="utf-8") as f:
             kb_data = json.load(f)
+        self.kb_json_path = path
+        if self._default_kb_json_path is None:
+            self._default_kb_json_path = path
+        self._activate_knowledge_data(
+            kb_data,
+            source_key=f"file:{path}",
+            source_hash=hashlib.sha256(path.read_bytes()).hexdigest()[:16],
+        )
 
-        chunk_id = 0
-        total = 0
-        for doc_name, chunks in kb_data.items():
-            for chunk in chunks:
-                if chunk.get("retrievable", True) is False:
-                    continue
-                total += 1
-                applicability = tag_applicability(chunk, doc_name)
-                if self.mine_type == "non_outburst" and applicability == "outburst_only":
-                    self.excluded_outburst_count += 1
-                    continue
-                chunk["id"] = f"kb_{chunk_id}"
-                chunk["doc_name"] = doc_name
-                chunk["applicability"] = applicability
-                chunk_id += 1
-                self.kb_chunks.append(chunk)
-                self.kb_texts.append(chunk.get("retrieval_text") or chunk["content"])
-        print(f"  可检索chunks: {len(self.kb_chunks)} / {total}"
-              f"（适用性过滤排除突出矿井专用 {self.excluded_outburst_count} 条，"
-              f"矿井类型: {self.mine_type}）")
+    def load_knowledge_base_records(
+        self,
+        records: List[Dict],
+        *,
+        kb_id: int,
+        mine_type: str,
+    ) -> bool:
+        """激活前端选中的 Milvus 知识库，并使用本地 BGE 重建/命中缓存。"""
+        normalized = self._normalize_mine_type(mine_type)
+        grouped: Dict[str, List[Dict]] = defaultdict(list)
+        for record in records:
+            doc_name = str(
+                record.get("doc_name") or record.get("filename") or f"kb_{kb_id}"
+            )
+            grouped[doc_name].append(dict(record))
+        if not grouped:
+            raise ValueError(f"知识库 {kb_id} 中没有已索引的规则块")
+        source_hash = self._knowledge_data_hash(grouped)
+        source_key = f"milvus:kb_{int(kb_id)}"
+        if (
+            self._kb_source_key == source_key
+            and self._kb_source_hash == source_hash
+            and self.mine_type == normalized
+            and self.kb_chunks
+        ):
+            return False
+        self.mine_type = normalized
+        self.kb_json_path = None
+        print(f"加载前端知识库: kb_id={kb_id}")
+        self._activate_knowledge_data(
+            grouped, source_key=source_key, source_hash=source_hash
+        )
+        self.build_index()
+        return True
+
+    def use_default_knowledge_base(self, mine_type: str) -> bool:
+        """切回系统默认规程文件，用于未指定 kb_id 的管理员任务。"""
+        normalized = self._normalize_mine_type(mine_type)
+        source = self._default_kb_json_path
+        if source is None:
+            self.mine_type = normalized
+            self.load_knowledge_base()
+            self.build_index()
+            return True
+        expected_key = f"file:{source}"
+        if (
+            self._kb_source_key == expected_key
+            and self.mine_type == normalized
+            and self.kb_chunks
+        ):
+            return False
+        self.mine_type = normalized
+        self.load_knowledge_base(str(source))
+        self.build_index()
+        return True
 
     def build_index(self):
-        source_hash = hashlib.sha256(self.kb_json_path.read_bytes()).hexdigest()[:16]
+        if not self.kb_texts:
+            raise ValueError("当前知识库在所选矿井类型下没有可检索规则块")
+        source_hash = self._kb_source_hash or self._knowledge_data_hash(
+            self._kb_raw_data
+        )
         cache_key = f"kb_{source_hash}_{self.mine_type}"
         self.kb_dense, kb_lexical = self.retriever.encode_corpus_cached(self.kb_texts, cache_key)
         self.kb_postings = _build_sparse_postings(kb_lexical)
         print(f"  索引就绪: dense {self.kb_dense.shape}, sparse postings {len(self.kb_postings)} tokens")
+
+    def set_mine_type(self, mine_type: str) -> bool:
+        """切换当前任务的矿井类型，并同步重载对应的法规索引。
+
+        worker 串行处理文档，因此可以安全复用同一引擎；不同类型的
+        BGE 缓存键本就包含 ``mine_type``，切换时通常只需读取已有缓存。
+        """
+        normalized = self._normalize_mine_type(mine_type)
+        if normalized == getattr(self, "mine_type", "non_outburst") and self.kb_chunks:
+            return False
+        self.mine_type = normalized
+        raw_data = getattr(self, "_kb_raw_data", None)
+        if raw_data:
+            self._activate_knowledge_data(
+                raw_data,
+                source_key=getattr(self, "_kb_source_key", "runtime"),
+                source_hash=getattr(self, "_kb_source_hash", "") or None,
+            )
+            self.build_index()
+        else:
+            # 兼容旧调用方/测试中只设置了 kb_json_path 的轻量实例。
+            source = getattr(self, "kb_json_path", None)
+            self.load_knowledge_base(str(source)) if source else self.load_knowledge_base()
+            self.build_index()
+        return True
 
     # ============ 检索（Phase A 预计算） ============
 
@@ -769,7 +911,7 @@ class HybridRAGReviewerV9:
 【待检索到的法规片段列表】
 {chunk_list_text}
 
-{MINE_APPLICABILITY_NOTE}
+{self._mine_applicability_note()}
 
 请对每条法规片段进行立场分类，分类定义：
 - 支持：该片段表明待审内容符合规定（待审内容不违反此片段要求）
@@ -824,10 +966,15 @@ class HybridRAGReviewerV9:
 
     # ============ 智能体2：初审（提示词与v8一致） ============
 
+    def _compliance_focus_note(self, pending_chunk: Dict) -> str:
+        """子类可在不增加额外 LLM 调用的前提下，为初审补充强制核查要点。"""
+        return ""
+
     def review_chunk_with_llm(self, pending_chunk: Dict, kb_results: List[Dict]) -> Dict:
         kb_context = self._build_kb_context(kb_results)
         pending_content = pending_chunk["content"]
         pending_meta = f"章: {pending_chunk.get('chapter', '')} | 节: {pending_chunk.get('section', '')}"
+        compliance_focus_note = self._compliance_focus_note(pending_chunk)
 
         prompt = f"""你是一位煤矿安全法规审核专家。请根据下方知识库，判断待审内容是否违反法规要求。
 
@@ -877,11 +1024,12 @@ D. 误差/偏差/公差
 【参考法规知识库】
 {kb_context}
 
-{MINE_APPLICABILITY_NOTE}
+{self._mine_applicability_note()}
 
 【审核要点】
 1. 禁止行为冲突：待审内容是否实施了法规明确禁止的行为（关注实质，不受措辞限制）
 2. 数值冲突：待审数值是否超出法规上限或低于法规下限（区间需两端分别比较）
+{compliance_focus_note}
 
 请以JSON格式输出审核结果：
 {{
@@ -1020,7 +1168,7 @@ D. 误差/偏差/公差
 【参考法规知识库（唯一允许引用的依据）】
 {kb_context}
 
-{MINE_APPLICABILITY_NOTE}
+{self._mine_applicability_note()}
 
 【初步审核发现的问题（需逐条核查）】
 {initial_issues_text}{numeric_note}
@@ -1109,6 +1257,19 @@ D. 误差/偏差/公差
         status = str(review_result.get("compliance_status", ""))
         return bool(review_result.get("issues")) or ("不合规" in status)
 
+    @staticmethod
+    def _cohere_review_status(review_result: Dict) -> Dict:
+        """保证结论状态与问题列表一致，避免“合规但仍输出问题”。"""
+        issues = list(review_result.get("issues") or [])
+        status = str(review_result.get("compliance_status", "")).strip()
+        if issues and status not in ("不合规", "不确定"):
+            review_result["compliance_status"] = "不合规"
+            review_result["status_normalized"] = True
+        elif not issues and status not in ("合规", "不确定"):
+            review_result["compliance_status"] = "合规"
+            review_result["status_normalized"] = True
+        return review_result
+
     def review_chunk_complete(self, pending_chunk: Dict, kb_results: List[Dict]
                               ) -> Tuple[Dict, List[Dict], List[Dict], List[Dict], Dict[str, float]]:
         """合规链：初审 -> 数值核验工具 -> 核验智能体 -> 立场分类（仅不合规）。
@@ -1129,6 +1290,7 @@ D. 误差/偏差/公差
             })
             return draft, classifications, numeric_checks, escalations, timings
 
+        draft = self._cohere_review_status(draft)
         has_issues = bool(draft.get("issues"))
         status = draft.get("compliance_status", "")
         needs_verify = VERIFY_NON_COMPLIANT and has_issues and ("不合规" in status or "不确定" in status)
@@ -1150,6 +1312,7 @@ D. 误差/偏差/公差
         else:
             draft["verified"] = False
             final_result = draft
+        final_result = self._cohere_review_status(final_result)
 
         # ---- 反向数值核验（v9.20）：初审未报问题时用工具反查漏报 ----
         if (not has_issues and kb_results and not self._fatal.is_set()
@@ -1536,12 +1699,16 @@ confidence 说明：高=确定是错别字；中=可能是错别字但有一定�
         esc_text = f" ↑升级{len(escalations)}" if escalations else ""
         numeric_elapsed = (agent_timings.get("numeric_check", 0)
                            + agent_timings.get("counter_check", 0))
+        typo_diagnostics = typo_result.get("diagnostics") or {}
+        typo_trace = str(typo_diagnostics.get("trace", "")).strip()
+        typo_trace_text = f"/{typo_trace}" if typo_trace else ""
         self._log(f"  [完成] chunk#{chunk_index + 1} {status_text}{esc_text} "
                   f"耗时{elapsed:.1f}s "
                   f"(初审{agent_timings.get('compliance_review', 0):.1f}s/"
                   f"数值{numeric_elapsed:.1f}s/"
                   f"核验{agent_timings.get('verification', 0):.1f}s/"
-                  f"错别字{agent_timings.get('typo', 0):.1f}s)")
+                  f"主裁{agent_timings.get('main_adjudication', 0):.1f}s/"
+                  f"错别字{agent_timings.get('typo', 0):.1f}s{typo_trace_text})")
 
         return {
             "chunk_index": chunk_index,
