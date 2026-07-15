@@ -97,6 +97,19 @@
   flex-direction: column;
 }
 
+.feature-card-link {
+  display: block;
+  height: 100%;
+  color: inherit;
+  text-decoration: none;
+  border-radius: 12px;
+}
+
+.feature-card-link:focus-visible {
+  outline: 3px solid rgba(24, 144, 255, 0.35);
+  outline-offset: 3px;
+}
+
 .feature-card:hover {
   transform: translateY(-4px);
   box-shadow: 0 12px 24px var(--shadow-color);
@@ -215,10 +228,17 @@
   font-size: 18px;
   box-shadow: 0 4px 12px rgba(24, 144, 255, 0.3);
   transition: all 0.3s;
+  text-decoration: none;
 }
 
 .agent-node:hover {
   transform: scale(1.1);
+  color: #fff;
+}
+
+.agent-node:focus-visible {
+  outline: 3px solid rgba(24, 144, 255, 0.35);
+  outline-offset: 3px;
 }
 
 .agent-node span {

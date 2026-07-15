@@ -1,5 +1,5 @@
-import { memo, useCallback } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { memo } from 'react'
+import { Link } from 'react-router-dom'
 import { Card, Row, Col, Typography } from 'antd'
 import {
   MessageOutlined,
@@ -7,6 +7,10 @@ import {
   SearchOutlined,
   SafetyCertificateOutlined,
   DashboardOutlined,
+  SettingOutlined,
+  UserOutlined,
+  TeamOutlined,
+  SyncOutlined,
   RightOutlined
 } from '@ant-design/icons'
 import useUserStore from '../../store/userStore'
@@ -15,32 +19,35 @@ import './index.css'
 const { Title, Paragraph } = Typography
 
 // 抽取为独立的 memo 组件，避免重复渲染
-const FeatureCard = memo(({ feature, onClick }) => (
-  <Card
-    className="feature-card"
-    hoverable
-    onClick={onClick}
+const FeatureCard = memo(({ feature }) => (
+  <Link
+    to={feature.path}
+    className="feature-card-link"
+    data-feature-path={feature.path}
+    aria-label={`进入${feature.title}`}
   >
-    <div className="feature-icon" style={{ backgroundColor: feature.color }}>
-      {feature.icon}
-    </div>
-    <div className="feature-content">
-      <Title level={4} className="feature-title">
-        {feature.title}
-      </Title>
-      <Paragraph className="feature-description">
-        {feature.description}
-      </Paragraph>
-    </div>
-    <div className="feature-arrow">
-      <RightOutlined />
-    </div>
-  </Card>
+    <Card className="feature-card" hoverable>
+      <div className="feature-icon" style={{ backgroundColor: feature.color }}>
+        {feature.icon}
+      </div>
+      <div className="feature-content">
+        <Title level={4} className="feature-title">
+          {feature.title}
+        </Title>
+        <Paragraph className="feature-description">
+          {feature.description}
+        </Paragraph>
+      </div>
+      <div className="feature-arrow">
+        <RightOutlined />
+      </div>
+    </Card>
+  </Link>
 ))
 
 FeatureCard.displayName = 'FeatureCard'
 
-const features = [
+const baseFeatures = [
   {
     key: 'chat',
     path: '/chat',
@@ -80,16 +87,57 @@ const features = [
     title: '用量监控',
     description: '实时监控系统使用情况，包括API调用、Token消耗、用户活跃度等数据',
     color: '#13c2c2'
+  },
+  {
+    key: 'settings',
+    path: '/settings',
+    icon: <SettingOutlined />,
+    title: '模型与系统设置',
+    description: '添加和切换大模型 API，配置界面偏好、默认矿井类型与审查提醒',
+    color: '#2f54eb'
+  },
+  {
+    key: 'profile',
+    path: '/profile',
+    icon: <UserOutlined />,
+    title: '个人中心',
+    description: '查看当前账户资料、角色和个人使用信息',
+    color: '#eb2f96'
   }
 ]
 
-const Home = memo(() => {
-  const navigate = useNavigate()
-  const user = useUserStore((state) => state.user)
+const adminFeatures = [
+  {
+    key: 'admin-review-kb',
+    path: '/admin/review-kb',
+    icon: <TeamOutlined />,
+    title: '审查知识库权限',
+    description: '为不同用户配置审查时可选择、可检索的规程知识库范围',
+    color: '#08979c'
+  },
+  {
+    key: 'admin-flywheel',
+    path: '/admin/flywheel',
+    icon: <SyncOutlined />,
+    title: '数据飞轮',
+    description: '管理人工裁决样本，沉淀高质量反馈并导出审查黄金数据集',
+    color: '#d4380d'
+  }
+]
 
-  const handleFeatureClick = useCallback((path) => {
-    navigate(path)
-  }, [navigate])
+const agentLinks = [
+  { key: 'retrieval', path: '/rag', icon: <SearchOutlined />, label: '检索' },
+  { key: 'review', path: '/review', icon: <SafetyCertificateOutlined />, label: '判别' },
+  { key: 'knowledge', path: '/knowledge', icon: <DatabaseOutlined />, label: '关联' },
+  { key: 'chat', path: '/chat', icon: <MessageOutlined />, label: '生成' },
+  { key: 'monitor', path: '/monitor', icon: <DashboardOutlined />, label: '监控' },
+]
+
+const Home = memo(() => {
+  const user = useUserStore((state) => state.user)
+  const features = user?.role === 'admin'
+    ? [...baseFeatures, ...adminFeatures]
+    : baseFeatures
 
   return (
     <div className="home-container">
@@ -123,7 +171,6 @@ const Home = memo(() => {
             <Col xs={24} sm={12} lg={8} key={feature.key}>
               <FeatureCard
                 feature={feature}
-                onClick={() => handleFeatureClick(feature.path)}
               />
             </Col>
           ))}
@@ -145,33 +192,25 @@ const Home = memo(() => {
                 <li>合规性判别 - 识别参数/程序违规</li>
                 <li>全局依赖分析 - 预测连锁反应</li>
                 <li>标准内容生成 - 综合考量修正方案</li>
-                <li>安全合规复合 - 模拟专家校验</li>
+                <li>安全合规复核 - 模拟专家校验</li>
               </ul>
             </div>
           </Col>
           <Col span={12}>
             <div className="intro-visual">
               <div className="agent-flow-visual">
-                <div className="agent-node node-1">
-                  <SearchOutlined />
-                  <span>检索</span>
-                </div>
-                <div className="agent-node node-2">
-                  <SafetyCertificateOutlined />
-                  <span>判别</span>
-                </div>
-                <div className="agent-node node-3">
-                  <DatabaseOutlined />
-                  <span>关联</span>
-                </div>
-                <div className="agent-node node-4">
-                  <MessageOutlined />
-                  <span>生成</span>
-                </div>
-                <div className="agent-node node-5">
-                  <DashboardOutlined />
-                  <span>复核</span>
-                </div>
+                {agentLinks.map((agent, index) => (
+                  <Link
+                    key={agent.key}
+                    to={agent.path}
+                    className={`agent-node node-${index + 1}`}
+                    data-agent-path={agent.path}
+                    aria-label={`进入${agent.label}功能`}
+                  >
+                    {agent.icon}
+                    <span>{agent.label}</span>
+                  </Link>
+                ))}
                 <svg className="agent-lines" viewBox="0 0 300 200">
                   <path d="M60,100 Q150,30 240,100" stroke="#1890ff" strokeWidth="2" fill="none" strokeDasharray="5,5">
                     <animate attributeName="stroke-dashoffset" from="10" to="0" dur="1s" repeatCount="indefinite" />
