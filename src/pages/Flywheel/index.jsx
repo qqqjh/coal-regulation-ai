@@ -122,7 +122,7 @@ export default function Flywheel() {
     <div className="flywheel-page">
       <section className="fw-hero">
         <div>
-          <div className="fw-eyebrow"><SyncOutlined /> HUMAN FEEDBACK LOOP</div>
+          <div className="fw-eyebrow"><SyncOutlined /> 管理员功能</div>
           <h1>人工反馈数据飞轮</h1>
           <p>
             每次采纳、驳回和人工改写都会形成可追溯样本；后续审查检索相似样本，
