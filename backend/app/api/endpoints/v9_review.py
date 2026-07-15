@@ -49,6 +49,12 @@ router = APIRouter()
 class TypoAllowTermsUpdate(BaseModel):
     terms: list[str] = Field(default_factory=list, max_length=500)
 
+
+class ReviewVectorUpsert(BaseModel):
+    job: dict
+    chunks: list[dict]
+    vectors: list[list[float]]
+
 _queue = ReviewQueue(settings.V9_QUEUE_DB)
 _WORK_DIR = settings.PROJECT_ROOT / "data" / "v9_web_work"
 _PREPROCESS_DIR = _WORK_DIR / "preprocess"
@@ -857,6 +863,34 @@ async def internal_review_chunks(
 
     items = vector_store_service.get_knowledge_base_review_chunks(int(kb_id))
     return {"kb_id": int(kb_id), "count": len(items), "items": items}
+
+
+@router.post("/internal/review-document-vectors", include_in_schema=False)
+async def internal_review_document_vectors(
+    payload: ReviewVectorUpsert,
+    _authorized: None = Depends(_require_review_worker),
+):
+    """Persist worker-generated BGE vectors through the process owning Milvus Lite."""
+    from review_doc_vector_store import review_doc_vector_store
+
+    job_id = str(payload.job.get("job_id") or "").strip()
+    if not job_id:
+        raise HTTPException(400, "job_id 不能为空")
+    if len(payload.chunks) != len(payload.vectors):
+        raise HTTPException(400, "chunks 与 vectors 数量不一致")
+    try:
+        records = review_doc_vector_store.upsert_job_chunks(
+            job=payload.job,
+            chunks=payload.chunks,
+            dense_vecs=payload.vectors,
+        )
+        mongo_ok = mongo_service.replace_review_chunks(
+            job=payload.job,
+            vector_records=records,
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"待审文档向量保存失败：{exc}") from exc
+    return {"job_id": job_id, "saved": len(records), "mongodb": bool(mongo_ok)}
 
 
 @router.get("/review-similar/{job_id}/{chunk_index}")

@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import { useState } from 'react'
 import { Form, Input, Button, Card, message, Checkbox, Segmented } from 'antd'
 import { UserOutlined, LockOutlined, IdcardOutlined } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'

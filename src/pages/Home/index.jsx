@@ -137,7 +137,7 @@ const Home = memo(() => {
             <div className="intro-content">
               <Title level={3}>多智能体协同架构</Title>
               <Paragraph>
-                系统采用"检索-判别-关联-生成-复核"五维分工的多智能体协同架构，
+                系统采用“检索-判别-关联-生成-复核”五维分工的多智能体协同架构，
                 通过智能体间的信息流转与约束制衡，实现从局部错误发现到全局一致性修正的完整闭环。
               </Paragraph>
               <ul className="intro-list">

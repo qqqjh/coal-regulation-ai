@@ -674,28 +674,36 @@ class V9Worker:
         chunks: List[Dict[str, Any]],
         q_dense,
     ) -> Dict[str, Any]:
-        """复用 Phase A 的待审文档向量，长期写入 Milvus，并镜像 chunk 元数据到 MongoDB。"""
+        """Send Phase A vectors to the backend process that owns Milvus Lite."""
         if q_dense is None:
             return {"saved": 0, "mongo": False}
+        if not REVIEW_WORKER_SECRET:
+            return {"saved": 0, "mongo": False, "error": "APP_AUTH_SECRET 未配置"}
         try:
-            from review_doc_vector_store import review_doc_vector_store
-
-            records = review_doc_vector_store.upsert_job_chunks(
-                job=job,
-                chunks=chunks,
-                dense_vecs=q_dense,
+            vectors = q_dense.tolist() if hasattr(q_dense, "tolist") else q_dense
+            body = json.dumps(
+                {"job": job, "chunks": chunks, "vectors": vectors},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            request = urllib.request.Request(
+                f"{REVIEW_BACKEND_URL}/internal/review-document-vectors",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Review-Worker-Secret": REVIEW_WORKER_SECRET,
+                },
+                method="POST",
             )
-            mongo_ok = False
-            try:
-                backend_dir = PROJECT_ROOT / "backend"
-                if str(backend_dir) not in sys.path:
-                    sys.path.insert(0, str(backend_dir))
-                from app.services.mongo_service import mongo_service
-
-                mongo_ok = mongo_service.replace_review_chunks(job=job, vector_records=records)
-            except Exception as exc:
-                log(f"待审 chunk 元数据写入 MongoDB 失败（不影响审查）: {exc}")
-            return {"saved": len(records), "mongo": bool(mongo_ok)}
+            with urllib.request.urlopen(request, timeout=300) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            return {
+                "saved": int(result.get("saved") or 0),
+                "mongo": bool(result.get("mongodb")),
+            }
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:500]
+            log(f"待审文档向量写入失败（HTTP {exc.code}，不影响审查）: {detail}")
+            return {"saved": 0, "mongo": False, "error": detail[:200]}
         except Exception as exc:
             log(f"待审文档向量写入 Milvus 失败（不影响审查）: {exc}")
             return {"saved": 0, "mongo": False, "error": str(exc)[:200]}

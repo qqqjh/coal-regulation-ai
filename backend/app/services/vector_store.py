@@ -93,11 +93,13 @@ class VectorStoreService:
     def _ensure_collection(self, dim: int) -> None:
         client = self._get_client()
         if self._collection_ready and self._collection_dim == dim:
+            self._load_collection()
             return
 
         if client.has_collection(self.collection_name):
             self._collection_ready = True
             self._collection_dim = dim
+            self._load_collection()
             return
 
         from pymilvus import DataType, MilvusClient
@@ -135,6 +137,17 @@ class VectorStoreService:
         )
         self._collection_ready = True
         self._collection_dim = dim
+        self._load_collection()
+
+    def _load_collection(self) -> None:
+        client = self._get_client()
+        if not client.has_collection(self.collection_name):
+            return
+        try:
+            client.load_collection(collection_name=self.collection_name)
+        except Exception as exc:
+            if "already" not in str(exc).lower() and "loaded" not in str(exc).lower():
+                raise
 
     def _embed_documents(self, texts: List[str]) -> List[List[float]]:
         if not texts:
@@ -510,6 +523,7 @@ class VectorStoreService:
         client = self._get_client()
         if not client.has_collection(self.collection_name):
             return []
+        self._load_collection()
         fields = output_fields or ["id", *self.OUTPUT_FIELDS]
         iterator = None
         try:

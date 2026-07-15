@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Alert,
   Button,
@@ -54,7 +54,7 @@ const AdminReviewKb = () => {
 
   const configuredCount = users.filter(u => u.configured).length
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     setLoading(true)
     try {
       const response = await fetch(`/api/admin/review-kb-permissions?role=${encodeURIComponent(user?.role || '')}`)
@@ -72,11 +72,11 @@ const AdminReviewKb = () => {
     } finally {
       setLoading(false)
     }
-  }
+  }, [user?.role])
 
   useEffect(() => {
     loadData()
-  }, [])
+  }, [loadData])
 
   const updateDraft = (userId, kbIds) => {
     setDraft(prev => ({ ...prev, [userId]: kbIds }))

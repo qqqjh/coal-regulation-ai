@@ -81,10 +81,12 @@ class ReviewDocVectorStore:
     def _ensure_collection(self, dim: int) -> None:
         client = self._get_client()
         if self._collection_ready and self._collection_dim == dim:
+            self._load_collection()
             return
         if client.has_collection(self.collection_name):
             self._collection_ready = True
             self._collection_dim = dim
+            self._load_collection()
             return
 
         from pymilvus import DataType, MilvusClient
@@ -122,6 +124,19 @@ class ReviewDocVectorStore:
         )
         self._collection_ready = True
         self._collection_dim = dim
+        self._load_collection()
+
+    def _load_collection(self) -> None:
+        """Milvus can release a collection between calls; queries require it loaded."""
+        client = self._get_client()
+        if not client.has_collection(self.collection_name):
+            return
+        try:
+            client.load_collection(collection_name=self.collection_name)
+        except Exception as exc:
+            # Older clients report an error when the collection is already loaded.
+            if "already" not in str(exc).lower() and "loaded" not in str(exc).lower():
+                raise
 
     def _entity_id(self, job_id: str, chunk_index: int, content: str) -> str:
         content_hash = hashlib.sha1(content.encode("utf-8", errors="ignore")).hexdigest()[:12]
@@ -249,6 +264,7 @@ class ReviewDocVectorStore:
         client = self._get_client()
         if not client.has_collection(self.collection_name):
             return 0
+        self._load_collection()
         rows = client.query(
             collection_name=self.collection_name,
             filter=f"job_id == {_quote(job_id)}",
@@ -273,6 +289,7 @@ class ReviewDocVectorStore:
         client = self._get_client()
         if not client.has_collection(self.collection_name):
             return []
+        self._load_collection()
 
         current_rows = client.query(
             collection_name=self.collection_name,

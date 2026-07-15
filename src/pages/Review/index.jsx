@@ -527,6 +527,7 @@ export default function Review() {
   const pdfPageWrapRef = useRef(null)
   const pdfRefreshSeqRef = useRef(0)
   const locatedIssuePageRef = useRef('')
+  const documentRequestJobRef = useRef('')
 
   useEffect(() => {
     setRepeatFocus(null)
@@ -534,17 +535,29 @@ export default function Review() {
   }, [jobId])
 
   const loadDocument = useCallback(async (jid) => {
-    if (!jid) return
+    if (!jid) return false
     setDocumentLoading(true)
     try {
       const res = await axios.get(`${REVIEW_API}/document/${jid}`)
       setDocumentBlocks(res.data.blocks || [])
+      return true
     } catch {
       setDocumentBlocks([])
+      return false
     } finally {
       setDocumentLoading(false)
     }
   }, [])
+
+  const loadDocumentOnce = useCallback((jid) => {
+    if (!jid || documentRequestJobRef.current === jid) return
+    documentRequestJobRef.current = jid
+    loadDocument(jid).then((loaded) => {
+      if (!loaded && documentRequestJobRef.current === jid) {
+        documentRequestJobRef.current = ''
+      }
+    })
+  }, [loadDocument])
 
   const loadHistory = useCallback(async () => {
     setHistoryLoading(true)
@@ -651,7 +664,7 @@ export default function Review() {
         const d = JSON.parse(e.data)
         if (d.type === 'status') {
           setJobInfo(d.job)
-          if (d.job?.paragraphs_ready) loadDocument(jid)
+          if (d.job?.paragraphs_ready) loadDocumentOnce(jid)
         } else if (d.type === 'issue') {
           setIssues(prev => prev.some(i => i.id === d.issue.id) ? prev : [...prev, d.issue])
         } else if (d.type === 'end') {
@@ -674,7 +687,7 @@ export default function Review() {
     }
     es.onerror = () => {}
     sseRef.current = es
-  }, [loadDocument, loadHistory])
+  }, [loadDocument, loadDocumentOnce, loadHistory])
 
   useEffect(() => () => sseRef.current?.close(), [])
 
@@ -755,7 +768,7 @@ export default function Review() {
     if (pdfBlobUrl) URL.revokeObjectURL(pdfBlobUrl)
   }, [pdfBlobUrl])
 
-  function refreshPdfPreview(force = false) {
+  const refreshPdfPreview = useCallback((force = false) => {
     if (!jobId) return
     pdfRefreshSeqRef.current += 1
     setPreviewMode('pdf')
@@ -766,7 +779,7 @@ export default function Review() {
     setPdfAreaRects([])
     setPdfAreaLayerBox(null)
     setPdfUrl(`${REVIEW_API}/preview-pdf/${jobId}?t=${Date.now()}&v=${pdfRefreshSeqRef.current}${force ? '&refresh=1' : ''}`)
-  }
+  }, [jobId])
 
   async function handlePdfLoadSuccess(pdf) {
     setPdfNumPages(pdf.numPages)
@@ -1186,7 +1199,7 @@ export default function Review() {
       stopped = true
       if (timer) clearTimeout(timer)
     }
-  }, [jobId, pendingFeedbackIds, loadDocument])
+  }, [jobId, pendingFeedbackIds, loadDocument, refreshPdfPreview])
 
   // ── 派生状态 ──────────────────────────────────────────────────
   const selectedIssue = issues.find(i => i.id === selectedId) || null

@@ -10,11 +10,6 @@ const { Option } = Select
 
   const Chat = () => {
   const user = useUserStore((state) => state.user)
-  const knowledgeAuthQuery = () => new URLSearchParams({
-    user_id: String(user?.id || 'guest'),
-    role: user?.role || 'user',
-  }).toString()
-
   // 从 localStorage 加载会话数据
   const loadSessions = () => {
     try {
@@ -64,7 +59,11 @@ const { Option } = Select
   useEffect(() => {
     const fetchKnowledgeBases = async () => {
       try {
-        const response = await fetch(`/api/knowledge/bases?${knowledgeAuthQuery()}`)
+        const query = new URLSearchParams({
+          user_id: String(user?.id || 'guest'),
+          role: user?.role || 'user',
+        }).toString()
+        const response = await fetch(`/api/knowledge/bases?${query}`)
         if (response.ok) {
           const data = await response.json()
           setKnowledgeBases(data)

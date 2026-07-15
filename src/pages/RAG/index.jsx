@@ -60,11 +60,6 @@ const RAG = () => {
   const [isSearching, setIsSearching] = useState(false)
   const [isGenerating, setIsGenerating] = useState(false)
   const [knowledgeBases, setKnowledgeBases] = useState([])
-  const knowledgeAuthQuery = () => new URLSearchParams({
-    user_id: String(user?.id || 'guest'),
-    role: user?.role || 'user',
-  }).toString()
-
   // 从localStorage加载保存的配置
   useEffect(() => {
     const savedConfig = localStorage.getItem('ragConfig')
@@ -86,7 +81,11 @@ const RAG = () => {
   useEffect(() => {
     const fetchKnowledgeBases = async () => {
       try {
-        const response = await fetch(`/api/knowledge/bases?${knowledgeAuthQuery()}`)
+        const query = new URLSearchParams({
+          user_id: String(user?.id || 'guest'),
+          role: user?.role || 'user',
+        }).toString()
+        const response = await fetch(`/api/knowledge/bases?${query}`)
         if (response.ok) {
           const data = await response.json()
           setKnowledgeBases(data)
