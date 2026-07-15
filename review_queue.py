@@ -73,7 +73,16 @@ CREATE TABLE IF NOT EXISTS jobs (
     paragraphs_path TEXT,          -- 段落模型 JSON 落盘路径（前端中间面板用）
     mine_type TEXT NOT NULL DEFAULT 'non_outburst',
     kb_id INTEGER,
+    reference_doc_ids TEXT,       -- JSON: 本次审查手动选择的参考规程文档 ID
+    reference_docs TEXT,          -- JSON: 参考规程名称/知识库快照
+    temporary_reference_id TEXT,  -- 一次性参考文件 ID（只允许绑定一个任务）
+    temporary_reference_name TEXT,
+    temporary_reference_path TEXT,
     user_id TEXT DEFAULT 'guest',
+    llm_profile_id TEXT,
+    llm_profile_name TEXT,
+    llm_model TEXT,
+    llm_base_url TEXT,
     status TEXT NOT NULL DEFAULT 'pending',  -- pending/parsing/reviewing/done/failed/cancelled
     progress INTEGER NOT NULL DEFAULT 0,
     n_chunks INTEGER DEFAULT 0,
@@ -111,6 +120,15 @@ CREATE TABLE IF NOT EXISTS issues (
 );
 CREATE INDEX IF NOT EXISTS idx_issues_job ON issues(job_id, id);
 CREATE INDEX IF NOT EXISTS idx_issues_feedback ON issues(human_action, agent_applied);
+
+-- User-scoped terms that must never be reported as typos.
+CREATE TABLE IF NOT EXISTS typo_allow_terms (
+    user_id TEXT NOT NULL,
+    term TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, term)
+);
+CREATE INDEX IF NOT EXISTS idx_typo_allow_terms_user ON typo_allow_terms(user_id, term);
 """
 
 
@@ -139,10 +157,19 @@ class ReviewQueue:
         additions = {
             "user_id": "TEXT DEFAULT 'guest'",
             "kb_id": "INTEGER",
+            "reference_doc_ids": "TEXT",
+            "reference_docs": "TEXT",
+            "temporary_reference_id": "TEXT",
+            "temporary_reference_name": "TEXT",
+            "temporary_reference_path": "TEXT",
             "agent_stage": "TEXT",
             "phase_done": "INTEGER DEFAULT 0",
             "phase_total": "INTEGER DEFAULT 0",
             "timings": "TEXT",
+            "llm_profile_id": "TEXT",
+            "llm_profile_name": "TEXT",
+            "llm_model": "TEXT",
+            "llm_base_url": "TEXT",
         }
         for name, ddl in additions.items():
             if name not in existing:
@@ -368,12 +395,33 @@ class ReviewQueue:
                    mine_type: str = "non_outburst",
                    paragraphs_path: Optional[str] = None,
                    user_id: str = "guest",
-                   kb_id: Optional[int] = None) -> int:
+                   kb_id: Optional[int] = None,
+                   reference_doc_ids: Optional[List[int]] = None,
+                   reference_docs: Optional[List[Dict[str, Any]]] = None,
+                   temporary_reference: Optional[Dict[str, Any]] = None) -> int:
+        temporary_reference = temporary_reference or {}
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO jobs (job_id, created_at, updated_at, doc_name, docx_path, "
-                "paragraphs_path, mine_type, user_id, kb_id, status) VALUES (?,?,?,?,?,?,?,?,?, 'pending')",
-                (job_id, _now(), _now(), doc_name, docx_path, paragraphs_path, mine_type, user_id, kb_id),
+                "paragraphs_path, mine_type, user_id, kb_id, reference_doc_ids, reference_docs, "
+                "temporary_reference_id, temporary_reference_name, temporary_reference_path, status) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending')",
+                (
+                    job_id,
+                    _now(),
+                    _now(),
+                    doc_name,
+                    docx_path,
+                    paragraphs_path,
+                    mine_type,
+                    user_id,
+                    kb_id,
+                    json.dumps(reference_doc_ids or [], ensure_ascii=False),
+                    json.dumps(reference_docs or [], ensure_ascii=False),
+                    temporary_reference.get("reference_id"),
+                    temporary_reference.get("name"),
+                    temporary_reference.get("path"),
+                ),
             )
             self._conn.commit()
             return cur.lastrowid
@@ -470,6 +518,43 @@ class ReviewQueue:
             return cur.rowcount > 0
 
     # ============ 问题（issues）：边审边写 / SSE 流式读 / 人工反馈回流 ============
+
+    def list_typo_allow_terms(self, user_id: str = "guest") -> List[str]:
+        """Return the typo allowlist for one user."""
+        normalized_user = str(user_id or "guest")[:80]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT term FROM typo_allow_terms WHERE user_id=? ORDER BY term COLLATE NOCASE",
+                (normalized_user,),
+            ).fetchall()
+        return [str(row["term"]) for row in rows]
+
+    def replace_typo_allow_terms(self, user_id: str, terms: List[str]) -> List[str]:
+        """Atomically replace one user's allowlist and return normalized terms."""
+        normalized_user = str(user_id or "guest")[:80]
+        normalized_terms: List[str] = []
+        seen = set()
+        for value in terms or []:
+            term = " ".join(str(value or "").strip().split())
+            if not term or len(term) > 80:
+                continue
+            key = term.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized_terms.append(term)
+            if len(normalized_terms) >= 500:
+                break
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM typo_allow_terms WHERE user_id=?", (normalized_user,)
+            )
+            self._conn.executemany(
+                "INSERT INTO typo_allow_terms (user_id, term, created_at) VALUES (?, ?, ?)",
+                [(normalized_user, term, _now()) for term in normalized_terms],
+            )
+            self._conn.commit()
+        return normalized_terms
 
     def add_issue(self, job_id: str, chunk_index: int, issue_type: str, status: str,
                   block_indices: Optional[List[int]] = None,

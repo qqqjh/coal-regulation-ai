@@ -280,12 +280,71 @@ def bytes_to_doc(data: bytes) -> Document:
 
 # ── DOCX → PDF（Word COM，Windows only）─────────────────────────────
 
+def _libreoffice_convert(src_docx: Path, page_from: int = 0, page_to: int = 0) -> bytes:
+    """Convert DOCX to PDF with headless LibreOffice on Linux servers."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    executable = shutil.which("libreoffice") or shutil.which("soffice")
+    if not executable:
+        raise RuntimeError("LibreOffice/soffice is not installed; cannot build a DOCX PDF preview")
+
+    with tempfile.TemporaryDirectory(prefix="coal_docx_pdf_") as temp_dir:
+        work_dir = Path(temp_dir)
+        # Preserve the source extension so LibreOffice can also open legacy
+        # .doc files without pretending they are OOXML .docx packages.
+        source_suffix = src_docx.suffix.lower() or ".docx"
+        input_path = work_dir / f"input{source_suffix}"
+        profile_dir = work_dir / "lo_profile"
+        shutil.copy2(src_docx, input_path)
+        subprocess.run(
+            [
+                executable,
+                f"-env:UserInstallation={profile_dir.resolve().as_uri()}",
+                "--headless",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                str(work_dir),
+                str(input_path),
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=180,
+        )
+        pdf_path = work_dir / "input.pdf"
+        if not pdf_path.exists() or pdf_path.stat().st_size == 0:
+            raise RuntimeError("LibreOffice did not generate a valid PDF preview")
+        data = pdf_path.read_bytes()
+
+    if page_from > 0 and page_to > 0:
+        from pypdf import PdfReader, PdfWriter
+
+        reader = PdfReader(io.BytesIO(data))
+        writer = PdfWriter()
+        start = max(0, page_from - 1)
+        stop = min(len(reader.pages), page_to)
+        for page_index in range(start, stop):
+            writer.add_page(reader.pages[page_index])
+        output = io.BytesIO()
+        writer.write(output)
+        return output.getvalue()
+    return data
+
+
 def _word_com_convert(src_docx: Path, page_from: int = 0, page_to: int = 0) -> bytes:
     """
     Word COM 转换核心：把 src_docx 转为 PDF 字节。
     先复制到临时文件再打开，确保不锁住 src_docx。
     page_from/page_to 均为 0 时导出全文，否则只导出指定页范围。
     """
+    import os
+
+    if os.name != "nt":
+        return _libreoffice_convert(src_docx, page_from=page_from, page_to=page_to)
+
     import win32com.client
     import pythoncom
     import tempfile

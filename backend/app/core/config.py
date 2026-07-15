@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,6 +15,9 @@ class Settings(BaseSettings):
     # v9 引擎与主智能体用的 DashScope（qwen）配置
     DASHSCOPE_API_KEY: str = ""
     DASHSCOPE_BASE_URL: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    DASHSCOPE_MODEL: str = "qwen-plus"
+    APP_AUTH_SECRET: str = ""
+    LLM_PROFILE_ENCRYPTION_KEY: str = ""
 
     # 路径配置
     BACKEND_DIR: Path = Path(__file__).resolve().parent.parent.parent          # backend/
@@ -30,7 +34,13 @@ class Settings(BaseSettings):
 
     # 向量库：默认连接本机 Docker Milvus Standalone
     VECTOR_BACKEND: str = "milvus"
-    MILVUS_URI: str = "http://localhost:19530"
+    # pymilvus itself reserves the MILVUS_URI process variable and only accepts
+    # an http(s) endpoint there.  Prefer the app-specific alias so Milvus Lite
+    # file paths do not fail while pymilvus is being imported.
+    MILVUS_URI: str = Field(
+        default="http://localhost:19530",
+        validation_alias=AliasChoices("COAL_MILVUS_URI", "MILVUS_URI"),
+    )
     MILVUS_TOKEN: str = ""
     MILVUS_COLLECTION_PREFIX: str = "coal_regulation"
     DEFAULT_TENANT_ID: str = "default"

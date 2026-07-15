@@ -21,13 +21,18 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from docx import Document
 
 from app.core.config import settings
+from app.core.auth_token import require_identity
 from app.db.database import get_db
 from app.services.monitor_service import monitor_service
-from app.services.review_kb_permission_service import assert_kb_allowed
+from app.services.review_kb_permission_service import (
+    assert_kb_allowed,
+    resolve_allowed_reference_documents,
+)
 
 # 引入仓库根的共享模块（review_queue / docx_adapter）
 _PROJECT_ROOT = str(settings.PROJECT_ROOT)
@@ -39,12 +44,21 @@ from app.services.mongo_service import mongo_service
 
 router = APIRouter()
 
+
+class TypoAllowTermsUpdate(BaseModel):
+    terms: list[str] = Field(default_factory=list, max_length=500)
+
 _queue = ReviewQueue(settings.V9_QUEUE_DB)
 _WORK_DIR = settings.PROJECT_ROOT / "data" / "v9_web_work"
 _PREPROCESS_DIR = _WORK_DIR / "preprocess"
 _PREPROCESS_DIR.mkdir(parents=True, exist_ok=True)
 _FEEDBACK_SNAPSHOT_DIR = _WORK_DIR / "feedback_snapshots"
 _FEEDBACK_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+_TEMPORARY_REFERENCE_DIR = _WORK_DIR / "temporary_references" / "uploads"
+_TEMPORARY_REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+_TEMPORARY_REFERENCE_MAX_BYTES = 50 * 1024 * 1024
+_TEMPORARY_REFERENCE_SUFFIXES = {".pdf", ".docx", ".doc"}
+_TEMPORARY_REFERENCE_TTL_SECONDS = 24 * 60 * 60
 
 
 def _sync_job_to_mongo(job_id: str, include_issues: bool = False) -> None:
@@ -78,6 +92,99 @@ def _save_preprocess_meta(meta: dict) -> None:
     meta_path = _preprocess_meta_path(meta["preprocess_id"])
     with meta_path.open("w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
+
+
+def _parse_reference_doc_ids(value: str | None) -> list[int]:
+    if not value:
+        return []
+    result = []
+    seen = set()
+    for part in str(value).replace("；", ",").replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            doc_id = int(part)
+        except ValueError as exc:
+            raise HTTPException(400, "参考规程文档 ID 无效") from exc
+        if doc_id > 0 and doc_id not in seen:
+            seen.add(doc_id)
+            result.append(doc_id)
+    return result
+
+
+def _decode_job_reference_fields(job: dict) -> dict:
+    for field in ("reference_doc_ids", "reference_docs"):
+        value = job.get(field)
+        if isinstance(value, str):
+            try:
+                job[field] = json.loads(value or "[]")
+            except json.JSONDecodeError:
+                job[field] = []
+        elif not isinstance(value, list):
+            job[field] = []
+    # The queue needs the owned upload path internally, but API consumers must
+    # never receive a server-local filesystem path.
+    job.pop("temporary_reference_path", None)
+    return job
+
+
+def _temporary_reference_meta_path(reference_id: str) -> Path:
+    if not reference_id or not reference_id.isalnum():
+        raise HTTPException(400, "临时参考文件 ID 无效")
+    return _TEMPORARY_REFERENCE_DIR / f"{reference_id}.json"
+
+
+def _cleanup_expired_temporary_references() -> None:
+    cutoff = time.time() - _TEMPORARY_REFERENCE_TTL_SECONDS
+    # Only metadata means "unclaimed". A claimed source may still be needed by
+    # a long-running worker and must be left to that worker's finally cleanup.
+    for item in _TEMPORARY_REFERENCE_DIR.glob("*.json"):
+        try:
+            if item.is_file() and item.stat().st_mtime < cutoff:
+                try:
+                    meta = json.loads(item.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    meta = {}
+                _cleanup_temporary_reference(meta)
+                item.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _cleanup_temporary_reference(reference: dict | None) -> None:
+    if not reference:
+        return
+    path = Path(reference.get("path") or "")
+    try:
+        if path.is_file() and _TEMPORARY_REFERENCE_DIR in path.resolve().parents:
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _claim_temporary_reference(reference_id: str | None) -> dict | None:
+    if not reference_id:
+        return None
+    meta_path = _temporary_reference_meta_path(reference_id)
+    if not meta_path.exists():
+        raise HTTPException(404, "临时参考文件不存在、已使用或已过期")
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, "临时参考文件元数据损坏") from exc
+    path = Path(meta.get("path") or "")
+    if not path.is_file() or _TEMPORARY_REFERENCE_DIR not in path.resolve().parents:
+        meta_path.unlink(missing_ok=True)
+        raise HTTPException(404, "临时参考文件不存在或已清理")
+    meta_path.unlink(missing_ok=True)
+    return meta
+
+
+def _cleanup_job_temporary_reference(job: dict | None) -> None:
+    if not job:
+        return
+    _cleanup_temporary_reference({"path": job.get("temporary_reference_path")})
 
 
 def _feedback_snapshot_path(job_id: str, issue_id: int) -> Path:
@@ -349,6 +456,8 @@ def _create_job_from_preprocess(
     mine_type: str = "non_outburst",
     user_id: str = "guest",
     kb_id: int | None = None,
+    reference_docs: list[dict] | None = None,
+    temporary_reference: dict | None = None,
 ) -> dict:
     meta = _load_preprocess_meta(preprocess_id)
     if not meta.get("docx_ready") or not meta.get("docx_path"):
@@ -358,6 +467,10 @@ def _create_job_from_preprocess(
         raise HTTPException(404, "预处理后的 .docx 文件不存在")
 
     job_id = uuid.uuid4().hex[:12]
+    reference_docs = reference_docs or []
+    reference_doc_ids = [int(item["id"]) for item in reference_docs]
+    if kb_id is None and reference_docs:
+        kb_id = int(reference_docs[0]["kb_id"])
     _queue.create_job(
         job_id,
         doc_name=meta["doc_name"],
@@ -365,6 +478,9 @@ def _create_job_from_preprocess(
         mine_type=mine_type,
         user_id=(user_id or "guest")[:80],
         kb_id=kb_id,
+        reference_doc_ids=reference_doc_ids,
+        reference_docs=reference_docs,
+        temporary_reference=temporary_reference,
     )
 
     pdf_path = Path(meta["pdf_path"]) if meta.get("pdf_path") else None
@@ -378,8 +494,61 @@ def _create_job_from_preprocess(
         "doc_name": meta["doc_name"],
         "status": "pending",
         "kb_id": kb_id,
+        "reference_doc_ids": reference_doc_ids,
+        "reference_docs": reference_docs,
+        "temporary_reference_id": (temporary_reference or {}).get("reference_id"),
+        "temporary_reference_name": (temporary_reference or {}).get("name"),
         "preprocess": meta,
     }
+
+
+@router.post("/temporary-reference")
+async def upload_temporary_reference(file: UploadFile = File(...)):
+    """Stage one regulation file for exactly one subsequent review job."""
+    _cleanup_expired_temporary_references()
+    original_name = Path(file.filename or "").name.strip()
+    suffix = Path(original_name).suffix.lower()
+    if not original_name or suffix not in _TEMPORARY_REFERENCE_SUFFIXES:
+        raise HTTPException(400, "临时参考文件仅支持 .pdf / .docx / .doc")
+    content = await file.read(_TEMPORARY_REFERENCE_MAX_BYTES + 1)
+    if not content:
+        raise HTTPException(400, "临时参考文件为空")
+    if len(content) > _TEMPORARY_REFERENCE_MAX_BYTES:
+        raise HTTPException(413, "临时参考文件不能超过 50 MB")
+
+    reference_id = uuid.uuid4().hex[:16]
+    safe_name = "".join(
+        "_" if char in '<>:"/\\|?*' else char
+        for char in original_name
+    )[:180]
+    stored_path = _TEMPORARY_REFERENCE_DIR / f"{reference_id}_{safe_name}"
+    stored_path.write_bytes(content)
+    meta = {
+        "reference_id": reference_id,
+        "name": original_name,
+        "path": str(stored_path),
+        "size": len(content),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _temporary_reference_meta_path(reference_id).write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {key: value for key, value in meta.items() if key != "path"}
+
+
+@router.delete("/temporary-reference/{reference_id}")
+async def delete_temporary_reference(reference_id: str):
+    meta_path = _temporary_reference_meta_path(reference_id)
+    if not meta_path.exists():
+        return {"ok": True, "deleted": False}
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        meta = {}
+    _cleanup_temporary_reference(meta)
+    meta_path.unlink(missing_ok=True)
+    return {"ok": True, "deleted": True}
 
 
 @router.post("/preprocess")
@@ -416,13 +585,27 @@ async def start_preprocessed(
     mine_type: str = "non_outburst",
     user_id: str = "guest",
     kb_id: int | None = None,
+    reference_doc_ids: str | None = None,
+    temporary_reference_id: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
     """基于预处理结果创建审查任务。"""
     started = time.perf_counter()
+    claimed_temporary_reference = None
     try:
+        selected_ids = _parse_reference_doc_ids(reference_doc_ids)
+        references = await resolve_allowed_reference_documents(db, user_id, selected_ids)
         await assert_kb_allowed(db, user_id, kb_id)
-        result = _create_job_from_preprocess(preprocess_id, mine_type=mine_type, user_id=user_id, kb_id=kb_id)
+        claimed_temporary_reference = _claim_temporary_reference(temporary_reference_id)
+        result = _create_job_from_preprocess(
+            preprocess_id,
+            mine_type=mine_type,
+            user_id=user_id,
+            kb_id=kb_id,
+            reference_docs=references,
+            temporary_reference=claimed_temporary_reference,
+        )
+        claimed_temporary_reference = None
         await monitor_service.log_operation(
             db=db,
             module="v9_review",
@@ -435,10 +618,14 @@ async def start_preprocessed(
                 "mine_type": mine_type,
                 "user_id": user_id,
                 "kb_id": kb_id,
+                "reference_doc_ids": selected_ids,
+                "temporary_reference_id": result.get("temporary_reference_id"),
+                "temporary_reference_name": result.get("temporary_reference_name"),
             },
         )
         return result
     except Exception as exc:
+        _cleanup_temporary_reference(claimed_temporary_reference)
         await monitor_service.log_operation(
             db=db,
             module="v9_review",
@@ -446,7 +633,14 @@ async def start_preprocessed(
             status="failed",
             latency=time.perf_counter() - started,
             error_msg=str(exc),
-            metadata={"preprocess_id": preprocess_id, "mine_type": mine_type, "user_id": user_id, "kb_id": kb_id},
+            metadata={
+                "preprocess_id": preprocess_id,
+                "mine_type": mine_type,
+                "user_id": user_id,
+                "kb_id": kb_id,
+                "reference_doc_ids": _parse_reference_doc_ids(reference_doc_ids),
+                "temporary_reference_id": temporary_reference_id,
+            },
         )
         raise
 
@@ -457,14 +651,28 @@ async def upload(
     mine_type: str = "non_outburst",
     user_id: str = "guest",
     kb_id: int | None = None,
+    reference_doc_ids: str | None = None,
+    temporary_reference_id: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
     """兼容旧调用：上传后先预处理，再创建审查任务。新前端应使用 /preprocess + /start。"""
     started = time.perf_counter()
+    claimed_temporary_reference = None
     try:
+        selected_ids = _parse_reference_doc_ids(reference_doc_ids)
+        references = await resolve_allowed_reference_documents(db, user_id, selected_ids)
         await assert_kb_allowed(db, user_id, kb_id)
+        claimed_temporary_reference = _claim_temporary_reference(temporary_reference_id)
         meta = await _preprocess_upload_file(file)
-        result = _create_job_from_preprocess(meta["preprocess_id"], mine_type=mine_type, user_id=user_id, kb_id=kb_id)
+        result = _create_job_from_preprocess(
+            meta["preprocess_id"],
+            mine_type=mine_type,
+            user_id=user_id,
+            kb_id=kb_id,
+            reference_docs=references,
+            temporary_reference=claimed_temporary_reference,
+        )
+        claimed_temporary_reference = None
         await monitor_service.log_operation(
             db=db,
             module="v9_review",
@@ -478,10 +686,14 @@ async def upload(
                 "mine_type": mine_type,
                 "user_id": user_id,
                 "kb_id": kb_id,
+                "reference_doc_ids": selected_ids,
+                "temporary_reference_id": result.get("temporary_reference_id"),
+                "temporary_reference_name": result.get("temporary_reference_name"),
             },
         )
         return result
     except Exception as exc:
+        _cleanup_temporary_reference(claimed_temporary_reference)
         await monitor_service.log_operation(
             db=db,
             module="v9_review",
@@ -489,30 +701,83 @@ async def upload(
             status="failed",
             latency=time.perf_counter() - started,
             error_msg=str(exc),
-            metadata={"filename": file.filename, "mine_type": mine_type, "user_id": user_id, "kb_id": kb_id},
+            metadata={
+                "filename": file.filename,
+                "mine_type": mine_type,
+                "user_id": user_id,
+                "kb_id": kb_id,
+                "reference_doc_ids": _parse_reference_doc_ids(reference_doc_ids),
+                "temporary_reference_id": temporary_reference_id,
+            },
         )
         raise
 
 
 @router.get("/jobs")
-async def jobs(user_id: str = "guest", limit: int = 30, scope: str = "mine"):
-    """列出当前用户的待审文档历史。MongoDB 可用时读长期镜像，不可用时退回 SQLite。"""
-    query_user = None if scope == "all" else (user_id or "guest")[:80]
+async def jobs(
+    user_id: str = "guest",
+    limit: int = 30,
+    scope: str = "mine",
+    identity: dict = Depends(require_identity),
+):
+    """列出审查历史；仅管理员能读取全部用户记录。"""
+    requester_id = str(identity.get("sub") or "guest")[:80]
+    is_admin = str(identity.get("role") or "user").lower() == "admin"
+    normalized_scope = str(scope or "mine").lower()
+    if normalized_scope == "all" and not is_admin:
+        raise HTTPException(403, "仅管理员可以查看全部用户的审查历史")
+    # Never trust the query-string user_id for authorization. It remains in the
+    # signature only for compatibility with older frontends.
+    query_user = None if normalized_scope == "all" else requester_id
     rows = _queue.list_jobs(user_id=query_user, limit=limit)
     mongo_service.upsert_review_jobs(rows)
     mongo_items = None if scope == "all" else mongo_service.list_review_jobs(user_id=query_user or "guest", limit=limit)
     source_rows = mongo_items if mongo_items is not None else rows
     items = []
     for row in source_rows:
-        item = dict(row)
-        try:
-            item["timings"] = json.loads(item.get("timings") or "{}")
-        except json.JSONDecodeError:
+        item = _decode_job_reference_fields(dict(row))
+        timings = item.get("timings")
+        if isinstance(timings, str):
+            try:
+                item["timings"] = json.loads(timings or "{}")
+            except json.JSONDecodeError:
+                item["timings"] = {}
+        elif not isinstance(timings, dict):
             item["timings"] = {}
         item["issue_count"] = int(item.get("issue_count") or 0)
         item["decided_count"] = int(item.get("decided_count") or 0)
         items.append(item)
-    return {"items": items}
+    return {
+        "items": items,
+        "scope": "all" if query_user is None else "mine",
+        "requester_id": requester_id,
+    }
+
+
+@router.get("/typo-terms")
+async def get_typo_allow_terms(user_id: str = "guest"):
+    """Return one user's custom terms that are excluded from typo detection."""
+    normalized_user = (user_id or "guest")[:80]
+    terms = _queue.list_typo_allow_terms(normalized_user)
+    mongo_terms = mongo_service.get_typo_allow_terms(normalized_user)
+    if not terms and mongo_terms:
+        terms = _queue.replace_typo_allow_terms(normalized_user, mongo_terms)
+    return {"user_id": normalized_user, "terms": terms, "count": len(terms)}
+
+
+@router.put("/typo-terms")
+async def replace_typo_allow_terms(payload: TypoAllowTermsUpdate, user_id: str = "guest"):
+    """Replace one user's custom typo allowlist in SQLite and MongoDB."""
+    normalized_user = (user_id or "guest")[:80]
+    terms = _queue.replace_typo_allow_terms(normalized_user, payload.terms)
+    mongo_saved = mongo_service.replace_typo_allow_terms(normalized_user, terms)
+    return {
+        "ok": True,
+        "user_id": normalized_user,
+        "terms": terms,
+        "count": len(terms),
+        "mongodb": bool(mongo_saved),
+    }
 
 
 @router.get("/storage-health")
@@ -563,6 +828,7 @@ async def status(job_id: str):
             job["timings"] = json.loads(job.get("timings") or "{}")
         except json.JSONDecodeError:
             job["timings"] = {}
+    _decode_job_reference_fields(job)
     _sync_job_to_mongo(job_id)
     return job
 
@@ -576,30 +842,53 @@ async def cancel(job_id: str):
     if job["status"] in ("done", "failed", "cancelled"):
         return {"ok": True, "job_id": job_id, "status": job["status"]}
     ok = _queue.cancel_job(job_id)
+    if ok and job.get("status") == "pending":
+        _cleanup_job_temporary_reference(job)
     return {"ok": ok, "job_id": job_id, "status": "cancelled"}
 
 
 @router.post("/jobs/{job_id}/rerun")
-async def rerun_job(job_id: str, user_id: str = "guest", db: AsyncSession = Depends(get_db)):
+async def rerun_job(
+    job_id: str,
+    user_id: str = "guest",
+    reference_doc_ids: str | None = None,
+    temporary_reference_id: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
     """基于历史任务的原始审查副本重新创建一个 pending 任务。"""
     old = _queue.get_job(job_id)
     if not old:
         raise HTTPException(404, "任务不存在")
     kb_id = old.get("kb_id")
     await assert_kb_allowed(db, user_id, kb_id)
+    old_reference_ids = _decode_job_reference_fields(dict(old)).get("reference_doc_ids", [])
+    selected_ids = (
+        _parse_reference_doc_ids(reference_doc_ids)
+        if reference_doc_ids is not None
+        else old_reference_ids
+    )
+    references = await resolve_allowed_reference_documents(db, user_id, selected_ids)
     source_docx = Path(old["docx_path"])
     if not source_docx.exists():
         raise HTTPException(404, "历史任务的审查副本文档不存在，无法重新审查")
 
     new_job_id = uuid.uuid4().hex[:12]
-    _queue.create_job(
-        new_job_id,
-        doc_name=old.get("doc_name") or source_docx.name,
-        docx_path=str(source_docx),
-        mine_type=old.get("mine_type") or "non_outburst",
-        user_id=(user_id or old.get("user_id") or "guest")[:80],
-        kb_id=kb_id,
-    )
+    claimed_temporary_reference = _claim_temporary_reference(temporary_reference_id)
+    try:
+        _queue.create_job(
+            new_job_id,
+            doc_name=old.get("doc_name") or source_docx.name,
+            docx_path=str(source_docx),
+            mine_type=old.get("mine_type") or "non_outburst",
+            user_id=(user_id or old.get("user_id") or "guest")[:80],
+            kb_id=kb_id,
+            reference_doc_ids=[int(item["id"]) for item in references],
+            reference_docs=references,
+            temporary_reference=claimed_temporary_reference,
+        )
+    except Exception:
+        _cleanup_temporary_reference(claimed_temporary_reference)
+        raise
     old_preview = _WORK_DIR / f"{job_id}_preview.pdf"
     if old_preview.exists() and old_preview.stat().st_size > 0:
         shutil.copy2(old_preview, _WORK_DIR / f"{new_job_id}_preview.pdf")
@@ -610,6 +899,10 @@ async def rerun_job(job_id: str, user_id: str = "guest", db: AsyncSession = Depe
         "doc_name": old.get("doc_name") or source_docx.name,
         "status": "pending",
         "kb_id": kb_id,
+        "reference_doc_ids": [int(item["id"]) for item in references],
+        "reference_docs": references,
+        "temporary_reference_id": (claimed_temporary_reference or {}).get("reference_id"),
+        "temporary_reference_name": (claimed_temporary_reference or {}).get("name"),
     }
 
 
@@ -621,6 +914,10 @@ async def delete_job(job_id: str):
         raise HTTPException(404, "任务不存在")
     if job.get("status") not in ("done", "failed", "cancelled"):
         _queue.cancel_job(job_id, reason="用户删除任务")
+    # A running worker owns and removes its input in its finally block. Pending
+    # and terminal jobs can be cleaned synchronously here.
+    if job.get("status") not in ("parsing", "reviewing"):
+        _cleanup_job_temporary_reference(job)
     ok = _queue.delete_job(job_id)
     try:
         mongo_service.delete_review_job(job_id)
@@ -691,6 +988,11 @@ async def stream(job_id: str):
                     "phase_total": job.get("phase_total"),
                     "timings": timings,
                     "agent_status": job.get("agent_status"),
+                    "kb_id": job.get("kb_id"),
+                    "reference_doc_ids": _decode_job_reference_fields(dict(job)).get("reference_doc_ids", []),
+                    "reference_docs": _decode_job_reference_fields(dict(job)).get("reference_docs", []),
+                    "temporary_reference_id": job.get("temporary_reference_id"),
+                    "temporary_reference_name": job.get("temporary_reference_name"),
                     "paragraphs_ready": bool(job.get("paragraphs_path")),
                     "error": job.get("error"),
                 }}
@@ -910,9 +1212,7 @@ async def preview_pdf(job_id: str, refresh: int = 0, rebuild: int = 0):
 
     def _convert_to_cache() -> None:
         import importlib.util
-        import tempfile
-        import pythoncom
-        import win32com.client
+        import os
 
         wm_spec = importlib.util.spec_from_file_location(
             "word_modifier", settings.PROJECT_ROOT / "word_modifier.py"
@@ -921,7 +1221,14 @@ async def preview_pdf(job_id: str, refresh: int = 0, rebuild: int = 0):
         wm_spec.loader.exec_module(wm)
 
         docx_path = source
-        if source.suffix.lower() == ".doc":
+        temp_docx = None
+        # Windows uses Word COM to normalize legacy .doc files.  Linux must
+        # not import pywin32; LibreOffice can convert .doc directly below.
+        if source.suffix.lower() == ".doc" and os.name == "nt":
+            import tempfile
+            import pythoncom
+            import win32com.client
+
             temp_docx = Path(tempfile.mktemp(suffix=".docx"))
             pythoncom.CoInitialize()
             word = None
@@ -956,7 +1263,14 @@ async def preview_pdf(job_id: str, refresh: int = 0, rebuild: int = 0):
                 pythoncom.CoUninitialize()
             docx_path = temp_docx
 
-        pdf_bytes = wm.docx_to_pdf_bytes(docx_path)
+        try:
+            pdf_bytes = wm.docx_to_pdf_bytes(docx_path)
+        finally:
+            if temp_docx is not None:
+                try:
+                    temp_docx.unlink(missing_ok=True)
+                except Exception:
+                    pass
         if rebuild:
             try:
                 cache_pdf.unlink(missing_ok=True)

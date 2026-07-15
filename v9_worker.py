@@ -29,6 +29,7 @@ from docx import Document
 from openai import OpenAI
 
 import docx_adapter
+from llm_usage_tracker import TrackedOpenAI, UsageTracker, write_monitor_usage
 from review_queue import ReviewQueue
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -37,6 +38,9 @@ WORK_DIR = PROJECT_ROOT / "data" / "v9_web_work"      # 段落模型 / 工作副
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 FEEDBACK_SNAPSHOT_DIR = WORK_DIR / "feedback_snapshots"
 FEEDBACK_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+TEMPORARY_REFERENCE_UPLOAD_DIR = WORK_DIR / "temporary_references" / "uploads"
+TEMPORARY_REFERENCE_WORK_DIR = WORK_DIR / "temporary_references" / "worker"
+TEMPORARY_REFERENCE_WORK_DIR.mkdir(parents=True, exist_ok=True)
 DEMO_SKIP_RETRIEVAL = os.getenv("V9_DEMO_SKIP_RETRIEVAL", "0") == "1"
 DISABLE_ESCALATION_LOOP = os.getenv("V9_DISABLE_ESCALATION_LOOP", "0") == "1"
 USE_MINERU_FOR_PENDING = os.getenv("V9_USE_MINERU_FOR_PENDING", "1") != "0"
@@ -87,6 +91,18 @@ def _timings_json(timings: Dict[str, float]) -> str:
     )
 
 
+def _json_list(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
 def _compact_text(text: str) -> str:
     return re.sub(r"\s+", "", text or "")
 
@@ -105,6 +121,12 @@ class V9Worker:
             raise ValueError("请设置 DASHSCOPE_API_KEY")
         self.queue = ReviewQueue(QUEUE_DB)
         self.llm = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+        backend_dir = PROJECT_ROOT / "backend"
+        if str(backend_dir) not in sys.path:
+            sys.path.insert(0, str(backend_dir))
+        from app.services.llm_profile_service import llm_profile_service
+        self.llm_profile_service = llm_profile_service
+        self._llm_profile_snapshots: Dict[tuple, Dict[str, Any]] = {}
         self.engine = None
         if load_engine:
             log("加载 v9 引擎（BGE 模型 + KB 索引，仅一次）...")
@@ -297,6 +319,51 @@ class V9Worker:
         )
         return chunks
 
+    def _build_temporary_reference_chunks(
+        self,
+        job_id: str,
+        source_path: str,
+    ) -> List[Dict[str, Any]]:
+        """Parse a task-only reference into an isolated, disposable chunk set."""
+        from mineru_adapter import convert_document_to_mineru_json
+        from chapter_based_chunking_v6 import chunk_rule_json_files_v6
+
+        job_dir = TEMPORARY_REFERENCE_WORK_DIR / job_id
+        shutil.rmtree(job_dir, ignore_errors=True)
+        json_dir = job_dir / "json"
+        chunk_dir = job_dir / "chunks"
+        try:
+            result = convert_document_to_mineru_json(
+                source_path,
+                doc_kind="custom",
+                target_json_dir=json_dir,
+                mineru_work_dir=job_dir / "mineru",
+                api_url=MINERU_API_URL,
+                timeout=7200,
+            )
+            chunk_docs = chunk_rule_json_files_v6(
+                json_files=[Path(result.project_json_path)],
+                output_dir=chunk_dir,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"MinerU 解析临时参考文件失败: {exc}") from exc
+        chunks = next(iter(chunk_docs.values()), []) if chunk_docs else []
+        if not isinstance(chunks, list) or not chunks:
+            raise RuntimeError("临时参考文件没有生成可检索的法规分块")
+        return chunks
+
+    def _cleanup_temporary_reference(self, job: Dict[str, Any]) -> None:
+        """Delete the claimed upload and every task-local parsing artifact."""
+        path_text = str(job.get("temporary_reference_path") or "").strip()
+        if path_text:
+            try:
+                path = Path(path_text).resolve()
+                if path.is_file() and TEMPORARY_REFERENCE_UPLOAD_DIR.resolve() in path.parents:
+                    path.unlink(missing_ok=True)
+            except OSError as exc:
+                log(f"临时参考源文件清理失败（已忽略）: {exc}")
+        shutil.rmtree(TEMPORARY_REFERENCE_WORK_DIR / str(job.get("job_id") or ""), ignore_errors=True)
+
     def _persist_review_doc_vectors(
         self,
         job: Dict[str, Any],
@@ -341,6 +408,20 @@ class V9Worker:
             return True
         return False
 
+    def _active_llm_profile(self, user_id: str) -> Dict[str, Any]:
+        try:
+            return self.llm_profile_service.get_active_runtime_profile(user_id or "guest")
+        except Exception as exc:
+            log(f"读取用户模型配置失败，回退系统默认模型: {exc}")
+            return {
+                "id": "system-default",
+                "name": "系统默认模型",
+                "base_url": BASE_URL,
+                "model": AGENT_MODEL,
+                "api_key": API_KEY,
+                "is_system": True,
+            }
+
     def process_job(self, job: Dict[str, Any]):
         job_id = job["job_id"]
         docx_path = job["docx_path"]
@@ -348,7 +429,62 @@ class V9Worker:
         log(f"开始审查任务 {job_id}: {job['doc_name']}")
         timings: Dict[str, float] = {}
         job_started = time.perf_counter()
+        usage_tracker = None
+        reference_doc_names: List[str] = []
         try:
+            llm_profile = self._active_llm_profile(job.get("user_id") or "guest")
+            usage_tracker = UsageTracker()
+            profile_key = (
+                str(job.get("user_id") or "guest"),
+                str(llm_profile["id"]),
+            )
+            self._llm_profile_snapshots[profile_key] = dict(llm_profile)
+            reference_docs = _json_list(job.get("reference_docs"))
+            reference_doc_names = [
+                str(item.get("name") or "").strip()
+                for item in reference_docs
+                if isinstance(item, dict) and str(item.get("name") or "").strip()
+            ]
+            self.engine.clear_temporary_reference()
+            try:
+                self.engine.set_reference_documents(reference_doc_names, mine_type=mine_type)
+            except ValueError as scope_exc:
+                if "尚未进入 v9 规程索引" not in str(scope_exc):
+                    raise
+                log("检测到新入库规程，正在刷新常驻 BGE 知识库索引…")
+                self.engine.load_knowledge_base()
+                self.engine.build_index()
+                self.engine.set_reference_documents(reference_doc_names, mine_type=mine_type)
+            log(
+                f"任务 {job_id} 参考规程: "
+                + ("、".join(reference_doc_names) if reference_doc_names else "全部规程（兼容模式）")
+            )
+            self.engine.configure_llm(
+                api_key=llm_profile.get("api_key", ""),
+                base_url=llm_profile["base_url"],
+                model=llm_profile["model"],
+                user_id=job.get("user_id") or "guest",
+                profile_id=llm_profile["id"],
+                profile_name=llm_profile["name"],
+                usage_tracker=usage_tracker,
+            )
+            job.update({
+                "llm_profile_id": llm_profile["id"],
+                "llm_profile_name": llm_profile["name"],
+                "llm_model": llm_profile["model"],
+                "llm_base_url": llm_profile["base_url"],
+            })
+            self.queue.update_job(
+                job_id,
+                llm_profile_id=llm_profile["id"],
+                llm_profile_name=llm_profile["name"],
+                llm_model=llm_profile["model"],
+                llm_base_url=llm_profile["base_url"],
+            )
+            log(
+                f"任务 {job_id} 使用模型配置「{llm_profile['name']}」: "
+                f"{llm_profile['model']} @ {llm_profile['base_url']}"
+            )
             parse_started = time.perf_counter()
             self.queue.update_job(
                 job_id,
@@ -374,6 +510,14 @@ class V9Worker:
                 chunks = self._build_pending_chunks_with_mineru(docx_path, parsed, docx_chunks)
             else:
                 chunks = docx_chunks
+            typo_allow_terms = self.queue.list_typo_allow_terms(job.get("user_id") or "guest")
+            if typo_allow_terms:
+                for chunk in chunks:
+                    chunk["typo_allow_terms"] = typo_allow_terms
+                log(
+                    f"任务 {job_id} 已加载用户术语屏蔽表: "
+                    f"{len(typo_allow_terms)} 项"
+                )
             timings["parse"] = time.perf_counter() - parse_started
             if self._stop_if_cancelled(job_id, "文档解析后"):
                 return
@@ -390,6 +534,31 @@ class V9Worker:
 
             engine = self.engine
             engine.mine_type = mine_type  # 适用性过滤按本任务矿井类型
+            temporary_reference_path = str(job.get("temporary_reference_path") or "").strip()
+            if temporary_reference_path:
+                temporary_started = time.perf_counter()
+                temporary_name = str(job.get("temporary_reference_name") or Path(temporary_reference_path).name)
+                self.queue.update_job(
+                    job_id,
+                    agent_stage="temporary_reference",
+                    phase_done=0,
+                    phase_total=0,
+                    agent_status=f"正在解析并向量化一次性参考文件：{temporary_name}",
+                    timings=_timings_json(timings),
+                )
+                temporary_chunks = self._build_temporary_reference_chunks(
+                    job_id,
+                    temporary_reference_path,
+                )
+                temporary_count = engine.add_temporary_reference_chunks(
+                    temporary_name,
+                    temporary_chunks,
+                )
+                timings["temporary_reference"] = time.perf_counter() - temporary_started
+                log(
+                    f"任务 {job_id} 一次性参考就绪: {temporary_name}，"
+                    f"{temporary_count} 条，耗时 {timings['temporary_reference']:.1f}s"
+                )
             if DEMO_SKIP_RETRIEVAL:
                 retrieval_started = time.perf_counter()
                 self.queue.update_job(
@@ -661,6 +830,46 @@ class V9Worker:
                                   agent_stage="failed",
                                   timings=_timings_json(timings),
                                   agent_status=f"审查失败: {str(exc)[:80]}")
+        finally:
+            if usage_tracker is not None:
+                try:
+                    final_job = self.queue.get_job(job_id) or job
+                    final_status = str(final_job.get("status") or "failed")
+                    write_monitor_usage(
+                        usage_tracker,
+                        module="v9_review",
+                        operation="review_job",
+                        status=("success" if final_status == "done" else "failed"),
+                        latency=time.perf_counter() - job_started,
+                        error_msg=str(final_job.get("error") or ""),
+                        metadata={
+                            "job_id": job_id,
+                            "doc_name": job.get("doc_name", ""),
+                            "user_id": job.get("user_id") or "guest",
+                            "job_status": final_status,
+                            "llm_profile_id": job.get("llm_profile_id", ""),
+                            "llm_profile_name": job.get("llm_profile_name", ""),
+                            "llm_model": job.get("llm_model", ""),
+                            "llm_base_url": job.get("llm_base_url", ""),
+                            "reference_doc_ids": _json_list(job.get("reference_doc_ids")),
+                            "reference_doc_names": reference_doc_names,
+                            "temporary_reference_id": job.get("temporary_reference_id"),
+                            "temporary_reference_name": job.get("temporary_reference_name"),
+                        },
+                    )
+                    usage = usage_tracker.snapshot()
+                    log(
+                        f"任务 {job_id} Token 用量: 输入 {usage['prompt_tokens']}, "
+                        f"输出 {usage['completion_tokens']}, 总计 {usage['total_tokens']}, "
+                        f"调用 {usage['calls']} 次"
+                    )
+                except Exception as monitor_exc:
+                    log(f"任务 {job_id} Token 用量写入监控失败: {monitor_exc}")
+            try:
+                if self.engine is not None:
+                    self.engine.clear_temporary_reference()
+            finally:
+                self._cleanup_temporary_reference(job)
 
     def _review_one_chunk(self, job_id: str, doc_name: str, idx: int, chunk: Dict,
                           kb_results: List[Dict], parsed: Dict, source_blocks: List[int]) -> int:
@@ -758,9 +967,43 @@ class V9Worker:
             return
 
         # 主智能体根据 原文 + 系统建议 + 人工意见 产出最终替换文本
-        new_text = self._agent_decide_replacement(
-            original, fb.get("suggestion", ""), fb.get("human_text", ""), action
+        llm_profile = self._active_llm_profile(job.get("user_id") or "guest")
+        feedback_usage = UsageTracker()
+        feedback_started = time.perf_counter()
+        feedback_client = TrackedOpenAI(
+            tracker=feedback_usage,
+            api_key=llm_profile.get("api_key") or "local-no-key",
+            base_url=llm_profile["base_url"],
+            timeout=120,
+            max_retries=0,
         )
+        new_text = self._agent_decide_replacement(
+            original,
+            fb.get("suggestion", ""),
+            fb.get("human_text", ""),
+            action,
+            llm_client=feedback_client,
+            llm_model=llm_profile["model"],
+        )
+        try:
+            write_monitor_usage(
+                feedback_usage,
+                module="v9_review",
+                operation="review_feedback",
+                status="success",
+                latency=time.perf_counter() - feedback_started,
+                metadata={
+                    "job_id": job_id,
+                    "issue_id": issue_id,
+                    "user_id": job.get("user_id") or "guest",
+                    "llm_profile_id": llm_profile["id"],
+                    "llm_profile_name": llm_profile["name"],
+                    "llm_model": llm_profile["model"],
+                    "llm_base_url": llm_profile["base_url"],
+                },
+            )
+        except Exception as monitor_exc:
+            log(f"反馈 issue#{issue_id} Token 用量写入监控失败: {monitor_exc}")
         if not new_text or new_text.strip() == original.strip():
             self.queue.finish_feedback(issue_id, applied=2,
                                        agent_note="主智能体判定无需改写或替换文本为空")
@@ -830,7 +1073,8 @@ class V9Worker:
                                        agent_note="未能在文档中定位原文，改写失败")
 
     def _agent_decide_replacement(self, original: str, suggestion: str,
-                                  human_text: str, action: str) -> str:
+                                  human_text: str, action: str,
+                                  llm_client=None, llm_model: str = "") -> str:
         """主智能体直接产出替换文本（只输出替换后的原文片段）。"""
         human_part = f"\n【人工意见】{human_text}" if human_text else ""
         guidance = ("人工接受系统建议，请据此给出替换文本。" if action == "accept"
@@ -847,8 +1091,9 @@ class V9Worker:
 只输出"替换原文片段后的最终文本"，不要解释、不要引号、不要前后缀。
 若判断无需修改，原样输出原文片段。"""
         try:
-            resp = self.llm.chat.completions.create(
-                model=AGENT_MODEL,
+            client = llm_client or self.llm
+            resp = client.chat.completions.create(
+                model=llm_model or AGENT_MODEL,
                 messages=[
                     {"role": "system", "content": "你只输出替换后的文本，不输出任何解释。"},
                     {"role": "user", "content": prompt},
@@ -893,7 +1138,63 @@ class V9Worker:
                     time.sleep(POLL_INTERVAL * 2)
                     continue
                 dead_logged = False
+                pending_items = self.queue.list_items(status="pending", limit=1)
+                if not pending_items:
+                    time.sleep(POLL_INTERVAL * 2)
+                    continue
+                payload = pending_items[0].get("payload") or {}
+                escalation_user = payload.get("llm_user_id") or "guest"
+                escalation_profile_id = payload.get("llm_profile_id") or "system-default"
+                profile_key = (str(escalation_user), str(escalation_profile_id))
+                escalation_profile = self._llm_profile_snapshots.get(profile_key)
+                if escalation_profile is None:
+                    try:
+                        escalation_profile = self.llm_profile_service.get_runtime_profile(
+                            escalation_user, escalation_profile_id
+                        )
+                    except Exception as exc:
+                        log(
+                            f"升级项模型快照不可用，回退系统默认模型: {exc}"
+                        )
+                        escalation_profile = self.llm_profile_service.get_runtime_profile(
+                            escalation_user, "system-default"
+                        )
+                escalation_usage = UsageTracker()
+                escalation_started = time.perf_counter()
+                agent.configure_llm(
+                    api_key=escalation_profile.get("api_key", ""),
+                    base_url=escalation_profile["base_url"],
+                    model=escalation_profile["model"],
+                    usage_tracker=escalation_usage,
+                )
+                log(
+                    f"升级项 #{pending_items[0]['id']} 使用模型配置"
+                    f"「{escalation_profile['name']}」: {escalation_profile['model']}"
+                )
                 stats = agent.process_queue(max_items=1)
+                try:
+                    write_monitor_usage(
+                        escalation_usage,
+                        module="v9_review",
+                        operation="review_escalation",
+                        status=("failed" if stats.get("failed") else "success"),
+                        latency=time.perf_counter() - escalation_started,
+                        metadata={
+                            "escalation_id": pending_items[0]["id"],
+                            "doc_name": pending_items[0].get("doc_name", ""),
+                            "chunk_index": pending_items[0].get("chunk_index"),
+                            "user_id": escalation_user,
+                            "llm_profile_id": escalation_profile["id"],
+                            "llm_profile_name": escalation_profile["name"],
+                            "llm_model": escalation_profile["model"],
+                            "llm_base_url": escalation_profile["base_url"],
+                        },
+                    )
+                except Exception as monitor_exc:
+                    log(
+                        f"升级项 #{pending_items[0]['id']} Token 用量写入监控失败: "
+                        f"{monitor_exc}"
+                    )
                 if not stats.get("resolved") and not stats.get("failed"):
                     time.sleep(POLL_INTERVAL * 2)
             except Exception as exc:

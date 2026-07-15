@@ -221,8 +221,17 @@ class MonitorService:
         result = await db.execute(query)
         logs = result.scalars().all()
 
-        return [
-            {
+        items = []
+        for log in logs:
+            metadata = {}
+            if log.extra_data:
+                try:
+                    parsed = json.loads(log.extra_data)
+                    if isinstance(parsed, dict):
+                        metadata = parsed
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+            items.append({
                 "id": log.id,
                 "module": log.module,
                 "operation": log.operation,
@@ -231,9 +240,13 @@ class MonitorService:
                 "latency": log.latency,
                 "cost": log.cost,
                 "timestamp": log.timestamp.isoformat(),
-                "error_msg": log.error_msg
-            }
-            for log in logs
-        ]
+                "error_msg": log.error_msg,
+                "metadata": metadata,
+                "prompt_tokens": int(metadata.get("prompt_tokens") or 0),
+                "completion_tokens": int(metadata.get("completion_tokens") or 0),
+                "llm_calls": int(metadata.get("calls") or 0),
+                "usage_source": metadata.get("usage_source", ""),
+            })
+        return items
 
 monitor_service = MonitorService()

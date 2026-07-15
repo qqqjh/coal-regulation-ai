@@ -35,6 +35,7 @@ import pickle
 import re
 import threading
 import time
+import unicodedata
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -42,9 +43,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from openai import OpenAI
 
 import numeric_compare
+from llm_usage_tracker import TrackedOpenAI, UsageTracker
 from review_queue import (
     ReviewQueue, ESC_DISAGREEMENT, ESC_NUMERIC_CONFLICT,
     ESC_LOW_CONFIDENCE, ESC_ERROR, ESC_COUNTER_CHECK,
@@ -140,6 +141,15 @@ def tag_applicability(chunk: Dict, doc_name: str) -> str:
     return "general"
 
 
+def normalize_reference_doc_name(value: str) -> str:
+    """Match database filenames such as ``煤矿安全规程.pdf`` to KB JSON keys."""
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    suffix = Path(text).suffix.lower()
+    if suffix in {".pdf", ".doc", ".docx", ".txt", ".json"}:
+        text = text[:-len(suffix)]
+    return re.sub(r"\s+", "", text).casefold()
+
+
 class FatalAPIError(Exception):
     """账户欠费等不可恢复错误，全局停止后续LLM调用。"""
 
@@ -231,7 +241,14 @@ def _top_indices(scores: np.ndarray, top_k: int) -> List[int]:
 
 
 def _dense_search(query_vector: np.ndarray, document_vectors: np.ndarray,
-                  top_k: int) -> List[Tuple[int, float]]:
+                  top_k: int,
+                  allowed_indices: Optional[Sequence[int]] = None) -> List[Tuple[int, float]]:
+    if allowed_indices is not None:
+        allowed = np.asarray(list(allowed_indices), dtype=np.int64)
+        if allowed.size == 0:
+            return []
+        scores = document_vectors[allowed] @ query_vector
+        return [(int(allowed[idx]), float(scores[idx])) for idx in _top_indices(scores, top_k)]
     scores = document_vectors @ query_vector
     return [(idx, float(scores[idx])) for idx in _top_indices(scores, top_k)]
 
@@ -246,10 +263,14 @@ def _build_sparse_postings(document_weights: Sequence[Dict[str, float]]) -> Dict
 
 def _sparse_search(query_weights: Dict[str, float],
                    postings: Dict[str, List[Tuple[int, float]]],
-                   document_count: int, top_k: int) -> List[Tuple[int, float]]:
+                   document_count: int, top_k: int,
+                   allowed_indices: Optional[Sequence[int]] = None) -> List[Tuple[int, float]]:
     scores = np.zeros(document_count, dtype=np.float32)
+    allowed_set = set(allowed_indices) if allowed_indices is not None else None
     for token_id, q_weight in query_weights.items():
         for doc_idx, d_weight in postings.get(str(token_id), ()):
+            if allowed_set is not None and doc_idx not in allowed_set:
+                continue
             scores[doc_idx] += float(q_weight) * d_weight
     return [(idx, float(scores[idx])) for idx in _top_indices(scores, top_k) if scores[idx] > 0]
 
@@ -398,7 +419,18 @@ class HybridRAGReviewerV9:
     def __init__(self, mine_type: str = MINE_TYPE):
         if not API_KEY:
             raise ValueError("请设置环境变量 DASHSCOPE_API_KEY")
-        self.llm_client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+        self.usage_tracker = UsageTracker()
+        self.llm_client = TrackedOpenAI(
+            tracker=self.usage_tracker,
+            api_key=API_KEY,
+            base_url=BASE_URL,
+        )
+        self.llm_model = QWEN_MODEL
+        self.llm_profile_meta: Dict[str, str] = {
+            "user_id": "guest",
+            "profile_id": "system-default",
+            "profile_name": "系统默认模型",
+        }
         self.retriever = LocalBGERetriever()
         self.queue = ReviewQueue(QUEUE_DB)
         self.mine_type = mine_type
@@ -409,10 +441,46 @@ class HybridRAGReviewerV9:
         self.kb_postings: Optional[Dict[str, List[Tuple[int, float]]]] = None
         self.kb_json_path: Optional[Path] = None
         self.excluded_outburst_count = 0
+        self.reference_doc_names: List[str] = []
+        self._active_kb_indices: Optional[List[int]] = None
+        self._loaded_doc_names: List[str] = []
+        self._base_kb_count = 0
+        self._base_kb_dense: Optional[np.ndarray] = None
+        self._base_kb_postings: Optional[Dict[str, List[Tuple[int, float]]]] = None
 
         self._llm_semaphore = threading.Semaphore(LLM_MAX_CONCURRENCY)
         self._fatal = threading.Event()
         self._print_lock = threading.Lock()
+
+    def configure_llm(
+        self,
+        *,
+        api_key: str,
+        base_url: str,
+        model: str,
+        user_id: str = "guest",
+        profile_id: str = "system-default",
+        profile_name: str = "系统默认模型",
+        usage_tracker: Optional[UsageTracker] = None,
+    ) -> None:
+        """Switch the OpenAI-compatible review model for the next job."""
+        if not base_url or not model:
+            raise ValueError("模型 Base URL 和模型名称不能为空")
+        self.usage_tracker = usage_tracker or UsageTracker()
+        self.llm_client = TrackedOpenAI(
+            tracker=self.usage_tracker,
+            api_key=api_key or "local-no-key",
+            base_url=base_url,
+            timeout=120,
+            max_retries=0,
+        )
+        self.llm_model = model
+        self.llm_profile_meta = {
+            "user_id": str(user_id or "guest")[:100],
+            "profile_id": str(profile_id or "system-default")[:100],
+            "profile_name": str(profile_name or "")[:100],
+        }
+        self._fatal.clear()
 
     # ============ LLM 调用（信号量限流 + 致命错误熔断） ============
 
@@ -425,7 +493,7 @@ class HybridRAGReviewerV9:
             try:
                 with self._llm_semaphore:
                     kwargs: Dict[str, Any] = dict(
-                        model=QWEN_MODEL, messages=messages, temperature=temperature
+                        model=self.llm_model, messages=messages, temperature=temperature
                     )
                     if max_tokens:
                         kwargs["max_tokens"] = max_tokens
@@ -468,6 +536,13 @@ class HybridRAGReviewerV9:
         with open(kb_json_path, "r", encoding="utf-8") as f:
             kb_data = json.load(f)
 
+        self.kb_chunks = []
+        self.kb_texts = []
+        self._base_kb_count = 0
+        self._base_kb_dense = None
+        self._base_kb_postings = None
+        self.excluded_outburst_count = 0
+        self._loaded_doc_names = list(kb_data.keys())
         chunk_id = 0
         total = 0
         for doc_name, chunks in kb_data.items():
@@ -476,33 +551,135 @@ class HybridRAGReviewerV9:
                     continue
                 total += 1
                 applicability = tag_applicability(chunk, doc_name)
-                if self.mine_type == "non_outburst" and applicability == "outburst_only":
-                    self.excluded_outburst_count += 1
-                    continue
                 chunk["id"] = f"kb_{chunk_id}"
                 chunk["doc_name"] = doc_name
                 chunk["applicability"] = applicability
                 chunk_id += 1
                 self.kb_chunks.append(chunk)
                 self.kb_texts.append(chunk.get("retrieval_text") or chunk["content"])
-        print(f"  可检索chunks: {len(self.kb_chunks)} / {total}"
-              f"（适用性过滤排除突出矿井专用 {self.excluded_outburst_count} 条，"
-              f"矿井类型: {self.mine_type}）")
+        self.set_reference_documents([], mine_type=self.mine_type)
+        print(f"  已加载chunks: {len(self.kb_chunks)} / {total}；"
+              f"当前可检索 {len(self._active_kb_indices or [])} 条")
+
+    def set_reference_documents(
+        self,
+        doc_names: Optional[Sequence[str]],
+        mine_type: Optional[str] = None,
+    ) -> None:
+        """Restrict subsequent recall/rerank to one task's selected regulations."""
+        if mine_type:
+            self.mine_type = mine_type
+        requested = [str(name).strip() for name in (doc_names or []) if str(name).strip()]
+        requested_keys = {normalize_reference_doc_name(name) for name in requested}
+        loaded_keys = {normalize_reference_doc_name(name) for name in self._loaded_doc_names}
+        missing = requested_keys - loaded_keys
+        if missing:
+            missing_names = [name for name in requested if normalize_reference_doc_name(name) in missing]
+            raise ValueError("所选参考规程尚未进入 v9 规程索引：" + "、".join(missing_names))
+
+        active = []
+        excluded = 0
+        for idx, chunk in enumerate(self.kb_chunks):
+            if requested_keys and normalize_reference_doc_name(chunk.get("doc_name", "")) not in requested_keys:
+                continue
+            if self.mine_type == "non_outburst" and chunk.get("applicability") == "outburst_only":
+                excluded += 1
+                continue
+            active.append(idx)
+        if requested_keys and not active:
+            raise ValueError("所选参考规程在当前矿井类型下没有可检索条款")
+        self.reference_doc_names = requested
+        self.excluded_outburst_count = excluded
+        self._active_kb_indices = active
+        scope = "、".join(requested) if requested else "全部规程"
+        print(
+            f"  本次参考范围: {scope}；可检索 {len(active)} 条"
+            f"（适用性过滤 {excluded} 条，矿井类型: {self.mine_type}）"
+        )
 
     def build_index(self):
         source_hash = hashlib.sha256(self.kb_json_path.read_bytes()).hexdigest()[:16]
         cache_key = f"kb_{source_hash}_{self.mine_type}"
         self.kb_dense, kb_lexical = self.retriever.encode_corpus_cached(self.kb_texts, cache_key)
         self.kb_postings = _build_sparse_postings(kb_lexical)
+        self._base_kb_count = len(self.kb_chunks)
+        self._base_kb_dense = self.kb_dense
+        self._base_kb_postings = self.kb_postings
         print(f"  索引就绪: dense {self.kb_dense.shape}, sparse postings {len(self.kb_postings)} tokens")
+
+    def clear_temporary_reference(self) -> None:
+        """Remove task-scoped chunks/vectors and restore the persistent KB index."""
+        if self._base_kb_count <= 0:
+            return
+        self.kb_chunks = self.kb_chunks[:self._base_kb_count]
+        self.kb_texts = self.kb_texts[:self._base_kb_count]
+        self.kb_dense = self._base_kb_dense
+        self.kb_postings = self._base_kb_postings
+        if self._active_kb_indices is not None:
+            self._active_kb_indices = [
+                idx for idx in self._active_kb_indices if idx < self._base_kb_count
+            ]
+
+    def add_temporary_reference_chunks(self, doc_name: str, chunks: Sequence[Dict]) -> int:
+        """Encode one task-only reference in memory without changing the KB cache."""
+        self.clear_temporary_reference()
+        if self._base_kb_count <= 0 or self._base_kb_dense is None or self._base_kb_postings is None:
+            raise RuntimeError("知识库索引尚未初始化")
+
+        display_name = f"临时参考：{Path(doc_name or '未命名文件').stem}"
+        prepared: List[Dict] = []
+        texts: List[str] = []
+        for source in chunks:
+            if source.get("retrievable", True) is False:
+                continue
+            chunk = dict(source)
+            applicability = tag_applicability(chunk, display_name)
+            if self.mine_type == "non_outburst" and applicability == "outburst_only":
+                continue
+            content = str(chunk.get("content") or "").strip()
+            retrieval_text = str(chunk.get("retrieval_text") or content).strip()
+            if not retrieval_text:
+                continue
+            chunk["id"] = f"temporary_{len(prepared)}"
+            chunk["doc_name"] = display_name
+            chunk["applicability"] = applicability
+            chunk["temporary_reference"] = True
+            prepared.append(chunk)
+            texts.append(retrieval_text)
+        if not prepared:
+            raise ValueError("临时参考文件没有可检索的正文内容")
+
+        temporary_dense, temporary_lexical = self.retriever.encode(texts)
+        offset = self._base_kb_count
+        self.kb_chunks.extend(prepared)
+        self.kb_texts.extend(texts)
+        self.kb_dense = np.vstack((self._base_kb_dense, temporary_dense)).astype(np.float32)
+        combined: Dict[str, List[Tuple[int, float]]] = defaultdict(list)
+        for token_id, rows in self._base_kb_postings.items():
+            combined[str(token_id)].extend(rows)
+        for local_idx, weights in enumerate(temporary_lexical):
+            for token_id, weight in weights.items():
+                combined[str(token_id)].append((offset + local_idx, float(weight)))
+        self.kb_postings = combined
+        active = list(self._active_kb_indices or [])
+        active.extend(range(offset, offset + len(prepared)))
+        self._active_kb_indices = active
+        print(f"  已加入一次性临时参考: {display_name}（{len(prepared)} 条，仅当前任务）")
+        return len(prepared)
 
     # ============ 检索（Phase A 预计算） ============
 
     def _recall_union(self, query_dense: np.ndarray, query_lex: Dict[str, float],
                       pool: int) -> List[int]:
         """dense/sparse/RRF 三路召回取并集，返回KB索引列表。"""
-        dense = _dense_search(query_dense, self.kb_dense, pool)
-        sparse = _sparse_search(query_lex, self.kb_postings, len(self.kb_chunks), pool)
+        dense = _dense_search(query_dense, self.kb_dense, pool, self._active_kb_indices)
+        sparse = _sparse_search(
+            query_lex,
+            self.kb_postings,
+            len(self.kb_chunks),
+            pool,
+            self._active_kb_indices,
+        )
         hybrid = _rrf_hybrid(dense, sparse, pool)
         union: Dict[int, None] = {}
         for rows in (dense, sparse, hybrid):
@@ -937,7 +1114,7 @@ D. 误差/偏差/公差
                 break
             with self._llm_semaphore:
                 checks.append(numeric_compare.numeric_check(
-                    self.llm_client, QWEN_MODEL, pending_text, rule_text
+                    self.llm_client, self.llm_model, pending_text, rule_text
                 ))
         return checks
 
@@ -984,7 +1161,7 @@ D. 误差/偏差/公差
                     "summary": "检索到的法规中无数值句"}
         with self._llm_semaphore:
             return numeric_compare.numeric_check(
-                self.llm_client, QWEN_MODEL,
+                self.llm_client, self.llm_model,
                 pending_chunk["content"][:1500], "\n".join(parts)
             )
 
@@ -1286,18 +1463,65 @@ confidence 说明：高=确定是错别字；中=可能是错别字但有一定�
         except Exception:
             return True
 
+    @staticmethod
+    def _normalize_allow_text(value: Any) -> str:
+        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or ""))).casefold()
+
+    @classmethod
+    def _is_typo_allowlisted(
+        cls,
+        issue: Dict[str, Any],
+        allow_terms: Sequence[str],
+        content: str,
+    ) -> bool:
+        """Deterministically suppress candidates covered by a user's term allowlist."""
+        wrong = cls._normalize_allow_text(
+            issue.get("wrong_char") or issue.get("original") or ""
+        )
+        if not wrong:
+            return False
+        context = cls._normalize_allow_text(issue.get("context") or content)
+        for raw_term in allow_terms:
+            term = cls._normalize_allow_text(raw_term)
+            if not term:
+                continue
+            if wrong == term or term in wrong:
+                return True
+            if wrong in term and term in context:
+                return True
+        return False
+
     def check_typos(self, pending_chunk: Dict) -> Dict:
         content = pending_chunk.get("content", "").strip()
         default = {"has_issues": False, "issues": [], "summary": "未发现错别字"}
         if len(content) < TYPO_MIN_CHUNK_LEN:
             return default
 
+        allow_terms = [
+            str(term).strip()
+            for term in (pending_chunk.get("typo_allow_terms") or [])
+            if str(term).strip()
+        ]
+        normalized_content = self._normalize_allow_text(content)
+        relevant_allow_terms = [
+            term for term in allow_terms
+            if self._normalize_allow_text(term) in normalized_content
+        ]
+        system_prompt = self.TYPO_SYSTEM_PROMPT
+        if relevant_allow_terms:
+            allowlist_text = "、".join(relevant_allow_terms[:200])
+            system_prompt += (
+                "\n\n用户自定义术语屏蔽表（最高优先级）：\n"
+                f"{allowlist_text}\n"
+                "上述术语及其内部字符均为用户认可的专有名词或内部惯用语，"
+                "不得报告为错别字、术语错误或用词错误。"
+            )
         user_msg = f"请检查以下文本中的错别字：\n\n{content}"
         last_error = ""
         for attempt in range(3):
             try:
                 raw = self._strip_json_fence(self._chat(
-                    [{"role": "system", "content": self.TYPO_SYSTEM_PROMPT},
+                    [{"role": "system", "content": system_prompt},
                      {"role": "user", "content": user_msg}],
                     temperature=0.0,
                 ))
@@ -1315,6 +1539,7 @@ confidence 说明：高=确定是错别字；中=可能是错别字但有一定�
                     and item.get("wrong_char", "").strip() != item.get("correct_char", "").strip()
                     and not any(kw in item.get("correct_char", "") for kw in skip_keywords)
                     and not any(kw in item.get("reason", "") for kw in skip_keywords)
+                    and not self._is_typo_allowlisted(item, allow_terms, content)
                 ]
                 filtered = [item for item in filtered if self._verify_typo_issue(item)]
                 issues = [
@@ -1526,6 +1751,11 @@ confidence 说明：高=确定是错别字；中=可能是错别字但有一定�
                          "score": r["score"]}
                         for r in kb_results
                     ],
+                    # Keep only non-secret identity metadata so the asynchronous
+                    # escalation reviewer can restore this job's model snapshot.
+                    "llm_user_id": self.llm_profile_meta["user_id"],
+                    "llm_profile_id": self.llm_profile_meta["profile_id"],
+                    "llm_profile_name": self.llm_profile_meta["profile_name"],
                 },
                 dedupe_key=f"{doc_name}#{chunk_index}#{esc['type']}",
             )

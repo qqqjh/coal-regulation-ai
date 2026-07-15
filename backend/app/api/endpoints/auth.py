@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
+from app.core.auth_token import create_access_token
 from app.services.auth_service import authenticate_user, register_user, serialize_user
 
 router = APIRouter()
@@ -22,7 +23,12 @@ class RegisterPayload(BaseModel):
 @router.post("/login")
 async def login(payload: LoginPayload, db: AsyncSession = Depends(get_db)):
     user = await authenticate_user(db, payload.username, payload.password)
-    return {"user": serialize_user(user)}
+    serialized = serialize_user(user)
+    return {
+        "user": serialized,
+        "access_token": create_access_token(serialized["id"], serialized["role"]),
+        "token_type": "bearer",
+    }
 
 
 @router.post("/register")
@@ -33,4 +39,9 @@ async def register(payload: RegisterPayload, db: AsyncSession = Depends(get_db))
         password=payload.password,
         display_name=payload.display_name,
     )
-    return {"user": serialize_user(user)}
+    serialized = serialize_user(user)
+    return {
+        "user": serialized,
+        "access_token": create_access_token(serialized["id"], serialized["role"]),
+        "token_type": "bearer",
+    }

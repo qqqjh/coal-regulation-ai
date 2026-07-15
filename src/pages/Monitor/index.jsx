@@ -11,6 +11,7 @@ import {
   Tag,
   Button,
   Empty,
+  Tooltip as AntTooltip,
   message,
 } from 'antd'
 import {
@@ -53,6 +54,23 @@ const MODULE_META = {
 const STATUS_META = {
   success: { label: '成功', color: 'success' },
   failed: { label: '失败', color: 'error' },
+}
+
+const NON_MODEL_OPERATIONS = new Set([
+  'preprocess',
+  'start_review',
+  'upload_and_start',
+  'upload',
+  'download',
+])
+
+const OPERATION_LABELS = {
+  review_job: '模型审查（真实 Usage）',
+  review_feedback: '人工反馈改写',
+  review_escalation: '争议项升级复核',
+  preprocess: '文档预处理',
+  start_review: '启动审查任务',
+  upload_and_start: '上传并启动审查',
 }
 
 function moduleMeta(module) {
@@ -181,6 +199,9 @@ const Monitor = () => {
         tokens: Number(item.tokens || 0),
         latency: Number(item.latency || 0),
         cost: Number(item.cost || 0),
+        prompt_tokens: Number(item.prompt_tokens || 0),
+        completion_tokens: Number(item.completion_tokens || 0),
+        llm_calls: Number(item.llm_calls || 0),
       })))
     } catch (error) {
       message.error(`加载用量监控失败：${error.message}`)
@@ -234,6 +255,7 @@ const Monitor = () => {
       key: 'operation',
       width: 150,
       ellipsis: true,
+      render: (value) => OPERATION_LABELS[value] || value,
     },
     {
       title: 'Token消耗',
@@ -242,7 +264,27 @@ const Monitor = () => {
       width: 120,
       align: 'right',
       sorter: (a, b) => a.tokens - b.tokens,
-      render: formatNumber,
+      render: (value, record) => {
+        if (record.usage_source === 'provider') {
+          const detail = [
+            `输入 ${formatNumber(record.prompt_tokens)}`,
+            `输出 ${formatNumber(record.completion_tokens)}`,
+            `模型请求 ${formatNumber(record.llm_calls)} 次`,
+          ].join(' · ')
+          return (
+            <AntTooltip title={detail}>
+              <strong>{formatNumber(value)}</strong>
+            </AntTooltip>
+          )
+        }
+        if (record.usage_source === 'provider_unavailable') {
+          return <AntTooltip title="该 OpenAI 兼容服务未在响应中返回 usage">未返回</AntTooltip>
+        }
+        if (NON_MODEL_OPERATIONS.has(record.operation)) {
+          return <AntTooltip title="该操作不调用大模型，不产生 Token">—</AntTooltip>
+        }
+        return formatNumber(value)
+      },
     },
     {
       title: '响应时间',
@@ -259,7 +301,13 @@ const Monitor = () => {
       key: 'cost',
       width: 100,
       align: 'right',
-      render: (value) => `$${Number(value || 0).toFixed(4)}`,
+      render: (value, record) => {
+        if (NON_MODEL_OPERATIONS.has(record.operation)) return '—'
+        if (record.usage_source === 'provider' && !record.metadata?.cost_calculated) {
+          return <AntTooltip title="需为模型配置输入/输出单价后才能计算">未配置</AntTooltip>
+        }
+        return `$${Number(value || 0).toFixed(4)}`
+      },
     },
     {
       title: '状态',
@@ -282,13 +330,16 @@ const Monitor = () => {
   ]
 
   const handleExport = () => {
-    const headers = ['时间', '模块', '操作', '状态', 'Token', '响应时间(s)', '成本(USD)', '错误信息']
+    const headers = ['时间', '模块', '操作', '状态', '总Token', '输入Token', '输出Token', '模型请求次数', '响应时间(s)', '成本(USD)', '错误信息']
     const rows = logData.map(item => [
       formatTime(item.timestamp),
       moduleMeta(item.module).label,
       item.operation || '',
       statusMeta(item.status).label,
       item.tokens || 0,
+      item.prompt_tokens || 0,
+      item.completion_tokens || 0,
+      item.llm_calls || 0,
       item.latency || 0,
       item.cost || 0,
       item.error_msg || '',

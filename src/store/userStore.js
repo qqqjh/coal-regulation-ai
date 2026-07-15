@@ -6,13 +6,15 @@ const useUserStore = create(
     (set) => ({
       // 用户信息
       user: null,
+      accessToken: null,
       // 是否已登录
       isLoggedIn: false,
 
       // 登录
-      login: (userInfo) => {
+      login: (userInfo, accessToken = null) => {
         set({
           user: userInfo,
+          accessToken,
           isLoggedIn: true
         })
       },
@@ -21,6 +23,7 @@ const useUserStore = create(
       logout: () => {
         set({
           user: null,
+          accessToken: null,
           isLoggedIn: false
         })
       },

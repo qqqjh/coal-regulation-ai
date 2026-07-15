@@ -32,7 +32,7 @@ const Login = () => {
       if (!response.ok) {
         throw new Error(data.detail || (mode === 'login' ? '登录失败' : '注册失败'))
       }
-      login(data.user)
+      login(data.user, data.access_token)
       message.success(mode === 'login' ? '登录成功' : '注册成功，已自动登录')
       navigate('/')
     } catch (error) {

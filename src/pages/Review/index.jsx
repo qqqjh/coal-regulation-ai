@@ -2,13 +2,13 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import useUserStore from '../../store/userStore'
 import {
   Button, Spin, Empty, Radio, Input, message, Progress, Tag, Tooltip, Popconfirm,
-  Select,
+  Select, Modal, Table,
 } from 'antd'
 import {
   DeleteOutlined, FileTextOutlined, CloudUploadOutlined,
   CheckCircleFilled, CloseCircleFilled, LoadingOutlined,
   CheckOutlined, CloseOutlined, EditOutlined, DownloadOutlined, ReloadOutlined,
-  RedoOutlined, PlayCircleOutlined,
+  RedoOutlined, PlayCircleOutlined, PaperClipOutlined, EyeOutlined,
 } from '@ant-design/icons'
 import axios from 'axios'
 import { Document as PdfDocument, Page, pdfjs } from 'react-pdf'
@@ -445,8 +445,8 @@ function AnnotatedDocument({ blocks, loading, issuesByBlock, onSelectIssue }) {
 // ── 主组件 ───────────────────────────────────────────────────────
 export default function Review() {
   const user = useUserStore(s => s.user)
+  const accessToken = useUserStore(s => s.accessToken)
   const uid  = user?.id ?? 'guest'
-  const isAdmin = user?.role === 'admin'
   const activeJobKey = `review-active-job:${uid}`
 
   // ── 上传 & 任务状态 ───────────────────────────────────────────
@@ -456,7 +456,8 @@ export default function Review() {
   const [mineType,   setMineType]   = useState('non_outburst')
   const [reviewKbs, setReviewKbs] = useState([])
   const [reviewKbLoading, setReviewKbLoading] = useState(false)
-  const [selectedReviewKbId, setSelectedReviewKbId] = useState(null)
+  const [selectedReferenceDocIds, setSelectedReferenceDocIds] = useState([])
+  const [temporaryReferenceFile, setTemporaryReferenceFile] = useState(null)
   const [jobId,      setJobId]      = useState(null)
   const [jobInfo,    setJobInfo]    = useState(null)
   const [docName,    setDocName]    = useState(null)
@@ -475,6 +476,11 @@ export default function Review() {
   const [documentLoading, setDocumentLoading] = useState(false)
   const [historyDocs, setHistoryDocs] = useState([])
   const [historyLoading, setHistoryLoading] = useState(false)
+  const [adminHistoryOpen, setAdminHistoryOpen] = useState(false)
+  const [typoTermsOpen, setTypoTermsOpen] = useState(false)
+  const [typoTerms, setTypoTerms] = useState([])
+  const [typoTermsLoading, setTypoTermsLoading] = useState(false)
+  const [typoTermsSaving, setTypoTermsSaving] = useState(false)
 
   // ── 问题列表 ──────────────────────────────────────────────────
   const [issues,     setIssues]     = useState([])
@@ -487,8 +493,10 @@ export default function Review() {
 
   const sseRef      = useRef(null)
   const fileInputRef = useRef(null)
+  const temporaryReferenceInputRef = useRef(null)
   const pdfPageWrapRef = useRef(null)
   const pdfRefreshSeqRef = useRef(0)
+  const locatedIssuePageRef = useRef('')
 
   const loadDocument = useCallback(async (jid) => {
     if (!jid) return
@@ -507,7 +515,12 @@ export default function Review() {
     setHistoryLoading(true)
     try {
       const res = await axios.get(`${V9}/jobs`, {
-        params: { user_id: uid, limit: 20, scope: user?.role === 'admin' ? 'all' : 'mine' },
+        params: {
+          user_id: uid,
+          limit: user?.role === 'admin' ? 200 : 20,
+          scope: user?.role === 'admin' ? 'all' : 'mine',
+        },
+        headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
       })
       setHistoryDocs(res.data.items || [])
     } catch {
@@ -515,15 +528,43 @@ export default function Review() {
     } finally {
       setHistoryLoading(false)
     }
-  }, [uid, user?.role])
+  }, [accessToken, uid, user?.role])
+
+  const loadTypoTerms = useCallback(async () => {
+    setTypoTermsLoading(true)
+    try {
+      const res = await axios.get(`${V9}/typo-terms`, { params: { user_id: uid } })
+      setTypoTerms(res.data.terms || [])
+    } catch {
+      setTypoTerms([])
+      message.error('术语屏蔽表加载失败')
+    } finally {
+      setTypoTermsLoading(false)
+    }
+  }, [uid])
+
+  const saveTypoTerms = useCallback(async () => {
+    setTypoTermsSaving(true)
+    try {
+      const normalized = [...new Set(
+        typoTerms.map(term => String(term || '').trim()).filter(Boolean)
+      )].slice(0, 500)
+      const res = await axios.put(
+        `${V9}/typo-terms`,
+        { terms: normalized },
+        { params: { user_id: uid } },
+      )
+      setTypoTerms(res.data.terms || [])
+      setTypoTermsOpen(false)
+      message.success(`术语屏蔽表已保存，共 ${res.data.count || 0} 项`)
+    } catch (err) {
+      message.error('术语屏蔽表保存失败：' + (err.response?.data?.detail || err.message))
+    } finally {
+      setTypoTermsSaving(false)
+    }
+  }, [typoTerms, uid])
 
   const loadReviewKbs = useCallback(async () => {
-    if (isAdmin) {
-      setReviewKbs([])
-      setSelectedReviewKbId(null)
-      setReviewKbLoading(false)
-      return
-    }
     setReviewKbLoading(true)
     try {
       const res = await axios.get('/api/admin/review-kb-permissions/allowed', {
@@ -531,21 +572,30 @@ export default function Review() {
       })
       const items = res.data.knowledge_bases || []
       setReviewKbs(items)
-      setSelectedReviewKbId(prev => {
-        if (prev && items.some(kb => kb.id === prev)) return prev
-        return items[0]?.id || null
+      const availableIds = items.flatMap(kb =>
+        (kb.documents || [])
+          .filter(doc => String(doc.status || '').toLowerCase() === 'indexed')
+          .map(doc => doc.id)
+      )
+      setSelectedReferenceDocIds(prev => {
+        const retained = prev.filter(id => availableIds.includes(id))
+        return retained.length ? retained : availableIds
       })
     } catch {
       setReviewKbs([])
-      setSelectedReviewKbId(null)
+      setSelectedReferenceDocIds([])
     } finally {
       setReviewKbLoading(false)
     }
-  }, [uid, isAdmin])
+  }, [uid])
 
   useEffect(() => {
     loadHistory()
   }, [loadHistory])
+
+  useEffect(() => {
+    loadTypoTerms()
+  }, [loadTypoTerms])
 
   useEffect(() => {
     loadReviewKbs()
@@ -616,7 +666,6 @@ export default function Review() {
       setPreviewMode('pdf')
       setPdfError("")
       setJobInfo(statusRes.data)
-      if (statusRes.data.kb_id) setSelectedReviewKbId(statusRes.data.kb_id)
       setIssues(issuesRes.data.issues || [])
       loadDocument(task.jobId)
       if (statusRes.data.status === 'cancelled') {
@@ -697,14 +746,47 @@ export default function Review() {
     }
   }
   // ── 上传 ──────────────────────────────────────────────────────
+  function onTemporaryReferenceChange(event) {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    if (!file.name.match(/\.(docx|doc|pdf)$/i)) {
+      message.error('临时参考只支持 Word/PDF 文档（.docx / .doc / .pdf）')
+      return
+    }
+    if (file.size > 50 * 1024 * 1024) {
+      message.error('临时参考文件不能超过 50MB')
+      return
+    }
+    setTemporaryReferenceFile(file)
+    message.success(`${file.name} 将仅用于下一次审查，不会加入知识库`)
+  }
+
+  async function uploadTemporaryReference() {
+    if (!temporaryReferenceFile) return null
+    const fd = new FormData()
+    fd.append('file', temporaryReferenceFile)
+    const res = await axios.post(`${V9}/temporary-reference`, fd, { timeout: 180000 })
+    return res.data
+  }
+
+  async function discardUploadedTemporaryReference(reference) {
+    if (!reference?.reference_id) return
+    try {
+      await axios.delete(`${V9}/temporary-reference/${reference.reference_id}`)
+    } catch {
+      // Unclaimed uploads also have a server-side expiry cleanup.
+    }
+  }
+
   async function handleFile(file) {
     if (!file) return
     if (!file.name.match(/\.(docx|doc|pdf)$/i)) {
       message.error('只支持 Word/PDF 文档（.docx / .doc / .pdf）')
       return
     }
-    if (!isAdmin && !selectedReviewKbId) {
-      message.error('当前账号没有可用于审查的规程知识库，请联系管理员配置')
+    if (!selectedReferenceDocIds.length) {
+      message.error('请至少选择一份本次审查参考的规程')
       return
     }
     setUploading(true)
@@ -713,7 +795,12 @@ export default function Review() {
     setFeedbackMap({})
     setJobInfo(null)
     setDocName(null)
+    let stagedTemporaryReference = null
     try {
+      if (temporaryReferenceFile) {
+        setPreprocessStage(`正在上传一次性参考：${temporaryReferenceFile.name}`)
+        stagedTemporaryReference = await uploadTemporaryReference()
+      }
       const fd = new FormData()
       fd.append('file', file)
       setPreprocessStage('正在预处理文档：保存原件、统一 .docx、准备 PDF 预览')
@@ -727,8 +814,9 @@ export default function Review() {
         mine_type: mineType,
         user_id: String(uid),
       })
-      if (!isAdmin && selectedReviewKbId) {
-        startParams.set('kb_id', String(selectedReviewKbId))
+      startParams.set('reference_doc_ids', selectedReferenceDocIds.join(','))
+      if (stagedTemporaryReference?.reference_id) {
+        startParams.set('temporary_reference_id', stagedTemporaryReference.reference_id)
       }
       const res = await axios.post(`${V9}/start/${prep.preprocess_id}?${startParams.toString()}`)
       const pdfReady = !!res.data.preprocess?.pdf_ready
@@ -737,7 +825,18 @@ export default function Review() {
       localStorage.setItem(activeJobKey, JSON.stringify({
         jobId: res.data.job_id, docName: res.data.doc_name, pdfReady,
       }))
-      setJobInfo({ status: 'pending', progress: 0, n_chunks: 0, n_done: 0 })
+      setJobInfo({
+        status: 'pending',
+        progress: 0,
+        n_chunks: 0,
+        n_done: 0,
+        kb_id: res.data.kb_id,
+        reference_doc_ids: res.data.reference_doc_ids || [],
+        reference_docs: res.data.reference_docs || [],
+        temporary_reference_id: res.data.temporary_reference_id || null,
+        temporary_reference_name: res.data.temporary_reference_name || null,
+      })
+      setTemporaryReferenceFile(null)
       setDocumentBlocks([])
       setPreviewMode('pdf')
       if (pdfReady) {
@@ -753,6 +852,7 @@ export default function Review() {
       loadHistory()
       message.success(pdfReady ? '预处理完成，审查任务已创建' : '预处理完成，审查任务已创建；PDF 可稍后手动生成')
     } catch (err) {
+      await discardUploadedTemporaryReference(stagedTemporaryReference)
       message.error('预处理/上传失败：' + (err.response?.data?.detail || err.message))
     } finally {
       setPreprocessStage('')
@@ -807,7 +907,6 @@ export default function Review() {
       setJobId(item.job_id)
       setDocName(statusData.doc_name || item.doc_name)
       setJobInfo(statusData)
-      if (statusData.kb_id) setSelectedReviewKbId(statusData.kb_id)
       setIssues(issuesRes.data.issues || [])
       setPdfError('')
       setPdfPage(1)
@@ -831,14 +930,28 @@ export default function Review() {
 
   async function rerunHistoryJob(item) {
     if (!item?.job_id) return
+    if (!selectedReferenceDocIds.length) {
+      message.error('请至少选择一份重新审查参考的规程')
+      return
+    }
+    let stagedTemporaryReference = null
     try {
+      stagedTemporaryReference = await uploadTemporaryReference()
       const res = await axios.post(`${V9}/jobs/${item.job_id}/rerun`, null, {
-        params: { user_id: uid },
+        params: {
+          user_id: uid,
+          reference_doc_ids: selectedReferenceDocIds.join(','),
+          ...(stagedTemporaryReference?.reference_id
+            ? { temporary_reference_id: stagedTemporaryReference.reference_id }
+            : {}),
+        },
       })
+      setTemporaryReferenceFile(null)
       message.success('已创建重新审查任务')
       await loadHistory()
       await openHistoryJob({ job_id: res.data.job_id, doc_name: res.data.doc_name })
     } catch (err) {
+      await discardUploadedTemporaryReference(stagedTemporaryReference)
       message.error('重新审查失败：' + (err.response?.data?.detail || err.message))
     }
   }
@@ -1035,10 +1148,23 @@ export default function Review() {
   const progressTotal = (isVectorizing || isRetrievalRerank)
     ? phaseTotal
     : Number(jobInfo?.n_chunks ?? phaseTotal ?? 0)
+  const referenceSelectOptions = useMemo(() => reviewKbs
+    .map(kb => ({
+      label: kb.name,
+      options: (kb.documents || [])
+        .filter(doc => String(doc.status || '').toLowerCase() === 'indexed')
+        .map(doc => ({
+          label: doc.name,
+          value: doc.id,
+        })),
+    }))
+    .filter(group => group.options.length > 0), [reviewKbs])
+  const activeReferenceDocs = Array.isArray(jobInfo?.reference_docs) ? jobInfo.reference_docs : []
   const timingText = useMemo(() => {
     const timings = jobInfo?.timings || {}
     const items = [
       ['parse', '解析'],
+      ['temporary_reference', '临时参考'],
       ['vectorize', '向量化'],
       ['retrieval_rerank', '检索重排'],
       ['persist_review_vectors', '向量入库'],
@@ -1051,6 +1177,7 @@ export default function Review() {
 
   const phaseProgressText = useMemo(() => {
     if (isDone) return `共发现 ${issues.length} 个问题`
+    if (agentStage === 'temporary_reference') return '正在解析并向量化一次性参考文件'
     if (isVectorizing) return `已向量化 ${progressDone} / ${progressTotal} 段`
     if (isRetrievalRerank) return `已检索重排 ${progressDone} / ${progressTotal} 段`
     if (agentStage === 'repetition') return '正在检查文档级重复内容'
@@ -1118,6 +1245,16 @@ export default function Review() {
     return map
   }, [blockByIndex, issues, pdfTextIndex])
 
+  function selectIssueAndLocate(issueId) {
+    setSelectedId(issueId)
+    setCustomText('')
+    const mappedPage = issuePageMap[issueId]
+    if (previewMode === 'pdf' && mappedPage) {
+      locatedIssuePageRef.current = `${issueId}:${mappedPage}`
+      if (mappedPage !== pdfPage) setPdfPage(mappedPage)
+    }
+  }
+
   const visiblePdfIssues = useMemo(() => {
     const hasIndex = Object.keys(pdfTextIndex).length > 0
     if (!hasIndex) return issues
@@ -1149,9 +1286,15 @@ export default function Review() {
   useEffect(() => {
     if (!selectedId) return
     const mappedPage = issuePageMap[selectedId]
-    if (previewMode === 'pdf' && mappedPage && mappedPage !== pdfPage) {
-      setPdfPage(mappedPage)
-      return
+    if (previewMode === 'pdf' && mappedPage) {
+      const locationKey = `${selectedId}:${mappedPage}`
+      if (locatedIssuePageRef.current !== locationKey) {
+        locatedIssuePageRef.current = locationKey
+        if (mappedPage !== pdfPage) {
+          setPdfPage(mappedPage)
+          return
+        }
+      }
     }
     const timer = setTimeout(() => {
       const selector = previewMode === 'pdf'
@@ -1259,20 +1402,19 @@ export default function Review() {
               <Radio.Button value="non_outburst">非突出矿井</Radio.Button>
               <Radio.Button value="outburst">突出矿井</Radio.Button>
             </Radio.Group>
-            {isAdmin ? (
-              <Tag className="rv-default-kb-tag">管理员：系统默认规程</Tag>
-            ) : (
-              <Select
-                size="small"
-                loading={reviewKbLoading}
-                value={selectedReviewKbId}
-                placeholder="选择规程知识库"
-                className="rv-review-kb-select"
-                options={reviewKbs.map(kb => ({ label: kb.name, value: kb.id }))}
-                onChange={setSelectedReviewKbId}
-                disabled={reviewKbs.length === 0}
-              />
-            )}
+            <Select
+              mode="multiple"
+              size="small"
+              loading={reviewKbLoading}
+              value={selectedReferenceDocIds}
+              placeholder="选择本次参考规程"
+              className="rv-review-kb-select"
+              options={referenceSelectOptions}
+              onChange={setSelectedReferenceDocIds}
+              maxTagCount="responsive"
+              allowClear
+              disabled={referenceSelectOptions.length === 0}
+            />
           </>
         )}
 
@@ -1280,6 +1422,21 @@ export default function Review() {
         {jobId && (
           <>
             <Tag color={st.color} style={{ fontWeight: 600 }}>{st.label}</Tag>
+            {jobInfo?.llm_model && (
+              <Tooltip title={`${jobInfo.llm_profile_name || '模型配置'} · ${jobInfo.llm_base_url || ''}`}>
+                <Tag color="geekblue">模型：{jobInfo.llm_model}</Tag>
+              </Tooltip>
+            )}
+            {activeReferenceDocs.length > 0 && (
+              <Tooltip title={activeReferenceDocs.map(doc => doc.name).join('、')}>
+                <Tag color="cyan">参考规程：{activeReferenceDocs.length} 份</Tag>
+              </Tooltip>
+            )}
+            {jobInfo?.temporary_reference_name && (
+              <Tooltip title="仅参与本次任务的召回与重排，任务结束后自动删除，不进入知识库">
+                <Tag color="purple">临时参考：{jobInfo.temporary_reference_name}</Tag>
+              </Tooltip>
+            )}
             {jobInfo?.agent_status && (
               <span style={{ fontSize: 12, color: 'rgba(255,255,255,.7)', maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {jobInfo.agent_status}
@@ -1294,6 +1451,16 @@ export default function Review() {
         )}
 
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
+          <Button
+            icon={<EditOutlined />}
+            onClick={() => {
+              setTypoTermsOpen(true)
+              loadTypoTerms()
+            }}
+            style={{ background: 'rgba(255,255,255,.15)', borderColor: 'rgba(255,255,255,.35)', color: '#fff' }}
+          >
+            术语屏蔽表{typoTerms.length ? ` (${typoTerms.length})` : ''}
+          </Button>
           {isDone && (
             <Button icon={<DownloadOutlined />} onClick={handleDownload}
               style={{ background: 'rgba(46,160,67,.85)', borderColor: 'rgba(46,160,67,.6)', color: '#fff', fontWeight: 600 }}>
@@ -1309,7 +1476,118 @@ export default function Review() {
         </div>
       </div>
 
+      <Modal
+        title="错别字检测术语屏蔽表"
+        open={typoTermsOpen}
+        confirmLoading={typoTermsSaving}
+        okText="保存"
+        cancelText="取消"
+        onOk={saveTypoTerms}
+        onCancel={() => setTypoTermsOpen(false)}
+        destroyOnClose={false}
+      >
+        <div className="rv-typo-terms-help">
+          表内术语会按当前用户保存。审查时，这些专有名词、内部简称及其内部字符不会被判定为错别字。
+        </div>
+        <Select
+          mode="tags"
+          value={typoTerms}
+          loading={typoTermsLoading}
+          onChange={values => setTypoTerms(values.slice(0, 500))}
+          tokenSeparators={[',', '，', '\n']}
+          placeholder="输入术语后按回车，例如：B版、B包、安培中心"
+          className="rv-typo-terms-select"
+          maxTagTextLength={24}
+        />
+        <div className="rv-typo-terms-count">已添加 {typoTerms.length} / 500 项</div>
+      </Modal>
+
+      <Modal
+        title={`全部用户审查历史（${historyDocs.length}）`}
+        open={adminHistoryOpen}
+        onCancel={() => setAdminHistoryOpen(false)}
+        footer={null}
+        width={1120}
+        destroyOnClose
+      >
+        <Table
+          rowKey="job_id"
+          size="small"
+          loading={historyLoading}
+          dataSource={historyDocs}
+          scroll={{ x: 920 }}
+          pagination={{
+            pageSize: 10,
+            showSizeChanger: true,
+            pageSizeOptions: [10, 20, 50],
+            showTotal: total => `共 ${total} 条记录`,
+          }}
+          columns={[
+            {
+              title: '用户',
+              dataIndex: 'user_id',
+              width: 130,
+              render: value => <Tag color="blue">{value || 'guest'}</Tag>,
+            },
+            {
+              title: '待审文档',
+              dataIndex: 'doc_name',
+              ellipsis: true,
+              render: (value, record) => value || record.job_id,
+            },
+            {
+              title: '状态',
+              dataIndex: 'status',
+              width: 90,
+              render: value => {
+                const cfg = JOB_STATUS[value] || { label: value || '未知', color: '#8c8c8c' }
+                return <Tag color={cfg.color}>{cfg.label}</Tag>
+              },
+            },
+            {
+              title: '问题数',
+              dataIndex: 'issue_count',
+              width: 85,
+              align: 'center',
+              render: value => Number(value || 0),
+            },
+            {
+              title: '审查时间',
+              key: 'review_time',
+              width: 155,
+              render: (_, record) => formatHistoryTime(record.updated_at || record.created_at) || '-',
+            },
+            {
+              title: '操作',
+              key: 'action',
+              width: 90,
+              fixed: 'right',
+              render: (_, record) => (
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<EyeOutlined />}
+                  onClick={async () => {
+                    setAdminHistoryOpen(false)
+                    await openHistoryJob(record)
+                  }}
+                >
+                  查看
+                </Button>
+              ),
+            },
+          ]}
+        />
+      </Modal>
+
       <input ref={fileInputRef} type="file" accept=".docx,.doc,.pdf,application/pdf" hidden onChange={onInputChange} />
+      <input
+        ref={temporaryReferenceInputRef}
+        type="file"
+        accept=".docx,.doc,.pdf,application/pdf"
+        hidden
+        onChange={onTemporaryReferenceChange}
+      />
 
       <div className="rv-workbench">
         <div
@@ -1317,12 +1595,54 @@ export default function Review() {
           onDragOver={onDragOver}
           onDragLeave={onDragLeave}
           onDrop={onDrop}
-          onClick={() => fileInputRef.current?.click()}
         >
-          {uploading ? <LoadingOutlined className="rv-workbench-upload-icon" /> : <CloudUploadOutlined className="rv-workbench-upload-icon" />}
-          <div>
-            <div className="rv-workbench-upload-title">{uploading ? '正在处理文档' : '上传待审文档'}</div>
-            <div className="rv-workbench-upload-sub">{preprocessStage || '.docx / .doc / .pdf，预处理后进入审查'}</div>
+          <div className="rv-workbench-upload-trigger" onClick={() => fileInputRef.current?.click()}>
+            {uploading ? <LoadingOutlined className="rv-workbench-upload-icon" /> : <CloudUploadOutlined className="rv-workbench-upload-icon" />}
+            <div>
+              <div className="rv-workbench-upload-title">{uploading ? '正在处理文档' : '上传待审文档'}</div>
+              <div className="rv-workbench-upload-sub">{preprocessStage || '.docx / .doc / .pdf，预处理后进入审查'}</div>
+            </div>
+          </div>
+          <div className="rv-workbench-reference" onClick={event => event.stopPropagation()}>
+            <span>{jobId ? '下次审查参考规程' : '本次审查参考规程'}</span>
+            <Select
+              mode="multiple"
+              size="small"
+              loading={reviewKbLoading}
+              value={selectedReferenceDocIds}
+              placeholder="至少选择一份规程"
+              options={referenceSelectOptions}
+              onChange={setSelectedReferenceDocIds}
+              maxTagCount={1}
+              maxTagTextLength={15}
+              allowClear
+              disabled={referenceSelectOptions.length === 0}
+            />
+          </div>
+          <div className="rv-workbench-temp-reference" onClick={event => event.stopPropagation()}>
+            <span>{jobId ? '下次审查临时参考' : '本次审查临时参考'}</span>
+            <Tooltip title={temporaryReferenceFile?.name || '仅用于一次审查，不加入知识库'}>
+              <Button
+                size="small"
+                icon={<PaperClipOutlined />}
+                className="rv-temp-reference-button"
+                onClick={() => temporaryReferenceInputRef.current?.click()}
+              >
+                <span>{temporaryReferenceFile?.name || '选择一次性文件'}</span>
+              </Button>
+            </Tooltip>
+            {temporaryReferenceFile && (
+              <Tooltip title="移除临时参考">
+                <Button
+                  size="small"
+                  type="text"
+                  danger
+                  icon={<CloseOutlined />}
+                  aria-label="移除临时参考"
+                  onClick={() => setTemporaryReferenceFile(null)}
+                />
+              </Tooltip>
+            )}
           </div>
         </div>
 
@@ -1352,16 +1672,27 @@ export default function Review() {
           <div className="rv-history-head">
             <div className="rv-workbench-section-title">
               <FileTextOutlined />
-              <span>最近历史</span>
+              <span>{user?.role === 'admin' ? '全部用户最近历史' : '最近历史'}</span>
             </div>
-            <Button
-              size="small"
-              icon={<ReloadOutlined />}
-              loading={historyLoading}
-              onClick={loadHistory}
-            >
-              刷新
-            </Button>
+            <div className="rv-history-head-actions">
+              {user?.role === 'admin' && (
+                <Button
+                  size="small"
+                  icon={<EyeOutlined />}
+                  onClick={() => setAdminHistoryOpen(true)}
+                >
+                  全部记录
+                </Button>
+              )}
+              <Button
+                size="small"
+                icon={<ReloadOutlined />}
+                loading={historyLoading}
+                onClick={loadHistory}
+              >
+                刷新
+              </Button>
+            </div>
           </div>
           <div className="rv-history-list">
             {historyPanelItems.length === 0 && (
@@ -1387,6 +1718,9 @@ export default function Review() {
                   </div>
                   <div className="rv-history-bottom">
                     <span className="rv-history-meta">
+                      {user?.role === 'admin' && (
+                        <Tag color="blue" title={item.user_id || 'guest'}>{item.user_id || 'guest'}</Tag>
+                      )}
                       <Tag color={status.color}>{status.label}</Tag>
                       <span>{Number(item.issue_count || 0)} 问题</span>
                       {formatHistoryTime(item.updated_at || item.created_at) && <span>{formatHistoryTime(item.updated_at || item.created_at)}</span>}
@@ -1491,7 +1825,7 @@ export default function Review() {
                   key={issue.id}
                   className={`rv-issue-item ${isSelected ? 'selected' : ''}`}
                   style={{ borderLeft: `4px solid ${cfg.color}` }}
-                  onClick={() => { setSelectedId(issue.id); setCustomText('') }}
+                  onClick={() => selectIssueAndLocate(issue.id)}
                 >
                   <div className="rv-issue-item-header">
                     <span className="rv-dec-dot">
@@ -1551,25 +1885,21 @@ export default function Review() {
                 <Radio value="non_outburst">非突出矿井</Radio>
                 <Radio value="outburst">突出矿井</Radio>
               </Radio.Group>
-              {isAdmin ? (
-                <Tag className="rv-upload-default-kb-tag">管理员使用系统默认规程库，不受用户权限限制</Tag>
-              ) : (
-                <Select
-                  loading={reviewKbLoading}
-                  value={selectedReviewKbId}
-                  placeholder="选择审查使用的规程知识库"
-                  style={{ width: 360, maxWidth: '100%' }}
-                  options={reviewKbs.map(kb => ({
-                    label: `${kb.name}${kb.document_count ? `（${kb.document_count} 文档）` : ''}`,
-                    value: kb.id,
-                  }))}
-                  onChange={setSelectedReviewKbId}
-                  disabled={reviewKbs.length === 0}
-                />
-              )}
-              {!isAdmin && reviewKbs.length === 0 && (
+              <Select
+                mode="multiple"
+                loading={reviewKbLoading}
+                value={selectedReferenceDocIds}
+                placeholder="选择本次审查参考的规程（可多选）"
+                style={{ width: 520, maxWidth: '100%' }}
+                options={referenceSelectOptions}
+                onChange={setSelectedReferenceDocIds}
+                maxTagCount="responsive"
+                allowClear
+                disabled={referenceSelectOptions.length === 0}
+              />
+              {referenceSelectOptions.length === 0 && (
                 <div style={{ fontSize: 12, color: '#cf1322' }}>
-                  当前账号没有可用于审查的规程知识库，请联系管理员配置
+                  当前账号没有可用于审查的已索引规程，请联系管理员配置
                 </div>
               )}
             </div>

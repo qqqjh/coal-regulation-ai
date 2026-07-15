@@ -1,11 +1,18 @@
 from datetime import datetime
 from typing import Iterable
 
+from fastapi import HTTPException
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models.database import AppUser, KnowledgeBase, ReviewKbPermission, ReviewKbUserAccess
+from app.models.database import (
+    AppUser,
+    Document,
+    KnowledgeBase,
+    ReviewKbPermission,
+    ReviewKbUserAccess,
+)
 
 
 DEFAULT_REVIEW_USERS = [
@@ -29,6 +36,15 @@ def serialize_kb(kb: KnowledgeBase) -> dict:
         "name": kb.name,
         "description": kb.description,
         "document_count": len(docs),
+        "documents": [
+            {
+                "id": doc.id,
+                "name": doc.name,
+                "status": doc.status,
+                "chunk_count": int(doc.chunk_count or 0),
+            }
+            for doc in sorted(docs, key=lambda item: (item.name or "", item.id))
+        ],
         "updated_at": (kb.updated_at or kb.created_at).isoformat() if (kb.updated_at or kb.created_at) else None,
     }
 
@@ -134,6 +150,53 @@ async def assert_kb_allowed(db: AsyncSession, user_id: str | int, kb_id: int | N
     if allowed_ids is None:
         return
     if int(kb_id) not in set(allowed_ids):
-        from fastapi import HTTPException
-
         raise HTTPException(status_code=403, detail="当前用户无权使用该规程知识库进行审查")
+
+
+async def resolve_allowed_reference_documents(
+    db: AsyncSession,
+    user_id: str | int,
+    document_ids: Iterable[int],
+) -> list[dict]:
+    """Validate a task-scoped regulation selection and return a stable snapshot."""
+    normalized_ids: list[int] = []
+    seen = set()
+    for value in document_ids:
+        try:
+            doc_id = int(value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="参考规程文档 ID 无效")
+        if doc_id <= 0 or doc_id in seen:
+            continue
+        seen.add(doc_id)
+        normalized_ids.append(doc_id)
+    if not normalized_ids:
+        return []
+
+    result = await db.execute(
+        select(Document, KnowledgeBase.name)
+        .join(KnowledgeBase, KnowledgeBase.id == Document.kb_id)
+        .where(Document.id.in_(normalized_ids))
+    )
+    rows = {int(doc.id): (doc, kb_name) for doc, kb_name in result.all()}
+    missing = [doc_id for doc_id in normalized_ids if doc_id not in rows]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"参考规程不存在：{missing}")
+
+    allowed_ids = await get_allowed_kb_ids(db, user_id)
+    allowed_set = None if allowed_ids is None else {int(value) for value in allowed_ids}
+    snapshots = []
+    for doc_id in normalized_ids:
+        doc, kb_name = rows[doc_id]
+        if allowed_set is not None and int(doc.kb_id) not in allowed_set:
+            raise HTTPException(status_code=403, detail=f"当前用户无权使用参考规程：{doc.name}")
+        if str(doc.status or "").lower() != "indexed":
+            raise HTTPException(status_code=400, detail=f"参考规程尚未完成索引：{doc.name}")
+        snapshots.append({
+            "id": int(doc.id),
+            "kb_id": int(doc.kb_id),
+            "kb_name": kb_name,
+            "name": doc.name,
+            "chunk_count": int(doc.chunk_count or 0),
+        })
+    return snapshots

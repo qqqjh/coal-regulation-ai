@@ -24,9 +24,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from openai import OpenAI
-
 import numeric_compare
+from llm_usage_tracker import TrackedOpenAI, UsageTracker
 from review_queue import ReviewQueue
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -56,6 +55,25 @@ class AgentTools:
     def __init__(self, queue: ReviewQueue):
         self.queue = queue
         self._engine = None  # 懒加载：检索工具需要 BGE 模型 + KB 索引
+        self._api_key = API_KEY
+        self._base_url = BASE_URL
+        self._model = AGENT_MODEL
+        self._usage_tracker = UsageTracker()
+
+    def configure_llm(self, *, api_key: str, base_url: str, model: str,
+                      usage_tracker: Optional[UsageTracker] = None) -> None:
+        """让主智能体工具与当前升级项使用同一模型快照。"""
+        self._api_key = api_key or "local-no-key"
+        self._base_url = base_url
+        self._model = model
+        self._usage_tracker = usage_tracker or UsageTracker()
+        if self._engine is not None:
+            self._engine.configure_llm(
+                api_key=self._api_key,
+                base_url=self._base_url,
+                model=self._model,
+                usage_tracker=self._usage_tracker,
+            )
 
     # ---- skills ----
 
@@ -154,6 +172,12 @@ class AgentTools:
             engine = HybridRAGReviewerV9()
             engine.load_knowledge_base()
             engine.build_index()
+            engine.configure_llm(
+                api_key=self._api_key,
+                base_url=self._base_url,
+                model=self._model,
+                usage_tracker=self._usage_tracker,
+            )
             self._engine = engine
         return self._engine
 
@@ -173,8 +197,12 @@ class AgentTools:
 
     def numeric_compare_tool(self, pending_text: str, rule_text: str) -> Dict:
         """确定性数值核验工具（单位归一化+方向语义编码）。"""
-        client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-        return numeric_compare.numeric_check(client, AGENT_MODEL, pending_text, rule_text)
+        client = TrackedOpenAI(
+            tracker=self._usage_tracker,
+            api_key=self._api_key,
+            base_url=self._base_url,
+        )
+        return numeric_compare.numeric_check(client, self._model, pending_text, rule_text)
 
     # ---- 队列与结果 ----
 
@@ -367,12 +395,34 @@ def _parse_strategy_json(raw: str) -> Dict[str, Any]:
 # ============ Agent 循环 ============
 
 class MainAgent:
-    def __init__(self):
-        if not API_KEY:
+    def __init__(self, *, api_key: str = API_KEY, base_url: str = BASE_URL,
+                 model: str = AGENT_MODEL):
+        if not api_key:
             raise ValueError("请设置环境变量 DASHSCOPE_API_KEY")
-        self.client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
         self.queue = ReviewQueue(QUEUE_DB)
         self.tools = AgentTools(self.queue)
+        self.configure_llm(api_key=api_key, base_url=base_url, model=model)
+
+    def configure_llm(self, *, api_key: str, base_url: str, model: str,
+                      usage_tracker: Optional[UsageTracker] = None) -> None:
+        if not base_url or not model:
+            raise ValueError("模型 Base URL 和模型名称不能为空")
+        normalized_key = api_key or "local-no-key"
+        self.usage_tracker = usage_tracker or UsageTracker()
+        self.client = TrackedOpenAI(
+            tracker=self.usage_tracker,
+            api_key=normalized_key,
+            base_url=base_url,
+            timeout=120,
+            max_retries=0,
+        )
+        self.model = model
+        self.tools.configure_llm(
+            api_key=normalized_key,
+            base_url=base_url,
+            model=model,
+            usage_tracker=self.usage_tracker,
+        )
 
     def _execute_tool(self, name: str, arguments: Dict) -> str:
         handler = getattr(self.tools, name, None)
@@ -397,7 +447,7 @@ class MainAgent:
         called: List[str] = []
         for _step in range(max_steps):
             response = self.client.chat.completions.create(
-                model=AGENT_MODEL, messages=messages,
+                model=self.model, messages=messages,
                 tools=tool_schemas, temperature=0.1,
             )
             msg = response.choices[0].message
@@ -436,7 +486,7 @@ class MainAgent:
             {"role": "user", "content": f"用户任务：{task}\n\n请输出该任务的执行策略（严格 JSON）。"},
         ]
         response = self.client.chat.completions.create(
-            model=AGENT_MODEL, messages=messages, temperature=0.1,
+            model=self.model, messages=messages, temperature=0.1,
         )
         raw = response.choices[0].message.content or ""
         return {"strategy": _parse_strategy_json(raw), "raw": raw}

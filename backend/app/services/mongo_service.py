@@ -72,6 +72,7 @@ class MongoService:
         db.review_chunks.create_index([("job_id", asc), ("chunk_index", asc)], unique=True)
         db.review_chunks.create_index([("user_id", asc), ("job_id", asc)])
         db.review_chunks.create_index([("milvus_id", asc)], unique=True)
+        db.typo_allow_terms.create_index([("updated_at", desc)])
         db.audit_logs.create_index([("created_at", desc)])
 
     def health(self) -> Dict[str, Any]:
@@ -99,6 +100,15 @@ class MongoService:
             "docx_path": job.get("docx_path", ""),
             "paragraphs_path": job.get("paragraphs_path", ""),
             "mine_type": job.get("mine_type", "non_outburst"),
+            "kb_id": job.get("kb_id"),
+            "reference_doc_ids": _loads_json(job.get("reference_doc_ids"), []),
+            "reference_docs": _loads_json(job.get("reference_docs"), []),
+            "temporary_reference_id": job.get("temporary_reference_id", ""),
+            "temporary_reference_name": job.get("temporary_reference_name", ""),
+            "llm_profile_id": job.get("llm_profile_id", ""),
+            "llm_profile_name": job.get("llm_profile_name", ""),
+            "llm_model": job.get("llm_model", ""),
+            "llm_base_url": job.get("llm_base_url", ""),
             "status": job.get("status", ""),
             "progress": int(job.get("progress") or 0),
             "n_chunks": int(job.get("n_chunks") or 0),
@@ -219,6 +229,35 @@ class MongoService:
             .limit(limit)
         )
         return list(cursor)
+
+    def get_typo_allow_terms(self, user_id: str = "guest") -> Optional[List[str]]:
+        db = self._connect()
+        if db is None:
+            return None
+        normalized_user = str(user_id or "guest")[:80]
+        doc = db.typo_allow_terms.find_one({"_id": normalized_user})
+        if not doc:
+            return []
+        return [str(term) for term in (doc.get("terms") or []) if str(term).strip()]
+
+    def replace_typo_allow_terms(self, user_id: str, terms: List[str]) -> bool:
+        db = self._connect()
+        if db is None:
+            return False
+        normalized_user = str(user_id or "guest")[:80]
+        db.typo_allow_terms.update_one(
+            {"_id": normalized_user},
+            {
+                "$set": {
+                    "user_id": normalized_user,
+                    "terms": list(terms or []),
+                    "updated_at": _now_iso(),
+                },
+                "$setOnInsert": {"created_at": _now_iso()},
+            },
+            upsert=True,
+        )
+        return True
 
     def delete_review_job(self, job_id: str) -> bool:
         db = self._connect()
