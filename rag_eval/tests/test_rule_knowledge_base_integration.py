@@ -202,6 +202,35 @@ class FrontendKnowledgeBaseSelectionTests(unittest.TestCase):
         self.assertEqual("frontend_kb", runtime["source"])
         self.assertEqual(23, runtime["kb_id"])
 
+    def test_worker_falls_back_to_local_rules_before_milvus_migration(self):
+        class DummyEngine:
+            kb_chunks = [{"content": "本地规则"}]
+            excluded_outburst_count = 0
+
+            def __init__(self):
+                self.default_calls = []
+
+            def use_default_knowledge_base(self, mine_type):
+                self.default_calls.append(mine_type)
+                return False
+
+        worker = V9Worker.__new__(V9Worker)
+        worker.engine = DummyEngine()
+        with patch.object(worker, "_load_review_kb_records", return_value=[]):
+            runtime = worker._configure_job_knowledge_base(
+                {
+                    "kb_id": 2,
+                    "reference_docs": json.dumps([
+                        {"id": 3, "kb_id": 2, "name": "煤矿安全规程.pdf"},
+                    ], ensure_ascii=False),
+                },
+                "non_outburst",
+            )
+
+        self.assertEqual(["non_outburst"], worker.engine.default_calls)
+        self.assertEqual("local_rule_index_fallback", runtime["source"])
+        self.assertEqual(["煤矿安全规程.pdf"], runtime["selected_documents"])
+
 
 if __name__ == "__main__":
     unittest.main()

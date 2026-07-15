@@ -225,6 +225,27 @@ class V9Worker:
 
         records = self._load_review_kb_records(int(kb_id))
         if not records:
+            selected_references = _json_list(job.get("reference_docs"))
+            selected_names = [
+                str(item.get("name") or "").strip()
+                for item in selected_references
+                if isinstance(item, dict) and str(item.get("name") or "").strip()
+            ]
+            if selected_names:
+                changed = engine.use_default_knowledge_base(mine_type)
+                log(
+                    f"知识库 kb_id={kb_id} 尚未迁移规则块到 Milvus，"
+                    "已回退本地 BGE 规则索引并按所选规程限定范围"
+                )
+                return {
+                    "source": "local_rule_index_fallback",
+                    "kb_id": int(kb_id),
+                    "changed": bool(changed),
+                    "source_chunks": 0,
+                    "chunks": len(engine.kb_chunks),
+                    "selected_documents": selected_names,
+                    "excluded_outburst": int(engine.excluded_outburst_count),
+                }
             raise ValueError(
                 f"前端选中的知识库 kb_id={kb_id} 没有已索引的可审查规则块"
             )
