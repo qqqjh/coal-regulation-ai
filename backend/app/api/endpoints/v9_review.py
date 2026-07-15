@@ -61,6 +61,13 @@ _TEMPORARY_REFERENCE_SUFFIXES = {".pdf", ".docx", ".doc"}
 _TEMPORARY_REFERENCE_TTL_SECONDS = 24 * 60 * 60
 
 
+def _require_admin(identity: dict = Depends(require_identity)) -> dict:
+    """Protect administrator-only review data at the API boundary."""
+    if str(identity.get("role") or "user").lower() != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可访问数据飞轮")
+    return identity
+
+
 def _sync_job_to_mongo(job_id: str, include_issues: bool = False) -> None:
     """Best-effort MongoDB mirror. SQLite remains the worker queue source of truth."""
     try:
@@ -111,6 +118,24 @@ def _parse_reference_doc_ids(value: str | None) -> list[int]:
             seen.add(doc_id)
             result.append(doc_id)
     return result
+
+
+def _resolve_reference_kb_id(
+    kb_id: int | None,
+    reference_docs: list[dict] | None,
+) -> int | None:
+    """Ensure one review job never mixes regulations from different KBs."""
+    reference_kb_ids = {
+        int(item["kb_id"])
+        for item in (reference_docs or [])
+        if item.get("kb_id") is not None
+    }
+    if len(reference_kb_ids) > 1:
+        raise HTTPException(400, "一次审查所选规程必须来自同一个知识库")
+    selected_kb_id = next(iter(reference_kb_ids), None)
+    if kb_id is not None and selected_kb_id is not None and int(kb_id) != selected_kb_id:
+        raise HTTPException(400, "所选规程与审查知识库不一致")
+    return selected_kb_id if selected_kb_id is not None else kb_id
 
 
 def _decode_job_reference_fields(job: dict) -> dict:
@@ -460,8 +485,7 @@ def _create_job_from_preprocess(
     job_id = uuid.uuid4().hex[:12]
     reference_docs = reference_docs or []
     reference_doc_ids = [int(item["id"]) for item in reference_docs]
-    if kb_id is None and reference_docs:
-        kb_id = int(reference_docs[0]["kb_id"])
+    kb_id = _resolve_reference_kb_id(kb_id, reference_docs)
     original_pdf_path = ""
     if source_format == "pdf":
         # 此路径由 worker 在 MinerU 直接解析 PDF 后创建。
@@ -746,7 +770,7 @@ async def jobs(
     query_user = None if normalized_scope == "all" else requester_id
     rows = _queue.list_jobs(user_id=query_user, limit=limit)
     mongo_service.upsert_review_jobs(rows)
-    mongo_items = None if scope == "all" else mongo_service.list_review_jobs(user_id=query_user or "guest", limit=limit)
+    mongo_items = None if normalized_scope == "all" else mongo_service.list_review_jobs(user_id=query_user or "guest", limit=limit)
     source_rows = mongo_items if mongo_items is not None else rows
     items = []
     for row in source_rows:
@@ -875,7 +899,6 @@ async def rerun_job(
     if not old:
         raise HTTPException(404, "任务不存在")
     kb_id = old.get("kb_id")
-    await assert_kb_allowed(db, user_id, kb_id)
     old_reference_ids = _decode_job_reference_fields(dict(old)).get("reference_doc_ids", [])
     selected_ids = (
         _parse_reference_doc_ids(reference_doc_ids)
@@ -883,6 +906,8 @@ async def rerun_job(
         else old_reference_ids
     )
     references = await resolve_allowed_reference_documents(db, user_id, selected_ids)
+    kb_id = _resolve_reference_kb_id(None if reference_doc_ids is not None else kb_id, references)
+    await assert_kb_allowed(db, user_id, kb_id)
     source_docx = Path(old["docx_path"])
     if not source_docx.exists():
         raise HTTPException(404, "历史任务的审查副本文档不存在，无法重新审查")
@@ -1214,6 +1239,7 @@ async def flywheel_list(
     action: str = "",
     issue_type: str = "",
     query: str = "",
+    _identity: dict = Depends(_require_admin),
 ):
     """人工反馈飞轮样本；不混入主智能体自动裁决记录。"""
     items = _queue.list_human_feedback(
@@ -1226,12 +1252,12 @@ async def flywheel_list(
 
 
 @router.get("/flywheel/stats")
-async def flywheel_stats():
+async def flywheel_stats(_identity: dict = Depends(_require_admin)):
     return _queue.flywheel_stats()
 
 
 @router.get("/flywheel/export")
-async def flywheel_export():
+async def flywheel_export(_identity: dict = Depends(_require_admin)):
     """导出当前有效人工反馈黄金样本，不包含撤回和自动智能体裁决。"""
     items = _queue.list_human_feedback(limit=2000)
     cases = [
@@ -1259,7 +1285,10 @@ async def flywheel_export():
 
 
 @router.delete("/flywheel/{ann_id}")
-async def flywheel_delete(ann_id: int):
+async def flywheel_delete(
+    ann_id: int,
+    _identity: dict = Depends(_require_admin),
+):
     """删除一条飞轮记录。"""
     ok = _queue.delete_annotation(ann_id)
     if not ok:

@@ -4,6 +4,7 @@ set -euo pipefail
 PROJECT_DIR="${COAL_PROJECT_DIR:-/root/autodl-tmp/coal-regulation-ai}"
 VENV_DIR="${COAL_VENV_DIR:-/root/autodl-tmp/bge-service/.venv}"
 MINERU_DIR="${MINERU_DIR:-/root/autodl-tmp/mineru}"
+REVIEW_WORKER_ENTRY="${COAL_REVIEW_WORKER_ENTRY:-v10_worker.py}"
 RUNTIME_DIR="$PROJECT_DIR/.runtime"
 LOG_DIR="$PROJECT_DIR/logs"
 
@@ -51,7 +52,7 @@ start_process() {
   case "$name" in
     mineru) expected_process="mineru-api" ;;
     backend) expected_process="uvicorn" ;;
-    worker) expected_process="v9_worker.py" ;;
+    worker) expected_process="$REVIEW_WORKER_ENTRY" ;;
   esac
 
   local current_pid
@@ -82,4 +83,4 @@ start_process backend "$PROJECT_DIR/backend" \
   "$VENV_DIR/bin/uvicorn" main:app --host 127.0.0.1 --port 8000 --workers 1
 
 start_process worker "$PROJECT_DIR" \
-  "$VENV_DIR/bin/python" "$PROJECT_DIR/v9_worker.py"
+  "$VENV_DIR/bin/python" "$PROJECT_DIR/$REVIEW_WORKER_ENTRY"

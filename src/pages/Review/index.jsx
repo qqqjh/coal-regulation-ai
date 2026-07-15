@@ -607,14 +607,20 @@ export default function Review() {
       })
       const items = res.data.knowledge_bases || []
       setReviewKbs(items)
-      const availableIds = items.flatMap(kb =>
-        (kb.documents || [])
+      const indexedGroups = items.map(kb => ({
+        kbId: kb.id,
+        docIds: (kb.documents || [])
           .filter(doc => String(doc.status || '').toLowerCase() === 'indexed')
-          .map(doc => doc.id)
-      )
+          .map(doc => doc.id),
+      })).filter(group => group.docIds.length > 0)
+      const availableIds = indexedGroups.flatMap(group => group.docIds)
       setSelectedReferenceDocIds(prev => {
         const retained = prev.filter(id => availableIds.includes(id))
-        return retained.length ? retained : availableIds
+        if (retained.length) {
+          const retainedGroup = indexedGroups.find(group => group.docIds.includes(retained[0]))
+          return retainedGroup ? retained.filter(id => retainedGroup.docIds.includes(id)) : []
+        }
+        return indexedGroups[0]?.docIds || []
       })
     } catch {
       setReviewKbs([])
@@ -1210,6 +1216,26 @@ export default function Review() {
         })),
     }))
     .filter(group => group.options.length > 0), [reviewKbs])
+  const referenceDocKbMap = useMemo(() => {
+    const mapping = new Map()
+    reviewKbs.forEach(kb => {
+      (kb.documents || []).forEach(doc => mapping.set(doc.id, kb.id))
+    })
+    return mapping
+  }, [reviewKbs])
+  const handleReferenceSelectionChange = useCallback((values) => {
+    if (!values.length) {
+      setSelectedReferenceDocIds([])
+      return
+    }
+    const latestId = values[values.length - 1]
+    const targetKbId = referenceDocKbMap.get(latestId)
+    const sameKbValues = values.filter(id => referenceDocKbMap.get(id) === targetKbId)
+    if (sameKbValues.length !== values.length) {
+      message.info('一次审查的参考规程需来自同一个知识库，已切换到新选择的知识库')
+    }
+    setSelectedReferenceDocIds(sameKbValues)
+  }, [referenceDocKbMap])
   const activeReferenceDocs = Array.isArray(jobInfo?.reference_docs) ? jobInfo.reference_docs : []
   const timingText = useMemo(() => {
     const timings = jobInfo?.timings || {}
@@ -1563,7 +1589,7 @@ export default function Review() {
               placeholder="选择本次参考规程"
               className="rv-review-kb-select"
               options={referenceSelectOptions}
-              onChange={setSelectedReferenceDocIds}
+              onChange={handleReferenceSelectionChange}
               maxTagCount="responsive"
               allowClear
               disabled={referenceSelectOptions.length === 0}
@@ -1765,7 +1791,7 @@ export default function Review() {
               value={selectedReferenceDocIds}
               placeholder="至少选择一份规程"
               options={referenceSelectOptions}
-              onChange={setSelectedReferenceDocIds}
+              onChange={handleReferenceSelectionChange}
               maxTagCount={1}
               maxTagTextLength={15}
               allowClear
@@ -2045,7 +2071,7 @@ export default function Review() {
                 placeholder="选择本次审查参考的规程（可多选）"
                 style={{ width: 520, maxWidth: '100%' }}
                 options={referenceSelectOptions}
-                onChange={setSelectedReferenceDocIds}
+                onChange={handleReferenceSelectionChange}
                 maxTagCount="responsive"
                 allowClear
                 disabled={referenceSelectOptions.length === 0}

@@ -9,6 +9,8 @@
 状态机：pending -> processing -> resolved
                          \\-> (失败 attempts+1) -> pending（重试）-> dead（≥MAX_ATTEMPTS）
 """
+from __future__ import annotations
+
 import json
 import re
 import sqlite3

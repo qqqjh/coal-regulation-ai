@@ -14,6 +14,8 @@
 人工反馈本身（合规结论层面）在后端写入飞轮（annotations, source=human），
 是数据飞轮的最高层；worker 这里只负责"把人的意见落到 Word 上"。
 """
+from __future__ import annotations
+
 import json
 import os
 import re
