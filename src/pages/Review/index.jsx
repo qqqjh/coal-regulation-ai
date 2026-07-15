@@ -248,6 +248,79 @@ function mergePdfAreaRects(rects, bounds, columnBounds = null, options = {}) {
   })
 }
 
+function findTextOccurrences(text, needle) {
+  if (!text || !needle) return []
+  const result = []
+  let start = 0
+  while (start <= text.length - needle.length) {
+    const index = text.indexOf(needle, start)
+    if (index < 0) break
+    result.push(index)
+    start = index + Math.max(1, needle.length)
+  }
+  return result
+}
+
+function buildCrossSpanTypoRects(page, pageRect, issues, existingIssueIds) {
+  const spans = Array.from(page.querySelectorAll('.react-pdf__Page__textContent span'))
+  const entries = []
+  let cursor = 0
+  spans.forEach(span => {
+    if (isPdfMarginElement(span)) return
+    const text = normalizeText(span.textContent || '')
+    if (!text) return
+    const rect = span.getBoundingClientRect()
+    if (rect.width < 1 || rect.height < 1) return
+    entries.push({ span, text, start: cursor, end: cursor + text.length, rect })
+    cursor += text.length
+  })
+  const pageText = entries.map(entry => entry.text).join('')
+  if (!pageText) return []
+
+  const result = []
+  issues.forEach(issue => {
+    if (issue.issue_type !== 'typo' || existingIssueIds.has(Number(issue.id))) return
+    if (issuePdfLocations(issue).length > 0) return
+    const needle = normalizeText(issue.original_text || '')
+    if (!needle) return
+    const occurrences = findTextOccurrences(pageText, needle)
+    if (!occurrences.length) return
+
+    let targetStart = occurrences[0]
+    const context = normalizeText(issue.detail?.context || '')
+    const relativeNeedle = context.indexOf(needle)
+    if (context && relativeNeedle >= 0) {
+      const contextStart = pageText.indexOf(context)
+      if (contextStart >= 0) targetStart = contextStart + relativeNeedle
+    }
+    const targetEnd = targetStart + needle.length
+
+    entries.forEach((entry, entryIndex) => {
+      const overlapStart = Math.max(targetStart, entry.start)
+      const overlapEnd = Math.min(targetEnd, entry.end)
+      if (overlapEnd <= overlapStart) return
+      const from = (overlapStart - entry.start) / entry.text.length
+      const to = (overlapEnd - entry.start) / entry.text.length
+      const left = Math.max(0, entry.rect.left - pageRect.left + entry.rect.width * from - 2)
+      const right = Math.min(pageRect.width, entry.rect.left - pageRect.left + entry.rect.width * to + 2)
+      const top = Math.max(0, entry.rect.top - pageRect.top - 2)
+      const bottom = Math.min(pageRect.height, entry.rect.bottom - pageRect.top + 2)
+      result.push({
+        left,
+        top,
+        width: Math.max(4, right - left),
+        height: Math.max(6, bottom - top),
+        key: `cross-${issue.id}-${entryIndex}`,
+        issueId: Number(issue.id),
+        issueType: 'typo',
+        stateClass: issueHighlightClass(issue).split(' ')[0],
+        selected: Number(issue.id) === Number(issue.__selectedId),
+      })
+    })
+  })
+  return result
+}
+
 function roundPdfRectValue(value) {
   return Math.round(Number(value || 0) * 10) / 10
 }
@@ -1385,24 +1458,36 @@ export default function Review() {
         ...issueLocateCandidates(issue).flatMap(buildPdfLocateFragments),
         ...buildBlockPageCandidates(issue, blockByIndex),
       ].filter(Boolean)
+      let matchedPage = null
+      candidateLoop:
       for (const normalized of candidates) {
         if (normalized.length < 4) continue
         for (const page of pages) {
           if (normalizedPages[page].includes(normalized)) {
-            map[issue.id] = page
-            return
+            matchedPage = page
+            break candidateLoop
           }
         }
         for (let len = Math.min(normalized.length, 30); len >= 10; len -= 5) {
           const prefix = normalized.slice(0, len)
           for (const page of pages) {
             if (normalizedPages[page].includes(prefix)) {
-              map[issue.id] = page
-              return
+              matchedPage = page
+              break candidateLoop
             }
           }
         }
       }
+      const original = normalizeText(issue.original_text || '')
+      if (matchedPage && original.length >= 2 && !normalizedPages[matchedPage].includes(original)) {
+        const originalPages = pages.filter(page => normalizedPages[page].includes(original))
+        if (originalPages.length) {
+          matchedPage = originalPages.reduce((best, page) => (
+            Math.abs(page - matchedPage) < Math.abs(best - matchedPage) ? page : best
+          ), originalPages[0])
+        }
+      }
+      if (matchedPage) map[issue.id] = matchedPage
     })
     return map
   }, [blockByIndex, issues, pdfTextIndex])
@@ -1564,6 +1649,11 @@ export default function Review() {
       setPdfAreaLayerBox(prev => samePdfAreaLayerBox(prev, nextLayerBox) ? prev : nextLayerBox)
       const textColumnBounds = getPdfTextColumnBounds(page, pageRect)
       const issueById = new Map(visiblePdfIssues.map(issue => [Number(issue.id), issue]))
+      const existingIssueIds = new Set(
+        Array.from(page.querySelectorAll('.rv-pdf-mark[data-issue-id]'))
+          .filter(mark => !isPdfMarginElement(mark))
+          .map(mark => Number(mark.dataset.issueId))
+      )
       const marks = Array.from(page.querySelectorAll('.rv-pdf-mark.area[data-issue-id]'))
       const grouped = new Map()
 
@@ -1593,6 +1683,12 @@ export default function Review() {
           })
         })
       })
+      next.push(...buildCrossSpanTypoRects(
+        page,
+        pageRect,
+        visiblePdfIssues.map(issue => ({ ...issue, __selectedId: selectedId })),
+        existingIssueIds,
+      ))
       setPdfAreaRects(prev => samePdfAreaRects(prev, next) ? prev : next)
       if (next.length === 0 && tries < 8) {
         tries += 1
