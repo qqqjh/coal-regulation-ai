@@ -11,6 +11,7 @@
 （引擎在 langchain0.3 环境，依赖不同）。
 """
 import asyncio
+import hmac
 import json
 import shutil
 import sys
@@ -19,7 +20,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -66,6 +67,19 @@ def _require_admin(identity: dict = Depends(require_identity)) -> dict:
     if str(identity.get("role") or "user").lower() != "admin":
         raise HTTPException(status_code=403, detail="仅管理员可访问数据飞轮")
     return identity
+
+
+def _require_review_worker(
+    x_review_worker_secret: str | None = Header(
+        default=None,
+        alias="X-Review-Worker-Secret",
+    ),
+) -> None:
+    """Authenticate the local worker without reopening Milvus Lite."""
+    expected = str(settings.APP_AUTH_SECRET or "")
+    provided = str(x_review_worker_secret or "")
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=403, detail="审查 Worker 内部凭据无效")
 
 
 def _sync_job_to_mongo(job_id: str, include_issues: bool = False) -> None:
@@ -828,6 +842,21 @@ async def storage_health():
         "redis": {"configured": bool(settings.REDIS_URL), "url": settings.REDIS_URL, "used_by_v9": False},
         "milvus": {"configured": bool(settings.MILVUS_URI), "uri": settings.MILVUS_URI},
     }
+
+
+@router.get(
+    "/internal/knowledge-base/{kb_id}/review-chunks",
+    include_in_schema=False,
+)
+async def internal_review_chunks(
+    kb_id: int,
+    _authorized: None = Depends(_require_review_worker),
+):
+    """Return rule chunks to the co-located worker that cannot reopen Milvus Lite."""
+    from app.services.vector_store import vector_store_service
+
+    items = vector_store_service.get_knowledge_base_review_chunks(int(kb_id))
+    return {"kb_id": int(kb_id), "count": len(items), "items": items}
 
 
 @router.get("/review-similar/{job_id}/{chunk_index}")

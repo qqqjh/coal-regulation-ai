@@ -22,6 +22,8 @@ import re
 import shutil
 import sys
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -64,8 +66,6 @@ WEB_CHUNK_CONCURRENCY = _env_int("V9_WEB_CHUNK_CONCURRENCY", 4, 1, 12)
 
 def _load_env_fallback():
     """新终端里若未设 DASHSCOPE_API_KEY，从 backend/.env 兜底读取。"""
-    if os.getenv("DASHSCOPE_API_KEY"):
-        return
     for env_path in (PROJECT_ROOT / "backend" / ".env", PROJECT_ROOT / ".env"):
         if not env_path.exists():
             continue
@@ -82,6 +82,11 @@ API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 BASE_URL = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 AGENT_MODEL = "qwen-plus"
 POLL_INTERVAL = 1.5
+REVIEW_BACKEND_URL = os.getenv(
+    "V9_REVIEW_BACKEND_URL",
+    "http://127.0.0.1:8000/api/v10",
+).rstrip("/")
+REVIEW_WORKER_SECRET = os.getenv("APP_AUTH_SECRET", "")
 
 
 def log(msg: str):
@@ -218,12 +223,7 @@ class V9Worker:
                 "excluded_outburst": int(engine.excluded_outburst_count),
             }
 
-        backend_path = str(BACKEND_DIR)
-        if backend_path not in sys.path:
-            sys.path.insert(0, backend_path)
-        from app.services.vector_store import vector_store_service
-
-        records = vector_store_service.get_knowledge_base_review_chunks(int(kb_id))
+        records = self._load_review_kb_records(int(kb_id))
         if not records:
             raise ValueError(
                 f"前端选中的知识库 kb_id={kb_id} 没有已索引的可审查规则块"
@@ -241,6 +241,39 @@ class V9Worker:
             "chunks": len(engine.kb_chunks),
             "excluded_outburst": int(engine.excluded_outburst_count),
         }
+
+    def _load_review_kb_records(self, kb_id: int) -> List[Dict[str, Any]]:
+        """Read Milvus-backed chunks through the backend that owns Milvus Lite."""
+        if not REVIEW_WORKER_SECRET:
+            raise RuntimeError("未配置 APP_AUTH_SECRET，Worker 无法读取所选知识库")
+        url = (
+            f"{REVIEW_BACKEND_URL}/internal/knowledge-base/"
+            f"{int(kb_id)}/review-chunks"
+        )
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "X-Review-Worker-Secret": REVIEW_WORKER_SECRET,
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=180) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:500]
+            raise RuntimeError(
+                f"后端读取知识库 kb_id={kb_id} 失败（HTTP {exc.code}）：{detail}"
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"无法通过后端读取知识库 kb_id={kb_id}：{exc}"
+            ) from exc
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            raise RuntimeError(f"后端返回的知识库 kb_id={kb_id} 数据格式无效")
+        return [item for item in items if isinstance(item, dict)]
 
     def _working_docx(self, job_id: str, original: str) -> Path:
         """每个任务一份可被主智能体改写的工作副本。"""

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import threading
@@ -119,6 +120,26 @@ class RuleApplicabilityTests(unittest.TestCase):
 
 
 class FrontendKnowledgeBaseSelectionTests(unittest.TestCase):
+    def test_worker_reads_selected_kb_through_backend_owner(self):
+        worker = V9Worker.__new__(V9Worker)
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps({
+            "items": [{"content": "规则", "doc_name": "规程.pdf"}],
+        }).encode("utf-8")
+        with patch("v9_worker.REVIEW_WORKER_SECRET", "test-secret"), patch(
+            "v9_worker.REVIEW_BACKEND_URL",
+            "http://127.0.0.1:8000/api/v10",
+        ), patch("v9_worker.urllib.request.urlopen", return_value=response) as urlopen:
+            records = worker._load_review_kb_records(2)
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(
+            "http://127.0.0.1:8000/api/v10/internal/knowledge-base/2/review-chunks",
+            request.full_url,
+        )
+        self.assertEqual("test-secret", request.get_header("X-review-worker-secret"))
+        self.assertEqual("规则", records[0]["content"])
+
     def test_non_outburst_task_filters_uploaded_outburst_chunks(self):
         reviewer = reviewer_without_models()
         records = [
@@ -168,8 +189,8 @@ class FrontendKnowledgeBaseSelectionTests(unittest.TestCase):
         worker = V9Worker.__new__(V9Worker)
         worker.engine = DummyEngine()
         with patch.object(
-            vector_store_service,
-            "get_knowledge_base_review_chunks",
+            worker,
+            "_load_review_kb_records",
             return_value=records,
         ) as load_records:
             runtime = worker._configure_job_knowledge_base(
