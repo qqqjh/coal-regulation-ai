@@ -46,3 +46,8 @@ __pycache__/
 ~$*
 *.db
 *.sqlite3
+
+# Local runtime and deployment packages
+/.runtime/
+/coal-server-deploy.tar.gz
+/rule-docs-json.tar.gz
