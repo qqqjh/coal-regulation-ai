@@ -51,3 +51,20 @@ __pycache__/
 /.runtime/
 /coal-server-deploy.tar.gz
 /rule-docs-json.tar.gz
+
+# Local competition papers and writing materials
+/研电赛*.docx
+/分工_*.docx
+/第三章预期方案与当前实现差异说明.md
+/body_blocks.txt
+/template_extract.txt
+/tmp_out.txt
+/xhs_search.png
+/tools/*competition*.py
+/tools/finalize_framework_concentration.py
+/tools/fix_v2_56_and_ch6_text.py
+/tools/fix_v3_experience_and_table62.py
+/tools/move_framework_terms_to_ch5.py
+/tools/rewrite_chapter3_assignment_doc.py
+/tools/tighten_v4_data_flywheel_wording.py
+/tools/update_team_assignment_image.py
